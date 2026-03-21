@@ -1,0 +1,19 @@
+[project]
+name = "adk-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "google-adk>=1.27.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "huggingface_hub",
+    "litellm",
+    "openai",
+    "google-generativeai",
+    "python-dotenv>=1.0.1"
+]
+
+[tool.uv]
+link-mode = "copy"
