@@ -108,25 +108,19 @@ Use the project virtual environment or `uv run`. On this machine, bare `python` 
 ### One-shot CLI
 
 ```powershell
-.\.venv\Scripts\python.exe run_sql_agent.py --db dataset\titantic\titanic.sqlite --question "How many female passengers are below 45 years old?"
-```
-
-Equivalent with `uv`:
-
-```powershell
-uv run run_sql_agent.py --db .\dataset\titantic\titanic.sqlite --question "How many female passengers are below 45 years old?"
+uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite --question "How many female passengers are below 45 years old?"
 ```
 
 ### Interactive mode
 
 ```powershell
-.\.venv\Scripts\python.exe run_sql_agent.py --db dataset\titantic\titanic.sqlite
+uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite
 ```
 
 ### Debug mode
 
 ```powershell
-.\.venv\Scripts\python.exe run_sql_agent.py --db dataset\titantic\titanic.sqlite --debug
+uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite --debug
 ```
 
 ### ADK-native mode
@@ -135,15 +129,20 @@ Run this from the `src` directory so ADK can discover the `SQL_agent` package fo
 
 ```powershell
 cd src
-..\.venv\Scripts\adk.exe run SQL_agent
+adk run SQL_agent
 ```
 
 For the local ADK web UI:
 
 ```powershell
 cd src
-..\.venv\Scripts\adk.exe web --no-reload
+adk web --no-reload
 ```
+#### ADK Web UI Preview
+
+<p align="center">
+  <img src="../../assets/adk_webui_sample.png" alt="ADK Web UI Screenshot" width="1000">
+</p>
 
 ## The Exact Request Lifecycle
 
