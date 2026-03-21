@@ -1,3 +1,13 @@
+"""Load and normalize configuration for the SQL agent.
+
+This module resolves database paths, model settings, debug flags, and other
+runtime defaults used across the SQL agent package. It is normally imported by
+the CLI entrypoint and helper modules rather than run directly.
+
+To exercise these settings in the full agent flow, run
+`uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite`.
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,7 +22,7 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "dataset" / "titantic" / "titanic.sqlite"
-DEFAULT_MODEL = "openai/SmolLM-1.7B-Instruct-GGUF"
+DEFAULT_MODEL = "openai/Qwen3.5-0.8B-GGUF"
 DEFAULT_PREVIEW_ROWS = 20
 
 

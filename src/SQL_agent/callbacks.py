@@ -1,3 +1,10 @@
+"""Define ADK callbacks used by the SQL agent runtime.
+
+This module stores the last SQL tool result in session state and rewrites the
+agent's final answer into a deterministic, structured response. It is used
+internally by the agent and is not intended to be run directly.
+"""
+
 from __future__ import annotations
 
 from google.genai import types

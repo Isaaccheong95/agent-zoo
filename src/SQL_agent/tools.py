@@ -1,3 +1,12 @@
+"""Expose the SQL agent's schema and query helpers as ADK tools.
+
+This module wraps the low-level database helpers in tool functions that the
+model can call through ADK. The tools are registered by `agent.py` and are not
+meant to be run directly.
+
+To use them through the full agent flow, run `uv run run_sql_agent.py`.
+"""
+
 from __future__ import annotations
 
 from typing import Callable

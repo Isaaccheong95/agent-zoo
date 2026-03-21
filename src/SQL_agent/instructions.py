@@ -1,3 +1,13 @@
+"""Build the instruction prompt used by the SQL agent.
+
+This module defines the default analyst-style prompt, optionally loads a custom
+instruction file, and appends runtime context such as the active database path
+and schema snapshot. It is consumed by the agent builder and is not intended to
+be run directly.
+
+To use these instructions in practice, run `uv run run_sql_agent.py`.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

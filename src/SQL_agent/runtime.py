@@ -1,3 +1,14 @@
+"""Run the SQL agent in single-question or interactive in-memory sessions.
+
+This module provides async helpers that create an ADK `InMemoryRunner`, manage
+sessions, stream events, and return the final agent response. It powers the CLI
+entrypoint in `run_sql_agent.py` and can also be imported by other code.
+
+To run the interactive CLI, use `uv run run_sql_agent.py`.
+To ask one question and exit, use
+`uv run run_sql_agent.py --question "How many passengers survived?"`.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +19,8 @@ from google.genai.types import Content, Part
 
 from .agent import build_root_agent
 from .config import SQLAgentSettings
+
+
 def _text_from_parts(parts: Iterable[Part]) -> str:
     return "".join(part.text for part in parts if part.text)
 

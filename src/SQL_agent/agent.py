@@ -1,3 +1,12 @@
+"""Build the top-level ADK SQL agent for this project.
+
+This module assembles the model, instructions, tools, and callbacks into a
+single `LlmAgent` instance. It is typically imported by the runtime helpers or
+`run_sql_agent.py` rather than executed directly.
+
+To run the agent from the command line, use `uv run run_sql_agent.py`.
+"""
+
 from __future__ import annotations
 
 from google.adk.agents import LlmAgent

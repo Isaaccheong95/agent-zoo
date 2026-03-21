@@ -1,3 +1,10 @@
+"""Format SQL execution results into the agent's final user-facing response.
+
+This module converts structured tool output into the four-section response
+format expected by the SQL agent. It is used by callbacks and is not meant to
+be run as a standalone script.
+"""
+
 from __future__ import annotations
 
 import json

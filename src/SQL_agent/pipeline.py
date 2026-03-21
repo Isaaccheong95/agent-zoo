@@ -1,3 +1,11 @@
+"""Provide a reusable natural-language-to-SQL pipeline outside the live agent.
+
+This module is a programmatic helper for workflows that want to inspect schema,
+generate SQL, validate it, execute it, and summarize the result without going
+through the full ADK runtime loop. It is intended to be imported by tests or
+other Python code, not run directly.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Callable
