@@ -1,5 +1,14 @@
 # agent-zoo
 
+## Contents
+
+- [What You'll Find](#what-youll-find)
+- [Project Goals](#project-goals)
+- [Structure](#structure)
+- [Getting Started](#getting-started)
+- [Set Up With uv](#set-up-with-uv)
+- [Why This Repo Exists](#why-this-repo-exists)
+
 `agent-zoo` is a collection of reusable agents built with Google ADK.
 
 The goal of this repository is simple: provide practical, plug-and-play agents that developers can run locally, study, adapt, and integrate into their own projects. Each agent is designed to solve a specific problem while keeping its logic transparent, modular, and easy to reuse.
@@ -33,6 +42,62 @@ Each agent lives in its own folder and should include its own:
 ## Getting Started
 
 Browse the available agent folders and follow the instructions in each agent's local README to run or integrate it.
+
+### Set Up With uv
+
+This repository uses `uv` for dependency and environment management.
+
+#### Install uv
+
+If you do not already have `uv` installed, you can use one of these common methods:
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+macOS and Linux:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+With `pipx`:
+
+```bash
+pipx install uv
+```
+
+With `pip`:
+
+```bash
+pip install uv
+```
+
+Verify the installation:
+
+```bash
+uv --version
+```
+
+#### Create the environment
+
+From the repository root, create and sync the virtual environment:
+
+```powershell
+uv sync
+```
+
+#### Run commands with uv
+
+Run agent commands directly through `uv`:
+
+```powershell
+uv run run_sql_agent.py --help
+```
+
+If you prefer activating the environment manually, `uv sync` will create a local `.venv` for you.
 
 ## Why This Repo Exists
 
