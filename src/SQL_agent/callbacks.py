@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from google.adk.models import LlmResponse
 from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
@@ -31,13 +32,16 @@ def _normalize_count_value(value: Any) -> Any:
     return value
 
 
-def _clear_private_result_state(state: dict[str, Any]) -> None:
+def _clear_private_result_state(state: Any) -> None:
     for key in (
         SQL_PUBLIC_RESULT_STATE_KEY,
         SQL_INTERNAL_RESULT_REF_STATE_KEY,
         SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     ):
-        state.pop(key, None)
+        if hasattr(state, "pop"):
+            state.pop(key, None)
+        elif key in state:
+            state[key] = None
 
 
 def _build_privacy_error_result(
@@ -205,14 +209,18 @@ def build_remember_query_result_callback(
             return None
 
         _clear_private_result_state(tool_context.state)
-        tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = _build_public_query_result(
+        public_result = _build_public_query_result(
             tool_response,
             active_settings,
         )
+        tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
 
         if active_settings.capture_internal_rows and tool_response.get("status") == "success":
             tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
             tool_context.state[SQL_INTERNAL_RESULT_REF_STATE_KEY] = SQL_INTERNAL_QUERY_RESULT_STATE_KEY
+
+        if active_settings.count_aggregates_only:
+            return public_result
 
         return None
 
@@ -239,5 +247,28 @@ def build_format_final_agent_response_callback(
     return format_final_agent_response
 
 
+def build_finalize_after_query_before_model_callback(
+    settings: SQLAgentSettings | None = None,
+):
+    def finalize_after_query(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        context = callback_context
+        if context is None:
+            return None
+
+        public_query_result = context.state.get(SQL_PUBLIC_RESULT_STATE_KEY)
+        if not isinstance(public_query_result, dict):
+            return None
+
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=format_structured_response(public_query_result))],
+            )
+        )
+
+    return finalize_after_query
+
+
 remember_query_result = build_remember_query_result_callback()
 format_final_agent_response = build_format_final_agent_response_callback()
+finalize_after_query_before_model = build_finalize_after_query_before_model_callback()

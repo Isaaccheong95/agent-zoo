@@ -22,6 +22,7 @@ from SQL_agent.callbacks import (
     SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     SQL_INTERNAL_RESULT_REF_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
+    build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
     build_remember_query_result_callback,
 )
@@ -192,6 +193,18 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         callback(tool, {}, tool_context, tool_response)
         return tool_context.state
 
+    def _invoke_after_tool_with_state(
+        self,
+        settings: SQLAgentSettings,
+        tool_response: dict,
+        state,
+    ):
+        callback = build_remember_query_result_callback(settings)
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state=state)
+        callback(tool, {}, tool_context, tool_response)
+        return tool_context.state
+
     def test_load_settings_defaults_and_env_overrides(self) -> None:
         settings = load_settings(
             {
@@ -245,6 +258,25 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertNotIn(SQL_INTERNAL_RESULT_REF_STATE_KEY, state)
         self.assertNotIn(SQL_INTERNAL_QUERY_RESULT_STATE_KEY, state)
 
+    def test_privacy_mode_returns_public_result_to_model(self) -> None:
+        callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=3))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={})
+
+        returned_result = callback(
+            tool,
+            {},
+            tool_context,
+            make_query_result(
+                [{"matching_count": 2}],
+                columns=["matching_count"],
+            ),
+        )
+
+        self.assertEqual(returned_result, tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY])
+        self.assertEqual(returned_result["status"], "error")
+        self.assertTrue(returned_result["privacy_blocked"])
+
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
             [
@@ -261,6 +293,44 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertEqual(state[SQL_INTERNAL_RESULT_REF_STATE_KEY], SQL_INTERNAL_QUERY_RESULT_STATE_KEY)
         self.assertEqual(state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY], raw_result)
+
+    def test_callback_handles_adk_state_objects_without_pop(self) -> None:
+        class FakeState:
+            def __init__(self, initial: dict | None = None) -> None:
+                self._value = dict(initial or {})
+
+            def __getitem__(self, key):
+                return self._value[key]
+
+            def __setitem__(self, key, value) -> None:
+                self._value[key] = value
+
+            def __contains__(self, key) -> bool:
+                return key in self._value
+
+            def get(self, key, default=None):
+                return self._value.get(key, default)
+
+        state = self._invoke_after_tool_with_state(
+            self._settings(),
+            make_query_result(
+                [{"matching_count": 4}],
+                columns=["matching_count"],
+            ),
+            FakeState(
+                {
+                    SQL_PUBLIC_RESULT_STATE_KEY: {"status": "success"},
+                    SQL_INTERNAL_RESULT_REF_STATE_KEY: "ref",
+                    SQL_INTERNAL_QUERY_RESULT_STATE_KEY: {"rows": [{"name": "Alice"}]},
+                }
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["rows"], [{"matching_count": 4}])
+        self.assertIsNone(state.get(SQL_INTERNAL_RESULT_REF_STATE_KEY))
+        self.assertIsNone(state.get(SQL_INTERNAL_QUERY_RESULT_STATE_KEY))
 
     def test_scalar_counts_below_threshold_are_blocked(self) -> None:
         state = self._invoke_after_tool(
@@ -347,6 +417,32 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIn("Found 4 matching rows.", response_text)
         self.assertNotIn("Alice", response_text)
         self.assertNotIn('"name"', response_text)
+
+    def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
+        settings = self._settings()
+        callback = build_finalize_after_query_before_model_callback(settings)
+        result = callback(
+            callback_context=SimpleNamespace(
+                state={
+                    SQL_PUBLIC_RESULT_STATE_KEY: {
+                        "status": "success",
+                        "db_path": "fixture.sqlite",
+                        "sql": "SELECT COUNT(*) AS matching_count FROM people",
+                        "columns": ["matching_count"],
+                        "rows": [{"matching_count": 4}],
+                        "row_count": 1,
+                        "preview_row_count": 1,
+                        "truncated": False,
+                        "error": None,
+                        "matched_row_count": 4,
+                    }
+                }
+            ),
+            llm_request=SimpleNamespace(),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIn("Found 4 matching rows.", result.content.parts[0].text)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
