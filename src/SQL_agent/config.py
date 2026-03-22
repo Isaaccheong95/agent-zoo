@@ -24,6 +24,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "dataset" / "titantic" / "titanic.sqlite"
 DEFAULT_MODEL = "openai/Qwen3.5-0.8B-GGUF"
 DEFAULT_PREVIEW_ROWS = 20
+DEFAULT_COUNT_AGGREGATES_ONLY = True
+DEFAULT_MINIMUM_AGGREGATE_COUNT = 3
+DEFAULT_CAPTURE_INTERNAL_ROWS = False
 
 
 def _ensure_local_openai_api_key() -> None:
@@ -64,6 +67,9 @@ class SQLAgentSettings:
     debug: bool = False
     instruction_file: Path | None = None
     preview_rows: int = DEFAULT_PREVIEW_ROWS
+    count_aggregates_only: bool = DEFAULT_COUNT_AGGREGATES_ONLY
+    minimum_aggregate_count: int = DEFAULT_MINIMUM_AGGREGATE_COUNT
+    capture_internal_rows: bool = DEFAULT_CAPTURE_INTERNAL_ROWS
     app_name: str = "sql_agent"
     user_id: str = "local_user"
     session_id: str = "sql_agent_session"
@@ -93,10 +99,26 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     if raw_preview_rows is None:
         raw_preview_rows = os.getenv("SQL_AGENT_PREVIEW_ROWS")
 
+    raw_count_aggregates_only = overrides.get("count_aggregates_only")
+    if raw_count_aggregates_only is None:
+        raw_count_aggregates_only = os.getenv("SQL_AGENT_COUNT_AGGREGATES_ONLY")
+
+    raw_minimum_aggregate_count = overrides.get("minimum_aggregate_count")
+    if raw_minimum_aggregate_count is None:
+        raw_minimum_aggregate_count = os.getenv("SQL_AGENT_MINIMUM_AGGREGATE_COUNT")
+
+    raw_capture_internal_rows = overrides.get("capture_internal_rows")
+    if raw_capture_internal_rows is None:
+        raw_capture_internal_rows = os.getenv("SQL_AGENT_CAPTURE_INTERNAL_ROWS")
+
     resolved_instruction = resolve_repo_path(raw_instruction_file)
     preview_rows = DEFAULT_PREVIEW_ROWS
     if raw_preview_rows not in (None, ""):
         preview_rows = max(1, int(raw_preview_rows))
+
+    minimum_aggregate_count = DEFAULT_MINIMUM_AGGREGATE_COUNT
+    if raw_minimum_aggregate_count not in (None, ""):
+        minimum_aggregate_count = max(1, int(raw_minimum_aggregate_count))
 
     return SQLAgentSettings(
         db_path=resolve_repo_path(raw_db_path) or DEFAULT_DB_PATH,
@@ -104,4 +126,13 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
         debug=_parse_bool(raw_debug, default=False),
         instruction_file=resolved_instruction,
         preview_rows=preview_rows,
+        count_aggregates_only=_parse_bool(
+            raw_count_aggregates_only,
+            default=DEFAULT_COUNT_AGGREGATES_ONLY,
+        ),
+        minimum_aggregate_count=minimum_aggregate_count,
+        capture_internal_rows=_parse_bool(
+            raw_capture_internal_rows,
+            default=DEFAULT_CAPTURE_INTERNAL_ROWS,
+        ),
     )

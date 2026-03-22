@@ -30,6 +30,8 @@ Rules:
 - Only generate read-only SQLite SQL.
 - Never invent tables, columns, or joins.
 - Prefer simple, correct, deterministic SQL over clever SQL.
+- Prefer `COUNT(*) AS matching_count` for user-facing answers whenever possible.
+- If you need a grouped aggregate, make sure the count column is explicit and easy to interpret.
 - Use `LOWER(...)` when appropriate for case-insensitive text matching.
 - Handle `NULL` values explicitly when they matter.
 - Use `COUNT(*)` for counting rows.
@@ -38,6 +40,9 @@ Rules:
 - Avoid unnecessary joins and unnecessary subqueries.
 - Do not narrate your step-by-step reasoning or tool-selection process to the user.
 - Keep intermediate reasoning private and only present the final user-facing answer.
+- Never expose raw row-level data to the user when privacy mode is enabled.
+- If a detail-row query is used internally, the final user-facing answer must still remain aggregate-only.
+- If a privacy threshold blocks the result, explain that limitation clearly instead of exposing the underlying rows.
 - If the request is ambiguous or cannot be grounded in the schema, do not execute SQL. Ask a clarification question or explain the limitation instead.
 - If a tool reports an error, explain it clearly and stay grounded in the schema.
 
@@ -54,7 +59,7 @@ Result summary:
 <brief summary of what happened, including row count when available>
 
 Result:
-<concise answer or short preview of rows>
+<concise answer using counts or other safe aggregates>
 
 Explanation:
 <brief note about assumptions, clarifications, or why execution was skipped when useful>
@@ -86,6 +91,9 @@ def build_agent_instruction(settings: SQLAgentSettings) -> str:
 ## Runtime Context
 - Default database path: {settings.db_path}
 - Default preview rows: {settings.preview_rows}
+- Count aggregates only: {settings.count_aggregates_only}
+- Minimum aggregate count: {settings.minimum_aggregate_count}
+- Capture internal rows: {settings.capture_internal_rows}
 
 ## Schema Snapshot
 ```text

@@ -13,7 +13,10 @@ from google.adk.agents import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
 
-from .callbacks import format_final_agent_response, remember_query_result
+from .callbacks import (
+    build_format_final_agent_response_callback,
+    build_remember_query_result_callback,
+)
 from .config import SQLAgentSettings, load_settings
 from .instructions import build_agent_instruction
 from .tools import build_sql_tools
@@ -28,8 +31,8 @@ def build_root_agent(settings: SQLAgentSettings | None = None) -> LlmAgent:
         instruction=build_agent_instruction(active_settings),
         tools=build_sql_tools(active_settings),
         generate_content_config=types.GenerateContentConfig(temperature=0.0),
-        after_tool_callback=remember_query_result,
-        after_agent_callback=format_final_agent_response,
+        after_tool_callback=build_remember_query_result_callback(active_settings),
+        after_agent_callback=build_format_final_agent_response_callback(active_settings),
     )
 
 

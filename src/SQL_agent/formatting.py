@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import json
 
-from .pipeline import summarize_execution_result
-
-
 def format_result_payload(tool_result: dict) -> str:
     if tool_result["status"] != "success":
         return tool_result.get("error") or "Execution failed."
@@ -26,9 +23,52 @@ def format_result_payload(tool_result: dict) -> str:
     return json.dumps(rows, indent=2)
 
 
+def _get_matching_row_count(tool_result: dict) -> int | float | None:
+    matched_row_count = tool_result.get("matched_row_count")
+    if isinstance(matched_row_count, (int, float)) and not isinstance(matched_row_count, bool):
+        return matched_row_count
+    return None
+
+
+def summarize_execution_result(tool_result: dict) -> str:
+    if tool_result["status"] != "success":
+        return tool_result.get("error") or "The query failed."
+
+    matched_row_count = _get_matching_row_count(tool_result)
+    if matched_row_count is not None:
+        if matched_row_count == 0:
+            return "No matching rows were found."
+        if matched_row_count == 1:
+            return "Found 1 matching row."
+        return f"Found {matched_row_count} matching rows."
+
+    row_count = tool_result["row_count"]
+    if row_count == 0:
+        return "No matching rows were found."
+    if row_count == 1:
+        return "Found 1 matching row."
+    if tool_result["truncated"]:
+        return f"Found {row_count} matching rows. Returning a preview."
+    return f"Found {row_count} matching rows."
+
+
 def build_default_explanation(tool_result: dict) -> str:
     if tool_result["status"] != "success":
         return tool_result.get("error") or "The query could not be executed safely."
+
+    matched_row_count = _get_matching_row_count(tool_result)
+    if matched_row_count is not None:
+        if matched_row_count == 0:
+            return "The query executed successfully but returned no matching rows."
+        if tool_result.get("rows") and len(tool_result["rows"][0]) > 1:
+            return (
+                "The query executed successfully and returned grouped counts covering "
+                f"{matched_row_count} matching row(s)."
+            )
+        return (
+            "The query executed successfully and the public response reports "
+            f"{matched_row_count} matching row(s)."
+        )
 
     row_count = tool_result.get("row_count", 0)
     if row_count == 0:

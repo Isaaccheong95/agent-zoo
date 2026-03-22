@@ -25,7 +25,7 @@ def _text_from_parts(parts: Iterable[Part]) -> str:
     return "".join(part.text for part in parts if part.text)
 
 
-def _print_debug_event(event) -> None:
+def _print_debug_event(event, settings: SQLAgentSettings) -> None:
     if event.content and event.content.parts:
         text = _text_from_parts(event.content.parts)
         if text:
@@ -36,7 +36,13 @@ def _print_debug_event(event) -> None:
             if function_call is not None:
                 print(f"[debug][tool-call] {function_call.name}: {function_call.args}")
             if function_response is not None:
-                print(f"[debug][tool-response] {function_response.name}: {function_response.response}")
+                if (
+                    settings.count_aggregates_only
+                    and function_response.name == "execute_sqlite_read_only"
+                ):
+                    print(f"[debug][tool-response] {function_response.name}: <redacted in privacy mode>")
+                else:
+                    print(f"[debug][tool-response] {function_response.name}: {function_response.response}")
 
 
 async def ask_question(
@@ -65,7 +71,7 @@ async def ask_question(
         new_message=content,
     ):
         if settings.debug:
-            _print_debug_event(event)
+            _print_debug_event(event, settings)
 
         if event.is_final_response() and event.author != "user" and event.content and event.content.parts:
             final_response = _text_from_parts(event.content.parts)
