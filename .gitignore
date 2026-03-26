@@ -1,4 +1,5 @@
 .adk/
+.uv-cache/
 
 # Python bytecode and caches
 __pycache__/
@@ -63,6 +64,11 @@ desktop.ini
 
 # Downloaded or generated model assets
 models/
+
+# Local benchmark datasets and generated DB sidecars
+dataset/mini_bird_bench/
+*.sqlite-shm
+*.sqlite-wal
 
 # Optional local data/artifact folders
 artifacts/
