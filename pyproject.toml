@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-run-sql-agent = "SQL_agent.cli:main"
+run-sql-agent = "sql_agent.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

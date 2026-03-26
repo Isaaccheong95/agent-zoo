@@ -94,7 +94,7 @@ The model is responsible for understanding the user's request and proposing SQL.
 - executing against SQLite in read-only mode
 - formatting a predictable final answer
 
-The live agent is in `src/SQL_agent`. There is also a plain Python runner at `run_sql_agent.py` so you can use the agent without going through the ADK CLI.
+The live agent is in `src/sql_agent`. There is also a plain Python runner at `run_sql_agent.py` so you can use the agent without going through the ADK CLI.
 
 ## The Core Design
 
@@ -113,16 +113,16 @@ This is deliberately not a black box. The SQL is always surfaced, and the pieces
 | Path | Purpose |
 | --- | --- |
 | `run_sql_agent.py` | Plain local CLI entrypoint |
-| `src/SQL_agent/__init__.py` | Package exports |
-| `src/SQL_agent/agent.py` | Builds the ADK `LlmAgent` |
-| `src/SQL_agent/config.py` | Loads config from CLI/env and resolves paths |
-| `src/SQL_agent/instructions.py` | Builds the system instruction and schema snapshot |
-| `src/SQL_agent/tools.py` | Wraps database helpers as ADK tools |
-| `src/SQL_agent/db.py` | Schema introspection, SQL scanning, validation, and execution |
-| `src/SQL_agent/runtime.py` | Runs the agent with `InMemoryRunner` |
-| `src/SQL_agent/callbacks.py` | Stores tool output and replaces the final response |
-| `src/SQL_agent/formatting.py` | Formats the final user-facing response |
-| `src/SQL_agent/pipeline.py` | Deterministic offline pipeline helper used by tests |
+| `src/sql_agent/__init__.py` | Package exports |
+| `src/sql_agent/agent.py` | Builds the ADK `LlmAgent` |
+| `src/sql_agent/config.py` | Loads config from CLI/env and resolves paths |
+| `src/sql_agent/instructions.py` | Builds the system instruction and schema snapshot |
+| `src/sql_agent/tools.py` | Wraps database helpers as ADK tools |
+| `src/sql_agent/db.py` | Schema introspection, SQL scanning, validation, and execution |
+| `src/sql_agent/runtime.py` | Runs the agent with `InMemoryRunner` |
+| `src/sql_agent/callbacks.py` | Stores tool output and replaces the final response |
+| `src/sql_agent/formatting.py` | Formats the final user-facing response |
+| `src/sql_agent/pipeline.py` | Deterministic offline pipeline helper used by tests |
 | `tests/test_sql_agent_db.py` | Unit tests for schema/validation/execution |
 | `tests/test_sql_agent_pipeline.py` | Unit tests for the higher-level pipeline |
 
@@ -195,11 +195,11 @@ uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite --debug
 
 ### ADK-native mode
 
-Run this from the `src` directory so ADK can discover the `SQL_agent` package folder:
+Run this from the `src` directory so ADK can discover the `sql_agent` package folder:
 
 ```powershell
 cd src
-adk run SQL_agent
+adk run sql_agent
 ```
 
 For the local ADK web UI:
@@ -230,7 +230,7 @@ It does four important things:
    - `--debug`
    - `--instruction-file`
    - `--question`
-2. Injects `src` into `sys.path` so `SQL_agent` can be imported without installing the package.
+2. Injects `src` into `sys.path` so `sql_agent` can be imported without installing the package.
 3. Calls `load_settings(...)` to merge CLI overrides with environment defaults.
 4. Chooses between:
    - one-shot mode via `ask_question(...)`
@@ -240,7 +240,7 @@ If `--question` is present, it asks once and exits. Otherwise, it starts a REPL-
 
 ### 2. `config.py` resolves settings and paths
 
-`src/SQL_agent/config.py` is responsible for configuration.
+`src/sql_agent/config.py` is responsible for configuration.
 
 The main pieces are:
 
@@ -257,7 +257,7 @@ The main pieces are:
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ```
 
-Because `config.py` lives at `src/SQL_agent/config.py`, going up two directories lands at the repo root.
+Because `config.py` lives at `src/sql_agent/config.py`, going up two directories lands at the repo root.
 
 #### Default database path
 
@@ -314,7 +314,7 @@ os.environ["OPENAI_API_KEY"] = "local-openai-compatible-key"
 
 ### 3. `agent.py` builds the ADK `LlmAgent`
 
-The live agent is constructed in `src/SQL_agent/agent.py`.
+The live agent is constructed in `src/sql_agent/agent.py`.
 
 The important function is:
 
@@ -353,7 +353,7 @@ One subtle consequence: if environment variables change after import, `root_agen
 
 ### 4. `instructions.py` builds the system prompt
 
-`src/SQL_agent/instructions.py` is where the agent instruction is assembled.
+`src/sql_agent/instructions.py` is where the agent instruction is assembled.
 
 It has two layers:
 
@@ -397,7 +397,7 @@ That duplication is intentional:
 
 ### 5. `tools.py` exposes the database helpers as ADK tools
 
-`src/SQL_agent/tools.py` defines `build_sql_tools(settings)`.
+`src/sql_agent/tools.py` defines `build_sql_tools(settings)`.
 
 It returns two plain Python callables:
 
@@ -417,7 +417,7 @@ This matters because ADK uses the function name and docstring as part of the too
 
 ### 6. `runtime.py` runs the agent with ADK
 
-`src/SQL_agent/runtime.py` is the bridge between the configured agent and the local execution loop.
+`src/sql_agent/runtime.py` is the bridge between the configured agent and the local execution loop.
 
 It uses ADK's `InMemoryRunner`.
 
@@ -485,7 +485,7 @@ That is why:
 
 ### 8. `formatting.py` builds the user-facing output
 
-`src/SQL_agent/formatting.py` converts the raw tool result into the exact response format.
+`src/sql_agent/formatting.py` converts the raw tool result into the exact response format.
 
 #### `format_result_payload(tool_result)`
 
@@ -520,7 +520,7 @@ This formatting function is what the `after_agent_callback` ultimately returns t
 
 ### 9. `pipeline.py` contains a deterministic, non-ADK pipeline
 
-`src/SQL_agent/pipeline.py` is not the main live runtime. It exists to keep the core workflow testable without a real model.
+`src/sql_agent/pipeline.py` is not the main live runtime. It exists to keep the core workflow testable without a real model.
 
 The central function is:
 
@@ -576,7 +576,7 @@ That behavior is correct according to the current implementation, but it is a go
 
 ## Deep Dive: `db.py`
 
-`src/SQL_agent/db.py` is the safety-critical part of the project.
+`src/sql_agent/db.py` is the safety-critical part of the project.
 
 This file does four jobs:
 
@@ -992,18 +992,18 @@ It helps to separate the code into two groups.
 ### Live runtime path
 
 - `run_sql_agent.py`
-- `src/SQL_agent/agent.py`
-- `src/SQL_agent/config.py`
-- `src/SQL_agent/instructions.py`
-- `src/SQL_agent/tools.py`
-- `src/SQL_agent/db.py`
-- `src/SQL_agent/runtime.py`
-- `src/SQL_agent/callbacks.py`
-- `src/SQL_agent/formatting.py`
+- `src/sql_agent/agent.py`
+- `src/sql_agent/config.py`
+- `src/sql_agent/instructions.py`
+- `src/sql_agent/tools.py`
+- `src/sql_agent/db.py`
+- `src/sql_agent/runtime.py`
+- `src/sql_agent/callbacks.py`
+- `src/sql_agent/formatting.py`
 
 ### Test and support path
 
-- `src/SQL_agent/pipeline.py`
+- `src/sql_agent/pipeline.py`
 - `tests/test_sql_agent_db.py`
 - `tests/test_sql_agent_pipeline.py`
 

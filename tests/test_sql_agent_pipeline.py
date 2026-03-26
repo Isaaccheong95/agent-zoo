@@ -13,7 +13,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from SQL_agent.pipeline import run_nl_to_sql_pipeline
+from sql_agent.pipeline import run_nl_to_sql_pipeline
 
 
 def create_pipeline_fixture(db_path: Path) -> None:
