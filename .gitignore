@@ -1,5 +1,7 @@
 .adk/
 
+dataset/mini_bird_bench/
+
 # Python bytecode and caches
 __pycache__/
 *.py[cod]

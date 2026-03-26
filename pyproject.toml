@@ -9,11 +9,20 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
     "huggingface_hub",
-    "litellm",
     "openai",
     "google-generativeai",
     "python-dotenv>=1.0.1"
 ]
+
+[project.optional-dependencies]
+benchmark = [
+    "func-timeout>=4.3.5",
+    "pymysql>=1.1.1",
+    "psycopg2-binary>=2.9.9",
+]
+
+[project.scripts]
+mini-bird-sqlite-benchmark = "SQL_agent.benchmark:main"
 
 [tool.uv]
 link-mode = "copy"
