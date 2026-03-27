@@ -79,11 +79,12 @@ def make_query_result(
     truncated: bool = False,
     status: str = "success",
     error: str | None = None,
+    sql: str = "SELECT ...",
 ) -> dict:
     return {
         "status": status,
         "db_path": "fixture.sqlite",
-        "sql": "SELECT ...",
+        "sql": sql,
         "columns": columns if columns is not None else (list(rows[0].keys()) if rows else []),
         "rows": rows,
         "row_count": len(rows) if row_count is None else row_count,
@@ -91,7 +92,6 @@ def make_query_result(
         "truncated": truncated,
         "error": error,
     }
-
 
 class SQLiteHelpersTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -255,6 +255,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["status"], "success")
         self.assertEqual(public_result["rows"], [{"matching_count": 4}])
         self.assertEqual(public_result["matched_row_count"], 4)
+        self.assertEqual(public_result["public_result_kind"], "detail_count_fallback")
         self.assertNotIn(SQL_INTERNAL_RESULT_REF_STATE_KEY, state)
         self.assertNotIn(SQL_INTERNAL_QUERY_RESULT_STATE_KEY, state)
 
@@ -357,6 +358,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 ],
                 columns=["sex", "matching_count"],
                 row_count=2,
+                sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
             ),
         )
 
@@ -375,6 +377,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 ],
                 columns=["sex", "matching_count"],
                 row_count=2,
+                sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
             ),
         )
 
@@ -382,6 +385,77 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["status"], "success")
         self.assertEqual(public_result["rows"][0]["sex"], "female")
         self.assertEqual(public_result["matched_row_count"], 9)
+        self.assertEqual(public_result["public_result_kind"], "count_aggregate")
+
+    def test_scalar_average_with_matching_count_is_kept_publicly(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [{"matching_count": 4, "average_age": 36.25}],
+                columns=["matching_count", "average_age"],
+                row_count=1,
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["rows"][0]["average_age"], 36.25)
+        self.assertEqual(public_result["matched_row_count"], 4)
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+
+    def test_scalar_average_below_threshold_is_blocked(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [{"matching_count": 2, "average_age": 36.25}],
+                columns=["matching_count", "average_age"],
+                row_count=1,
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "error")
+        self.assertTrue(public_result["privacy_blocked"])
+        self.assertIn("minimum threshold (3)", public_result["error"])
+
+    def test_grouped_average_above_threshold_is_kept_publicly(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [
+                    {"sex": "female", "matching_count": 5, "average_age": 31.4},
+                    {"sex": "male", "matching_count": 4, "average_age": 44.0},
+                ],
+                columns=["sex", "matching_count", "average_age"],
+                row_count=2,
+                sql="SELECT sex, COUNT(*) AS matching_count, AVG(age) AS average_age FROM people GROUP BY sex",
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["matched_row_count"], 9)
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+        self.assertEqual(public_result["rows"][0]["average_age"], 31.4)
+
+    def test_grouped_average_below_threshold_is_blocked(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [
+                    {"sex": "female", "matching_count": 5, "average_age": 31.4},
+                    {"sex": "male", "matching_count": 1, "average_age": 44.0},
+                ],
+                columns=["sex", "matching_count", "average_age"],
+                row_count=2,
+                sql="SELECT sex, COUNT(*) AS matching_count, AVG(age) AS average_age FROM people GROUP BY sex",
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "error")
+        self.assertTrue(public_result["privacy_blocked"])
+        self.assertIn("group count is below the minimum threshold", public_result["error"])
 
     def test_count_mode_off_preserves_public_passthrough(self) -> None:
         raw_result = make_query_result(
