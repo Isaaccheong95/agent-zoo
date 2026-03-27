@@ -17,7 +17,6 @@ from typing import Iterable
 from google.adk.runners import InMemoryRunner
 from google.genai.types import Content, Part
 
-from .agent import build_root_agent
 from .config import SQLAgentSettings
 
 
@@ -52,6 +51,8 @@ async def ask_question(
     runner: InMemoryRunner | None = None,
     session_id: str | None = None,
 ) -> str:
+    from .agent import build_root_agent
+
     local_runner = runner or InMemoryRunner(agent=build_root_agent(settings), app_name=settings.app_name)
     active_session_id = session_id or settings.session_id
 
@@ -80,6 +81,8 @@ async def ask_question(
 
 
 async def run_interactive_loop(settings: SQLAgentSettings) -> None:
+    from .agent import build_root_agent
+
     runner = InMemoryRunner(agent=build_root_agent(settings), app_name=settings.app_name)
     await runner.session_service.create_session(
         app_name=runner.app_name,

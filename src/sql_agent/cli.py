@@ -4,7 +4,6 @@ import argparse
 import asyncio
 
 from .config import load_settings
-from .runtime import ask_question, run_interactive_loop
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +18,8 @@ def parse_args() -> argparse.Namespace:
 
 async def _main_async() -> int:
     args = parse_args()
+    from .runtime import ask_question, run_interactive_loop
+
     settings = load_settings(
         {
             "db_path": args.db_path,
