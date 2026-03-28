@@ -94,7 +94,7 @@ uv sync
 Run agent commands directly through `uv`:
 
 ```powershell
-uv run run_sql_agent.py --help
+uv run run-sql-agent --help
 ```
 
 Programmatic imports use the `agent_zoo` namespace:

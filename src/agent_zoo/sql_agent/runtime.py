@@ -2,11 +2,11 @@
 
 This module provides async helpers that create an ADK `InMemoryRunner`, manage
 sessions, stream events, and return the final agent response. It powers the CLI
-entrypoint in `run_sql_agent.py` and can also be imported by other code.
+entrypoint in `agent_zoo.sql_agent.cli` and can also be imported by other code.
 
-To run the interactive CLI, use `uv run run_sql_agent.py`.
+To run the interactive CLI, use `uv run run-sql-agent`.
 To ask one question and exit, use
-`uv run run_sql_agent.py --question "How many passengers survived?"`.
+`uv run run-sql-agent --question "How many passengers survived?"`.
 """
 
 from __future__ import annotations

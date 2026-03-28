@@ -5,7 +5,7 @@ instruction file, and appends runtime context such as the active database path
 and schema snapshot. It is consumed by the agent builder and is not intended to
 be run directly.
 
-To use these instructions in practice, run `uv run run_sql_agent.py`.
+To use these instructions in practice, run `uv run run-sql-agent`.
 """
 
 from __future__ import annotations

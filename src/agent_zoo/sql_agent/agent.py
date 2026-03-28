@@ -2,9 +2,9 @@
 
 This module assembles the model, instructions, tools, and callbacks into a
 single `LlmAgent` instance. It is typically imported by the runtime helpers or
-`run_sql_agent.py` rather than executed directly.
+the package CLI rather than executed directly.
 
-To run the agent from the command line, use `uv run run_sql_agent.py`.
+To run the agent from the command line, use `uv run run-sql-agent`.
 """
 
 from __future__ import annotations

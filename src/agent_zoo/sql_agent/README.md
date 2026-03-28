@@ -13,7 +13,7 @@
   - [ADK-native mode](#adk-native-mode)
   - [ADK Web UI Preview](#adk-web-ui-preview)
 - [The Exact Request Lifecycle](#the-exact-request-lifecycle)
-  - [1. `run_sql_agent.py` parses CLI arguments](#1-run_sql_agentpy-parses-cli-arguments)
+  - [1. `cli.py` parses CLI arguments](#1-clipy-parses-cli-arguments)
   - [2. `config.py` resolves settings and paths](#2-configpy-resolves-settings-and-paths)
   - [3. `agent.py` builds the ADK `LlmAgent`](#3-agentpy-builds-the-adk-llmagent)
   - [4. `instructions.py` builds the system prompt](#4-instructionspy-builds-the-system-prompt)
@@ -94,7 +94,7 @@ The model is responsible for understanding the user's request and proposing SQL.
 - executing against SQLite in read-only mode
 - formatting a predictable final answer
 
-The agent is in `src/agent_zoo/sql_agent`. There is also a Python runner at `run_sql_agent.py` so you can use the agent without going through the ADK CLI. Programmatic imports now use `agent_zoo.sql_agent`, for example `from agent_zoo.sql_agent import SQLAgent`, then `agent = SQLAgent()` and `await agent.ask(...)`.
+The agent is in `src/agent_zoo/sql_agent`. The canonical CLI entrypoint is `agent_zoo.sql_agent.cli:main`, exposed as `run-sql-agent`. Programmatic imports use `agent_zoo.sql_agent`, for example `from agent_zoo.sql_agent import SQLAgent`, then `agent = SQLAgent()` and `await agent.ask(...)`.
 
 ## The Core Design
 
@@ -112,7 +112,7 @@ This is deliberately not a black box. The SQL is always surfaced, and the pieces
 
 | Path | Purpose |
 | --- | --- |
-| `run_sql_agent.py` | Plain local CLI entrypoint |
+| `src/agent_zoo/sql_agent/cli.py` | Canonical package CLI entrypoint |
 | `src/agent_zoo/sql_agent/__init__.py` | Package exports |
 | `src/agent_zoo/sql_agent/agent.py` | Builds the ADK `LlmAgent` |
 | `src/agent_zoo/sql_agent/config.py` | Loads config from CLI/env and resolves paths |
@@ -132,7 +132,7 @@ This is deliberately not a black box. The SQL is always surfaced, and the pieces
 User question
     |
     v
-run_sql_agent.py
+run-sql-agent / cli.py
     |
     v
 load_settings(...)
@@ -178,19 +178,19 @@ Use the project virtual environment or `uv run`. On this machine, bare `python` 
 ### One-shot CLI
 
 ```powershell
-uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite --question "How many female passengers are below 45 years old?"
+uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite --question "How many female passengers are below 45 years old?"
 ```
 
 ### Interactive mode
 
 ```powershell
-uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite
+uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite
 ```
 
 ### Debug mode
 
 ```powershell
-uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite --debug
+uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite --debug
 ```
 
 ### ADK-native mode
@@ -218,9 +218,9 @@ adk web --no-reload
 
 This section follows a real request through the code.
 
-### 1. `run_sql_agent.py` parses CLI arguments
+### 1. `cli.py` parses CLI arguments
 
-`run_sql_agent.py` is the human-friendly entrypoint.
+`src/agent_zoo/sql_agent/cli.py` is the canonical entrypoint, exposed through the installed `run-sql-agent` command.
 
 It does four important things:
 
@@ -230,9 +230,8 @@ It does four important things:
    - `--debug`
    - `--instruction-file`
    - `--question`
-2. Injects `src` into `sys.path` so `sql_agent` can be imported without installing the package.
-3. Calls `load_settings(...)` to merge CLI overrides with environment defaults.
-4. Chooses between:
+2. Calls `load_settings(...)` to merge CLI overrides with environment defaults.
+3. Chooses between:
    - one-shot mode via `ask_question(...)`
    - interactive mode via `run_interactive_loop(...)`
 
@@ -991,7 +990,7 @@ It helps to separate the code into two groups.
 
 ### Live runtime path
 
-- `run_sql_agent.py`
+- `src/agent_zoo/sql_agent/cli.py`
 - `src/agent_zoo/sql_agent/agent.py`
 - `src/agent_zoo/sql_agent/config.py`
 - `src/agent_zoo/sql_agent/instructions.py`
@@ -1043,7 +1042,7 @@ If `uv run` fails before the agent starts, that is not an agent bug. It usually 
 In that case, retry with:
 
 ```powershell
-.\.venv\Scripts\python.exe run_sql_agent.py ...
+.\.venv\Scripts\run-sql-agent.exe ...
 ```
 
 ### Why `adk run` can show more text than the plain CLI
@@ -1077,7 +1076,7 @@ That is safer than generating plausible but wrong SQL.
 
 ### CLI arguments
 
-`run_sql_agent.py` supports:
+`run-sql-agent` supports:
 
 - `--db`
 - `--model`
@@ -1189,5 +1188,3 @@ The model is responsible for choosing and writing SQL.
 The Python code is responsible for deciding whether that SQL is safe, valid for the schema, executable in read-only mode, and presented consistently to the user.
 
 That separation is the main reason the project is understandable and testable.
-
-

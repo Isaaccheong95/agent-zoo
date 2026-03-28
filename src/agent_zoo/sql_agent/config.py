@@ -5,7 +5,7 @@ runtime defaults used across the SQL agent package. It is normally imported by
 the CLI entrypoint and helper modules rather than run directly.
 
 To exercise these settings in the full agent flow, run
-`uv run run_sql_agent.py --db dataset\\titantic\\titanic.sqlite`.
+`uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite`.
 """
 
 from __future__ import annotations

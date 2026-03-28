@@ -5,7 +5,7 @@ opens SQLite files in read-only mode, validates generated SQL, summarizes
 schema information, and returns structured execution results.
 
 It is designed to be imported by tools and tests rather than executed directly.
-The easiest way to use it end-to-end is through `uv run run_sql_agent.py`.
+The easiest way to use it end-to-end is through `uv run run-sql-agent`.
 """
 
 from __future__ import annotations
