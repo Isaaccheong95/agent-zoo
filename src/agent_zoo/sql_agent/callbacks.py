@@ -8,6 +8,7 @@ directly.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from google.adk.models import LlmResponse
@@ -20,6 +21,14 @@ from .formatting import format_structured_response
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
+SAFE_AGGREGATE_COLUMN_PATTERNS = (
+    "avg",
+    "average",
+    "min",
+    "minimum",
+    "max",
+    "maximum",
+)
 
 
 def _is_numeric(value: Any) -> bool:
@@ -30,6 +39,22 @@ def _normalize_count_value(value: Any) -> Any:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
+
+
+def _normalize_column_name(value: str) -> str:
+    return re.sub(r"\s+", "_", str(value).strip().lower())
+
+
+def _is_count_column(column_name: str) -> bool:
+    normalized = _normalize_column_name(column_name)
+    return "count" in normalized
+
+
+def _is_safe_aggregate_column(column_name: str) -> bool:
+    normalized = _normalize_column_name(column_name)
+    if _is_count_column(normalized):
+        return False
+    return any(pattern in normalized for pattern in SAFE_AGGREGATE_COLUMN_PATTERNS)
 
 
 def _clear_private_result_state(state: Any) -> None:
@@ -65,10 +90,24 @@ def _build_privacy_error_result(
     }
 
 
+def _build_detail_fallback_public_result(
+    tool_response: dict[str, Any],
+    minimum_aggregate_count: int,
+) -> dict[str, Any]:
+    return _build_scalar_public_result(
+        tool_response,
+        tool_response.get("row_count", 0),
+        minimum_aggregate_count,
+        public_result_kind="detail_count_fallback",
+    )
+
+
 def _build_scalar_public_result(
     tool_response: dict[str, Any],
     matching_count: Any,
     minimum_aggregate_count: int,
+    *,
+    public_result_kind: str = "count_aggregate",
 ) -> dict[str, Any]:
     normalized_count = _normalize_count_value(matching_count)
     if normalized_count < minimum_aggregate_count:
@@ -93,6 +132,7 @@ def _build_scalar_public_result(
         "truncated": False,
         "error": None,
         "matched_row_count": normalized_count,
+        "public_result_kind": public_result_kind,
     }
 
 
@@ -111,11 +151,11 @@ def _extract_scalar_numeric_value(rows: list[dict[str, Any]]) -> Any | None:
     return value
 
 
-def _detect_grouped_count_column(
+def _detect_count_column(
     rows: list[dict[str, Any]],
     columns: list[str],
 ) -> str | None:
-    if not rows or len(columns) < 2:
+    if not rows or not columns:
         return None
 
     numeric_columns = [
@@ -130,27 +170,163 @@ def _detect_grouped_count_column(
     return numeric_columns[0]
 
 
-def _build_grouped_public_result(
+def _detect_safe_aggregate_columns(
+    rows: list[dict[str, Any]],
+    columns: list[str],
+) -> list[str]:
+    if not rows:
+        return []
+
+    aggregate_columns = []
+    for column in columns:
+        if not _is_safe_aggregate_column(column):
+            continue
+        if all(_is_numeric(row.get(column)) for row in rows):
+            aggregate_columns.append(column)
+    return aggregate_columns
+
+
+def _sql_has_top_level_group_by(sql: str) -> bool:
+    state = "normal"
+    depth = 0
+    tokens: list[str] = []
+    token_chars: list[str] = []
+    index = 0
+    upper_sql = sql.upper()
+
+    while index < len(upper_sql):
+        char = upper_sql[index]
+        next_char = upper_sql[index + 1] if index + 1 < len(upper_sql) else ""
+
+        if state == "line_comment":
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            if char == "'" and next_char == "'":
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            if token_chars:
+                tokens.append("".join(token_chars))
+                token_chars = []
+            index += 1
+            continue
+
+        if char == ")":
+            depth = max(0, depth - 1)
+            if token_chars:
+                tokens.append("".join(token_chars))
+                token_chars = []
+            index += 1
+            continue
+
+        if depth > 0:
+            if token_chars:
+                tokens.append("".join(token_chars))
+                token_chars = []
+            index += 1
+            continue
+
+        if char.isalpha() or char == "_":
+            token_chars.append(char)
+        else:
+            if token_chars:
+                tokens.append("".join(token_chars))
+                token_chars = []
+        index += 1
+
+    if token_chars:
+        tokens.append("".join(token_chars))
+
+    for first, second in zip(tokens, tokens[1:]):
+        if first == "GROUP" and second == "BY":
+            return True
+    return False
+
+
+def _build_aggregate_public_result(
     tool_response: dict[str, Any],
     minimum_aggregate_count: int,
 ) -> dict[str, Any] | None:
     rows = tool_response.get("rows") or []
     columns = tool_response.get("columns") or []
-    count_column = _detect_grouped_count_column(rows, columns)
+    count_column = _detect_count_column(rows, columns)
     if count_column is None:
+        return None
+
+    aggregate_columns = _detect_safe_aggregate_columns(rows, columns)
+    has_group_by = _sql_has_top_level_group_by(tool_response.get("sql") or "")
+    is_scalar = len(rows) == 1 and not has_group_by
+    is_grouped = has_group_by
+
+    if not is_scalar and not is_grouped:
         return None
 
     if tool_response.get("truncated"):
         return _build_privacy_error_result(
             tool_response,
             (
-                "Privacy guardrail blocked this grouped result because only a preview "
-                "was available, so not every group could be checked safely."
+                "Privacy guardrail blocked this aggregate result because only a preview "
+                "was available, so not every cohort or group could be checked safely."
             ),
         )
 
     count_values = [row[count_column] for row in rows]
     if any(value < minimum_aggregate_count for value in count_values):
+        if not is_grouped:
+            matching_count = _normalize_count_value(count_values[0])
+            return _build_privacy_error_result(
+                tool_response,
+                (
+                    "Privacy guardrail blocked this result because the matching count "
+                    f"({matching_count}) is below the minimum threshold "
+                    f"({minimum_aggregate_count})."
+                ),
+                matched_row_count=matching_count,
+            )
         return _build_privacy_error_result(
             tool_response,
             (
@@ -162,6 +338,10 @@ def _build_grouped_public_result(
 
     public_result = dict(tool_response)
     public_result["matched_row_count"] = _normalize_count_value(sum(count_values))
+    public_result["aggregate_columns"] = aggregate_columns
+    public_result["public_result_kind"] = (
+        "safe_aggregate" if aggregate_columns else "count_aggregate"
+    )
     return public_result
 
 
@@ -175,25 +355,15 @@ def _build_public_query_result(
     if not settings.count_aggregates_only:
         return dict(tool_response)
 
-    rows = tool_response.get("rows") or []
-    scalar_value = _extract_scalar_numeric_value(rows)
-    if scalar_value is not None:
-        return _build_scalar_public_result(
-            tool_response,
-            scalar_value,
-            settings.minimum_aggregate_count,
-        )
-
-    grouped_result = _build_grouped_public_result(
+    aggregate_result = _build_aggregate_public_result(
         tool_response,
         settings.minimum_aggregate_count,
     )
-    if grouped_result is not None:
-        return grouped_result
+    if aggregate_result is not None:
+        return aggregate_result
 
-    return _build_scalar_public_result(
+    return _build_detail_fallback_public_result(
         tool_response,
-        tool_response.get("row_count", 0),
         settings.minimum_aggregate_count,
     )
 
