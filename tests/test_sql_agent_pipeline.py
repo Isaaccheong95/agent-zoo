@@ -13,7 +13,9 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from sql_agent.pipeline import run_nl_to_sql_pipeline
+from agent_zoo.sql_agent import SQLAgent
+from agent_zoo.sql_agent.agent import build_root_agent
+from agent_zoo.sql_agent.pipeline import run_nl_to_sql_pipeline
 
 
 def create_pipeline_fixture(db_path: Path) -> None:
@@ -102,5 +104,11 @@ class SQLPipelineTestCase(unittest.TestCase):
         self.assertIn("No SQL was generated", result["summary"])
 
 
+    def test_namespace_exports_sqlagent_alias(self) -> None:
+        self.assertIs(SQLAgent, build_root_agent)
+
 if __name__ == "__main__":
     unittest.main()
+
+
+

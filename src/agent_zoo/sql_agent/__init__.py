@@ -1,6 +1,7 @@
 from .config import SQLAgentSettings, load_settings
 
 __all__ = [
+    "SQLAgent",
     "SQLAgentSettings",
     "ask_question",
     "build_root_agent",
@@ -15,10 +16,11 @@ def __getattr__(name: str):
 
         return ask_question
 
-    if name in {"build_root_agent", "root_agent"}:
+    if name in {"SQLAgent", "build_root_agent", "root_agent"}:
         from .agent import build_root_agent, root_agent
 
         return {
+            "SQLAgent": build_root_agent,
             "build_root_agent": build_root_agent,
             "root_agent": root_agent,
         }[name]

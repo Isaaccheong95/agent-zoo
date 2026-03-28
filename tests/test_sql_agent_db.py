@@ -18,7 +18,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from sql_agent.callbacks import (
+from agent_zoo.sql_agent.callbacks import (
     SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     SQL_INTERNAL_RESULT_REF_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
@@ -26,9 +26,9 @@ from sql_agent.callbacks import (
     build_format_final_agent_response_callback,
     build_remember_query_result_callback,
 )
-from sql_agent.config import SQLAgentSettings, load_settings
-from sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
-from sql_agent.runtime import _print_debug_event
+from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
+from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
+from agent_zoo.sql_agent.runtime import _print_debug_event
 
 
 def create_fixture_database(db_path: Path) -> None:
@@ -473,4 +473,5 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

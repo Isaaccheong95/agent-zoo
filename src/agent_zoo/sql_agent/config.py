@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = PROJECT_ROOT / "dataset" / "titantic" / "titanic.sqlite"
 DEFAULT_MODEL = "openai/Qwen3.5-0.8B-GGUF"
 DEFAULT_PREVIEW_ROWS = 20

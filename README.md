@@ -97,6 +97,12 @@ Run agent commands directly through `uv`:
 uv run run_sql_agent.py --help
 ```
 
+Programmatic imports use the `agent_zoo` namespace:
+
+```python
+from agent_zoo.sql_agent import SQLAgent
+```
+
 If you prefer activating the environment manually, `uv sync` will create a local `.venv` for you.
 
 ## Why This Repo Exists
