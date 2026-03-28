@@ -100,7 +100,12 @@ uv run run_sql_agent.py --help
 Programmatic imports use the `agent_zoo` namespace:
 
 ```python
+import asyncio
+
 from agent_zoo.sql_agent import SQLAgent
+
+agent = SQLAgent()
+response = asyncio.run(agent.ask("How many passengers survived?"))
 ```
 
 If you prefer activating the environment manually, `uv sync` will create a local `.venv` for you.

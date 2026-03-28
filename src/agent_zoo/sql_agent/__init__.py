@@ -17,10 +17,10 @@ def __getattr__(name: str):
         return ask_question
 
     if name in {"SQLAgent", "build_root_agent", "root_agent"}:
-        from .agent import build_root_agent, root_agent
+        from .agent import SQLAgent, build_root_agent, root_agent
 
         return {
-            "SQLAgent": build_root_agent,
+            "SQLAgent": SQLAgent,
             "build_root_agent": build_root_agent,
             "root_agent": root_agent,
         }[name]

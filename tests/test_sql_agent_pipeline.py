@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import sys
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 
 CURRENT_FILE = Path(__file__).resolve()
@@ -13,8 +15,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from agent_zoo.sql_agent import SQLAgent
-from agent_zoo.sql_agent.agent import build_root_agent
+from agent_zoo.base import BaseAgent
+from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings
 from agent_zoo.sql_agent.pipeline import run_nl_to_sql_pipeline
 
 
@@ -103,12 +105,44 @@ class SQLPipelineTestCase(unittest.TestCase):
         self.assertIsNone(result["generated_sql"])
         self.assertIn("No SQL was generated", result["summary"])
 
+    def test_namespace_exports_instantiable_sqlagent(self) -> None:
+        agent = SQLAgent(
+            settings=SQLAgentSettings(
+                db_path=self.db_path,
+                model="openai/test-model",
+            )
+        )
 
-    def test_namespace_exports_sqlagent_alias(self) -> None:
-        self.assertIs(SQLAgent, build_root_agent)
+        self.assertIsInstance(agent, BaseAgent)
+        self.assertEqual(agent.get_name(), "sql_agent")
+        self.assertEqual(
+            agent.get_description(),
+            "Converts natural language questions into safe read-only SQLite queries and explains the results.",
+        )
+
+    def test_sqlagent_ask_delegates_to_runtime(self) -> None:
+        settings = SQLAgentSettings(
+            db_path=self.db_path,
+            model="openai/test-model",
+        )
+        agent = SQLAgent(settings=settings)
+        mocked_ask_question = AsyncMock(return_value="Found 2 matching rows.")
+
+        with patch("agent_zoo.sql_agent.runtime.ask_question", new=mocked_ask_question):
+            response = asyncio.run(
+                agent.ask(
+                    "How many female patients are below 45 years old?",
+                    session_id="test-session",
+                )
+            )
+
+        self.assertEqual(response, "Found 2 matching rows.")
+        mocked_ask_question.assert_awaited_once_with(
+            "How many female patients are below 45 years old?",
+            settings,
+            session_id="test-session",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

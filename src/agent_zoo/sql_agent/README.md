@@ -94,7 +94,7 @@ The model is responsible for understanding the user's request and proposing SQL.
 - executing against SQLite in read-only mode
 - formatting a predictable final answer
 
-The live agent is in `src/agent_zoo/sql_agent`. There is also a plain Python runner at `run_sql_agent.py` so you can use the agent without going through the ADK CLI. Programmatic imports now use `agent_zoo.sql_agent`, for example `from agent_zoo.sql_agent import SQLAgent`.
+The agent is in `src/agent_zoo/sql_agent`. There is also a Python runner at `run_sql_agent.py` so you can use the agent without going through the ADK CLI. Programmatic imports now use `agent_zoo.sql_agent`, for example `from agent_zoo.sql_agent import SQLAgent`, then `agent = SQLAgent()` and `await agent.ask(...)`.
 
 ## The Core Design
 
