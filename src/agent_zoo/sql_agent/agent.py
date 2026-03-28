@@ -15,7 +15,10 @@ from google.adk.agents import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
 
-from ..base import BaseAgent
+try:
+    from ..base import BaseAgent
+except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
+    from base import BaseAgent
 from .callbacks import (
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
