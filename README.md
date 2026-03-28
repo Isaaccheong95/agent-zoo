@@ -108,6 +108,27 @@ agent = SQLAgent()
 response = asyncio.run(agent.ask("How many passengers survived?"))
 ```
 
+To point the SQL agent at your own SQLite database, either pass `--db` on the CLI:
+
+```powershell
+uv run run-sql-agent --db D:\data\my_database.sqlite --question "How many rows are in this dataset?"
+```
+
+or configure the agent programmatically with a custom `db_path`:
+
+```python
+import asyncio
+from pathlib import Path
+
+from agent_zoo.sql_agent import SQLAgent, load_settings
+
+settings = load_settings({"db_path": Path(r"D:\data\my_database.sqlite")})
+agent = SQLAgent(settings=settings)
+response = asyncio.run(agent.ask("How many rows are in this dataset?"))
+```
+
+You can also set `SQL_AGENT_DB_PATH` in your environment if you want that database to be the default for future runs.
+
 If you prefer activating the environment manually, `uv sync` will create a local `.venv` for you.
 
 ## Why This Repo Exists
