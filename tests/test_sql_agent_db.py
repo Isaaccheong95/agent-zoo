@@ -223,6 +223,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 "SQL_AGENT_COUNT_AGGREGATES_ONLY": "false",
                 "SQL_AGENT_MINIMUM_AGGREGATE_COUNT": "7",
                 "SQL_AGENT_CAPTURE_INTERNAL_ROWS": "true",
+                "OPENAI_API_BASE": "http://127.0.0.1:9000/v1",
             },
             clear=False,
         ):
@@ -236,6 +237,30 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertFalse(overridden.count_aggregates_only)
         self.assertEqual(overridden.minimum_aggregate_count, 7)
         self.assertTrue(overridden.capture_internal_rows)
+        self.assertEqual(overridden.openai_api_base, "http://127.0.0.1:9000/v1")
+
+    def test_build_root_agent_applies_openai_api_base_before_model_construction(self) -> None:
+        from agent_zoo.sql_agent.agent import build_root_agent
+
+        settings = SQLAgentSettings(
+            db_path=REPO_ROOT / "dataset" / "titantic" / "titanic.sqlite",
+            model="openai/test-model",
+            openai_api_base="http://127.0.0.1:9001/v1",
+        )
+
+        def construct_model(*args, **kwargs):
+            self.assertEqual(os.environ["OPENAI_API_BASE"], settings.openai_api_base)
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "local-openai-compatible-key")
+            return SimpleNamespace()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("agent_zoo.sql_agent.agent.LiteLlm", side_effect=construct_model) as mocked_model:
+                with patch("agent_zoo.sql_agent.agent.LlmAgent", return_value=SimpleNamespace()):
+                    with patch("agent_zoo.sql_agent.agent.build_agent_instruction", return_value="instructions"):
+                        with patch("agent_zoo.sql_agent.agent.build_sql_tools", return_value=[]):
+                            build_root_agent(settings)
+
+        mocked_model.assert_called_once_with(model="openai/test-model")
 
     def test_detail_rows_become_public_matching_count_by_default(self) -> None:
         state = self._invoke_after_tool(
@@ -547,5 +572,4 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

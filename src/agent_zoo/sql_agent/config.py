@@ -64,6 +64,7 @@ def resolve_repo_path(raw_path: str | Path | None) -> Path | None:
 class SQLAgentSettings:
     db_path: Path
     model: str
+    openai_api_base: str | None = None
     debug: bool = False
     instruction_file: Path | None = None
     preview_rows: int = DEFAULT_PREVIEW_ROWS
@@ -86,6 +87,10 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     raw_model = overrides.get("model")
     if raw_model is None:
         raw_model = os.getenv("SQL_AGENT_MODEL", DEFAULT_MODEL)
+
+    raw_openai_api_base = overrides.get("openai_api_base")
+    if raw_openai_api_base is None:
+        raw_openai_api_base = os.getenv("OPENAI_API_BASE")
 
     raw_debug = overrides.get("debug")
     if raw_debug is None:
@@ -123,6 +128,11 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     return SQLAgentSettings(
         db_path=resolve_repo_path(raw_db_path) or DEFAULT_DB_PATH,
         model=str(raw_model),
+        openai_api_base=(
+            str(raw_openai_api_base).strip()
+            if raw_openai_api_base not in (None, "")
+            else None
+        ),
         debug=_parse_bool(raw_debug, default=False),
         instruction_file=resolved_instruction,
         preview_rows=preview_rows,

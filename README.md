@@ -129,7 +129,28 @@ response = asyncio.run(agent.ask("How many rows are in this dataset?"))
 
 You can also set `SQL_AGENT_DB_PATH` in your environment if you want that database to be the default for future runs.
 
-If you prefer activating the environment manually, `uv sync` will create a local `.venv` for you.
+#### Use your own OpenAI-compatible LLM server
+
+`agent-zoo` expects an OpenAI-compatible LLM endpoint. That can be a local `llama.cpp` server, a `vLLM` server, or another compatible backend that exposes a `/v1` API.
+
+Point the package at that server with `OPENAI_API_BASE`. `SQL_AGENT_MODEL` controls the model name sent to the server:
+
+```powershell
+$env:OPENAI_API_BASE = "http://127.0.0.1:8080/v1"
+$env:SQL_AGENT_MODEL = "openai/Qwen3.5-0.8B-GGUF"
+uv run run-sql-agent --db D:\data\my_database.sqlite --question "How many rows are in this dataset?"
+```
+
+Programmatic configuration uses the same setting:
+
+```python
+settings = load_settings(
+    {
+        "db_path": Path(r"D:\data\my_database.sqlite"),
+        "openai_api_base": "http://127.0.0.1:8080/v1",
+    }
+)
+```
 
 ## Why This Repo Exists
 
