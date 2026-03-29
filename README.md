@@ -43,6 +43,46 @@ Each agent lives in its own folder and should include its own:
 
 Browse the available agent folders and follow the instructions in each agent's local README to run or integrate it.
 
+### Install in your own project
+
+If you are not using `uv`, create and activate your virtual environment first, then install `agent-zoo` from the Git tag, branch, or commit you want:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.1.0"
+```
+
+This plain `pip install` path can take a long time because `pip` has to resolve the full Google ADK dependency tree from scratch when installing from the Git repo. If you want a faster install experience, prefer `uv`.
+
+If you are using `uv`, you can install it into a `uv`-managed environment like this:
+
+```bash
+uv venv
+uv pip install --python .venv/bin/python "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.1.0"
+```
+
+Then import the package from `agent_zoo` in your own code:
+
+```python
+import asyncio
+from pathlib import Path
+
+from agent_zoo.sql_agent import SQLAgent, load_settings
+
+settings = load_settings(
+    {
+        "db_path": Path("/path/to/my_database.sqlite"),
+        "openai_api_base": "http://127.0.0.1:8080/v1",
+    }
+)
+agent = SQLAgent(settings=settings)
+response = asyncio.run(agent.ask("How many rows are in this dataset?"))
+print(response)
+```
+
+If your OpenAI-compatible LLM server exposes a different model name than the default, set `SQL_AGENT_MODEL` in your environment before running your code.
+
 ### Set Up With uv
 
 This repository uses `uv` for dependency and environment management.
