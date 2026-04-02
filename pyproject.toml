@@ -14,7 +14,7 @@ dependencies = [
     "numpy>=2.4.3",
     "huggingface_hub",
     "openai",
-    "google-generativeai",
+    "google-genai",
     "python-dotenv>=1.0.1"
 ]
 
