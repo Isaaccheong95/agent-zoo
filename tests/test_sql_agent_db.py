@@ -28,7 +28,9 @@ from agent_zoo.sql_agent.callbacks import (
 )
 from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
+from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
+from agent_zoo.scope_guard import build_llm_scope_gate
 
 
 def create_fixture_database(db_path: Path) -> None:
@@ -174,6 +176,39 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["row_count"], 0)
         self.assertIn("no such column", result["error"].lower())
+
+    def test_build_agent_instruction_mentions_clarifying_near_matches(self) -> None:
+        instruction = build_agent_instruction(
+            SQLAgentSettings(
+                db_path=self.db_path,
+                model="test-model",
+            )
+        )
+
+        self.assertIn("approximate, colloquial, or partially incorrect dataset terminology", instruction)
+        self.assertIn("fare class", instruction)
+
+    def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="IN_SCOPE"))]
+            )
+
+        classifier = build_llm_scope_gate(
+            "test-model",
+            "titanic_passengers(pclass INTEGER, fare REAL)",
+        )
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            allow, refusal = classifier("how many ppl in each fare class")
+
+        self.assertTrue(allow)
+        self.assertIsNone(refusal)
+        self.assertIn("schema-adjacent wording", captured["system_prompt"])
+        self.assertIn("fare class", captured["system_prompt"])
 
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):

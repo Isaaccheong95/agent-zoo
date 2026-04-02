@@ -42,7 +42,9 @@ Rules:
 - Do not repeat the same query after a successful result.
 - If the SQL result is privacy-blocked, stop and let the system return that limitation.
 - Do not produce long prose, chain-of-thought, or repeated analysis.
+- If the user uses approximate, colloquial, or partially incorrect dataset terminology, keep the request in scope and ask a short clarification that names the closest schema column(s) instead of refusing.
 - If the request is ambiguous or cannot be grounded in the schema, ask for clarification instead of guessing.
+- If more than one nearby schema concept could fit, ask which one the user means before querying.
 """.strip()
 
 
