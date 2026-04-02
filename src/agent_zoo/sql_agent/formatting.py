@@ -121,9 +121,7 @@ def build_default_explanation(tool_result: dict) -> str:
 
 def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
     sql = tool_result.get("sql") or "Not executed"
-    summary = summarize_execution_result(tool_result)
     result_payload = format_result_payload(tool_result)
-    detail = explanation.strip() if explanation and explanation.strip() else build_default_explanation(tool_result)
 
     code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
     result_block = f"```{code_block}\n{result_payload}\n```".strip()
@@ -131,10 +129,6 @@ def format_structured_response(tool_result: dict, explanation: str | None = None
     return (
         "Generated SQL:\n"
         f"```sql\n{sql}\n```\n\n"
-        "Result summary:\n"
-        f"{summary}\n\n"
         "Result:\n"
-        f"{result_block}\n\n"
-        "Explanation:\n"
-        f"{detail}"
+        f"{result_block}"
     )
