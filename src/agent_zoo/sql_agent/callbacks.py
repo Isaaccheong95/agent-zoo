@@ -114,11 +114,7 @@ def _build_scalar_public_result(
     if normalized_count < minimum_aggregate_count:
         return _build_privacy_error_result(
             tool_response,
-            (
-                "Privacy guardrail blocked this result because the matching count "
-                f"({normalized_count}) is below the minimum threshold "
-                f"({minimum_aggregate_count})."
-            ),
+            "Privacy guardrail blocked this result because the matching count is below the minimum threshold.",
             matched_row_count=normalized_count,
         )
 
@@ -408,11 +404,7 @@ def _build_aggregate_public_result(
         if subset_count is not None and subset_count < minimum_aggregate_count:
             return _build_privacy_error_result(
                 tool_response,
-                (
-                    "Privacy guardrail blocked this result because the matching count "
-                    f"({subset_count}) is below the minimum threshold "
-                    f"({minimum_aggregate_count})."
-                ),
+                "Privacy guardrail blocked this result because the matching count is below the minimum threshold.",
                 matched_row_count=subset_count,
             )
         public_result = dict(tool_response)
@@ -445,19 +437,12 @@ def _build_aggregate_public_result(
             matching_count = _normalize_count_value(count_values[0])
             return _build_privacy_error_result(
                 tool_response,
-                (
-                    "Privacy guardrail blocked this result because the matching count "
-                    f"({matching_count}) is below the minimum threshold "
-                    f"({minimum_aggregate_count})."
-                ),
+                "Privacy guardrail blocked this result because the matching count is below the minimum threshold.",
                 matched_row_count=matching_count,
             )
         return _build_privacy_error_result(
             tool_response,
-            (
-                "Privacy guardrail blocked this grouped result because at least one "
-                f"group count is below the minimum threshold ({minimum_aggregate_count})."
-            ),
+            "Privacy guardrail blocked this grouped result because at least one group count is below the minimum threshold.",
             matched_row_count=_normalize_count_value(sum(count_values)),
         )
 

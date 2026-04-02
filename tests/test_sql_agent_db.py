@@ -371,7 +371,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["status"], "error")
         self.assertTrue(public_result["privacy_blocked"])
         self.assertEqual(public_result["matched_row_count"], 2)
-        self.assertIn("minimum threshold (3)", public_result["error"])
+        self.assertIn("minimum threshold", public_result["error"])
 
     def test_grouped_counts_below_threshold_are_blocked(self) -> None:
         state = self._invoke_after_tool(
@@ -441,7 +441,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
         self.assertEqual(public_result["status"], "error")
         self.assertTrue(public_result["privacy_blocked"])
-        self.assertIn("minimum threshold (3)", public_result["error"])
+        self.assertIn("minimum threshold", public_result["error"])
 
     def test_grouped_average_above_threshold_is_kept_publicly(self) -> None:
         state = self._invoke_after_tool(
