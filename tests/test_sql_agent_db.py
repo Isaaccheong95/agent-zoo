@@ -186,7 +186,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         )
 
         self.assertIn("approximate, colloquial, or partially incorrect dataset terminology", instruction)
-        self.assertIn("fare class", instruction)
+        self.assertIn("nearby schema concept", instruction)
 
     def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
         captured: dict[str, str] = {}
@@ -208,7 +208,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertTrue(allow)
         self.assertIsNone(refusal)
         self.assertIn("schema-adjacent wording", captured["system_prompt"])
-        self.assertIn("fare class", captured["system_prompt"])
+        self.assertIn("near-match", captured["system_prompt"])
 
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):
