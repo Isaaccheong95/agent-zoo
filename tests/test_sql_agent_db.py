@@ -373,6 +373,22 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["matched_row_count"], 2)
         self.assertIn("minimum threshold", public_result["error"])
 
+    def test_scalar_count_with_non_count_alias_uses_actual_value(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [{"total_passengers": 4}],
+                columns=["total_passengers"],
+                sql="SELECT COUNT(*) AS total_passengers FROM people",
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["rows"], [{"matching_count": 4}])
+        self.assertEqual(public_result["matched_row_count"], 4)
+        self.assertEqual(public_result["public_result_kind"], "count_aggregate")
+
     def test_grouped_counts_below_threshold_are_blocked(self) -> None:
         state = self._invoke_after_tool(
             self._settings(minimum_aggregate_count=3),

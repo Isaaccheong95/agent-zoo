@@ -49,6 +49,7 @@ def build_llm_scope_gate(
             return True, None
         try:
             import litellm
+
             response = litellm.completion(
                 model=model,
                 messages=[
@@ -56,9 +57,17 @@ def build_llm_scope_gate(
                     {"role": "user", "content": user_text},
                 ],
                 temperature=0.0,
-                max_tokens=5,
+                max_tokens=300,  # give room for final IN_SCOPE/OUT_OF_SCOPE token
+                extra_body={
+                    # common for vLLM / HF chat-template based servers
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    # common for some Qwen/Ollama-style backends
+                    # "think": False,
+                },
             )
             verdict = (response.choices[0].message.content or "").strip().upper()
+            print("LLM judge response", response)
+
         except Exception:
             return True, None  # Fail open on classifier error
         if "OUT_OF_SCOPE" in verdict:
@@ -66,4 +75,3 @@ def build_llm_scope_gate(
         return True, None
 
     return classify
-

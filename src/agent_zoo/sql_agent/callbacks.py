@@ -383,26 +383,54 @@ def _build_count_sql(sql: str) -> str | None:
     return f"SELECT COUNT(*) {from_clause}"
 
 
+def _is_top_level_scalar_count_sql(sql: str) -> bool:
+    select_pos = _find_top_level_keyword(sql, "SELECT")
+    from_pos = _find_top_level_keyword(sql, "FROM")
+    if select_pos is None or from_pos is None or from_pos <= select_pos:
+        return False
+
+    select_clause = sql[select_pos + len("SELECT"):from_pos].strip()
+    return bool(
+        re.match(
+            r'^COUNT\s*\((?:[^()]|\([^()]*\))*\)\s*(?:AS\s+"?[A-Za-z_][A-Za-z0-9_]*"?)?$',
+            select_clause,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _build_aggregate_public_result(
     tool_response: dict[str, Any],
     minimum_aggregate_count: int,
 ) -> dict[str, Any] | None:
     rows = tool_response.get("rows") or []
     columns = tool_response.get("columns") or []
+    sql = tool_response.get("sql") or ""
+    has_group_by = _sql_has_top_level_group_by(sql)
     count_column = _detect_count_column(rows, columns)
     if count_column is None:
+        scalar_numeric_value = _extract_scalar_numeric_value(rows)
+        if (
+            scalar_numeric_value is not None
+            and not has_group_by
+            and _is_top_level_scalar_count_sql(sql)
+        ):
+            return _build_scalar_public_result(
+                tool_response,
+                scalar_numeric_value,
+                minimum_aggregate_count,
+            )
+
         # No COUNT column — check if this is a pure scalar aggregate (MIN/MAX/AVG etc.).
         # If so, run a COUNT(*) over the same FROM/WHERE to get the actual subset size
         # and use that for the privacy threshold check.
         aggregate_columns = _detect_safe_aggregate_columns(rows, columns)
         if not aggregate_columns:
             return None
-        has_group_by = _sql_has_top_level_group_by(tool_response.get("sql") or "")
         if has_group_by:
             # Grouped aggregates without a COUNT column can't be checked per-group
             return None
         db_path = tool_response.get("db_path") or ""
-        sql = tool_response.get("sql") or ""
         count_sql = _build_count_sql(sql)
         subset_count = count_subset_rows(db_path, count_sql) if (count_sql and db_path) else None
         if subset_count is not None and subset_count < minimum_aggregate_count:
@@ -419,7 +447,6 @@ def _build_aggregate_public_result(
         return public_result
 
     aggregate_columns = _detect_safe_aggregate_columns(rows, columns)
-    has_group_by = _sql_has_top_level_group_by(tool_response.get("sql") or "")
     is_scalar = len(rows) == 1 and not has_group_by
     is_grouped = has_group_by
 
