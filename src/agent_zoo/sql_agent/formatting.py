@@ -126,9 +126,17 @@ def format_structured_response(tool_result: dict, explanation: str | None = None
     code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
     result_block = f"```{code_block}\n{result_payload}\n```".strip()
 
-    return (
+    output = (
         "Generated SQL:\n"
         f"```sql\n{sql}\n```\n\n"
         "Result:\n"
         f"{result_block}"
     )
+
+    if tool_result.get("public_result_kind") == "detail_count_fallback":
+        output += (
+            "\n\nNote: Individual row-level data cannot be returned due to privacy guardrails. "
+            "Only the number of matching records is shown."
+        )
+
+    return output
