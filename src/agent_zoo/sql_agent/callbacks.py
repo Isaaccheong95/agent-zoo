@@ -15,8 +15,12 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
-from .db import count_subset_rows
+from .db import count_subset_rows, get_schema_summary
 from .formatting import format_structured_response
+try:
+    from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
+except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
+    from scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate  # type: ignore[no-redef]
 
 
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
@@ -547,6 +551,79 @@ def build_finalize_after_query_before_model_callback(
         )
 
     return finalize_after_query
+
+
+def _extract_last_user_text(llm_request) -> str:
+    """Return the text of the most recent user turn from an LlmRequest."""
+    contents = getattr(llm_request, "contents", None) or []
+    for content in reversed(contents):
+        if getattr(content, "role", None) == "user":
+            parts = getattr(content, "parts", None) or []
+            return " ".join(
+                getattr(part, "text", "") or "" for part in parts
+            ).strip()
+    return ""
+
+
+def build_scope_gate_callback(
+    classifier,
+    refusal_message: str = DEFAULT_REFUSAL_MESSAGE,
+):
+    """Return a before_model_callback that refuses prompts judged out-of-scope.
+
+    classifier is a callable (user_text) -> (allow: bool, refusal: str | None),
+    e.g. the return value of build_llm_scope_gate().
+    Returns None when the prompt is in scope or when a SQL result is already in
+    state (i.e. the agent is mid-execution past the first LLM call).
+    """
+    def scope_gate(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        # Skip the check if the most recent content in the request is a tool
+        # response — that means we're on the second LLM call within the same
+        # turn (after the SQL tool ran), not at the start of a new user message.
+        if llm_request is not None:
+            contents = getattr(llm_request, "contents", None) or []
+            if contents:
+                last_role = getattr(contents[-1], "role", None)
+                if last_role == "tool":
+                    return None
+                last_parts = getattr(contents[-1], "parts", None) or []
+                if any(getattr(p, "function_response", None) is not None for p in last_parts):
+                    return None
+
+        user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+        allow, refusal = classifier(user_text)
+        if not allow:
+            return LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=refusal)],
+                )
+            )
+        return None
+
+    return scope_gate
+
+
+def build_combined_before_model_callback(
+    settings: SQLAgentSettings | None = None,
+):
+    """Chain LLM scope gate → finalize-after-query into a single before_model_callback."""
+    active_settings = settings or load_settings()
+
+    schema_summary = get_schema_summary(active_settings.db_path)
+    schema_text = schema_summary.get("schema_text") or ""
+    classifier = build_llm_scope_gate(active_settings.model, schema_text)
+
+    scope_gate = build_scope_gate_callback(classifier)
+    finalize = build_finalize_after_query_before_model_callback(active_settings)
+
+    def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
+        if result is not None:
+            return result
+        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+    return combined
 
 
 remember_query_result = build_remember_query_result_callback()
