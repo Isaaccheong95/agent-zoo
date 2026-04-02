@@ -15,7 +15,7 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
-from .db import count_subset_rows, get_schema_summary
+from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import format_structured_response
 try:
     from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
@@ -383,6 +383,33 @@ def _build_count_sql(sql: str) -> str | None:
     return f"SELECT COUNT(*) {from_clause}"
 
 
+def _build_grouped_count_sql(sql: str) -> str | None:
+    from_pos = _find_top_level_keyword(sql, "FROM")
+    group_by_pos = _find_top_level_keyword(sql, "GROUP BY")
+    if from_pos is None or group_by_pos is None or group_by_pos <= from_pos:
+        return None
+
+    from_rest = sql[from_pos:]
+    from_cut_pos = len(from_rest)
+    for terminal in ("ORDER BY", "LIMIT"):
+        pos = _find_top_level_keyword(from_rest, terminal)
+        if pos is not None and pos < from_cut_pos:
+            from_cut_pos = pos
+    from_clause = from_rest[:from_cut_pos].rstrip()
+
+    group_by_rest = sql[group_by_pos + len("GROUP BY"):]
+    group_by_cut_pos = len(group_by_rest)
+    for terminal in ("HAVING", "ORDER BY", "LIMIT"):
+        pos = _find_top_level_keyword(group_by_rest, terminal)
+        if pos is not None and pos < group_by_cut_pos:
+            group_by_cut_pos = pos
+    group_by_clause = group_by_rest[:group_by_cut_pos].strip()
+    if not group_by_clause:
+        return None
+
+    return f"SELECT {group_by_clause}, COUNT(*) AS matching_count {from_clause}"
+
+
 def _is_top_level_scalar_count_sql(sql: str) -> bool:
     select_pos = _find_top_level_keyword(sql, "SELECT")
     from_pos = _find_top_level_keyword(sql, "FROM")
@@ -428,8 +455,68 @@ def _build_aggregate_public_result(
         if not aggregate_columns:
             return None
         if has_group_by:
-            # Grouped aggregates without a COUNT column can't be checked per-group
-            return None
+            db_path = tool_response.get("db_path") or ""
+            count_sql = _build_grouped_count_sql(sql)
+            count_result = (
+                execute_sqlite_query(db_path, count_sql, preview_rows=max(len(rows), 1))
+                if (count_sql and db_path)
+                else {"status": "error"}
+            )
+            if count_result.get("status") != "success" or count_result.get("truncated"):
+                return None
+
+            count_rows = count_result.get("rows") or []
+            count_columns = count_result.get("columns") or []
+            group_columns = [
+                column
+                for column in columns
+                if column not in aggregate_columns and column in count_columns
+            ]
+            if not group_columns or len(count_rows) != len(rows):
+                return None
+
+            count_by_group: dict[tuple[Any, ...], Any] = {}
+            for count_row in count_rows:
+                matching_count = count_row.get("matching_count")
+                if not _is_numeric(matching_count):
+                    return None
+                key = tuple(count_row.get(column) for column in group_columns)
+                if key in count_by_group:
+                    return None
+                count_by_group[key] = matching_count
+
+            count_values = []
+            public_rows = []
+            remaining_columns = [column for column in columns if column not in group_columns]
+            for row in rows:
+                key = tuple(row.get(column) for column in group_columns)
+                matching_count = count_by_group.get(key)
+                if not _is_numeric(matching_count):
+                    return None
+                normalized_count = _normalize_count_value(matching_count)
+                count_values.append(normalized_count)
+
+                public_row = {column: row.get(column) for column in group_columns}
+                public_row["matching_count"] = normalized_count
+                for column in remaining_columns:
+                    public_row[column] = row.get(column)
+                public_rows.append(public_row)
+
+            if any(value < minimum_aggregate_count for value in count_values):
+                return _build_privacy_error_result(
+                    tool_response,
+                    "Privacy guardrail blocked this grouped result because at least one group count is below the minimum threshold.",
+                    matched_row_count=_normalize_count_value(sum(count_values)),
+                )
+
+            public_result = dict(tool_response)
+            public_result["columns"] = [*group_columns, "matching_count", *remaining_columns]
+            public_result["rows"] = public_rows
+            public_result["matched_row_count"] = _normalize_count_value(sum(count_values))
+            public_result["aggregate_columns"] = aggregate_columns
+            public_result["public_result_kind"] = "safe_aggregate"
+            return public_result
+
         db_path = tool_response.get("db_path") or ""
         count_sql = _build_count_sql(sql)
         subset_count = count_subset_rows(db_path, count_sql) if (count_sql and db_path) else None

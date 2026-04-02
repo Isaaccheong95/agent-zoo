@@ -479,6 +479,37 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
         self.assertEqual(public_result["rows"][0]["average_age"], 31.4)
 
+    def test_grouped_average_without_matching_count_derives_group_counts(self) -> None:
+        count_result = make_query_result(
+            [
+                {"sex": "female", "matching_count": 5},
+                {"sex": "male", "matching_count": 4},
+            ],
+            columns=["sex", "matching_count"],
+            row_count=2,
+            sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
+        )
+
+        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=count_result):
+            state = self._invoke_after_tool(
+                self._settings(minimum_aggregate_count=3),
+                make_query_result(
+                    [
+                        {"sex": "female", "average_age": 31.4},
+                        {"sex": "male", "average_age": 44.0},
+                    ],
+                    columns=["sex", "average_age"],
+                    row_count=2,
+                    sql="SELECT sex, AVG(age) AS average_age FROM people GROUP BY sex",
+                ),
+            )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["rows"][0]["matching_count"], 5)
+        self.assertEqual(public_result["matched_row_count"], 9)
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+
     def test_grouped_average_below_threshold_is_blocked(self) -> None:
         state = self._invoke_after_tool(
             self._settings(minimum_aggregate_count=3),
