@@ -15,6 +15,7 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
+from .db import count_subset_rows
 from .formatting import format_structured_response
 
 
@@ -287,6 +288,101 @@ def _sql_has_top_level_group_by(sql: str) -> bool:
     return False
 
 
+def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
+    """Return the start position of the first top-level occurrence of keyword in sql.
+
+    Top-level means not inside parentheses, quoted strings, or comments.
+    Returns None if not found.
+    """
+    upper = sql.upper()
+    keyword_upper = keyword.upper()
+    keyword_len = len(keyword_upper)
+    state = "normal"
+    depth = 0
+    index = 0
+    while index < len(upper):
+        char = upper[index]
+        next_char = upper[index + 1] if index + 1 < len(upper) else ""
+        if state == "line_comment":
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+        if state == "block_comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+        if state == "single_quote":
+            if char == "'" and next_char == "'":
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+        if state == "double_quote":
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            state = "line_comment"
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            state = "block_comment"
+            index += 2
+            continue
+        if char == "'":
+            state = "single_quote"
+            index += 1
+            continue
+        if char == '"':
+            state = "double_quote"
+            index += 1
+            continue
+        if char == "(":
+            depth += 1
+            index += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if depth == 0 and upper[index:index + keyword_len] == keyword_upper:
+            before = upper[index - 1] if index > 0 else " "
+            after = upper[index + keyword_len] if index + keyword_len < len(upper) else " "
+            if (not before.isalnum() and before != "_") and (not after.isalnum() and after != "_"):
+                return index
+        index += 1
+    return None
+
+
+def _build_count_sql(sql: str) -> str | None:
+    """Convert a scalar aggregate SELECT to SELECT COUNT(*) over the same FROM/WHERE.
+
+    For example:
+        SELECT MIN(age) FROM t WHERE sex = 'male'
+        → SELECT COUNT(*) FROM t WHERE sex = 'male'
+
+    Returns None if the FROM clause cannot be found.
+    """
+    from_pos = _find_top_level_keyword(sql, "FROM")
+    if from_pos is None:
+        return None
+    rest = sql[from_pos:]
+    cut_pos = len(rest)
+    for terminal in ("GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
+        pos = _find_top_level_keyword(rest, terminal)
+        if pos is not None and pos < cut_pos:
+            cut_pos = pos
+    from_clause = rest[:cut_pos].rstrip()
+    return f"SELECT COUNT(*) {from_clause}"
+
+
 def _build_aggregate_public_result(
     tool_response: dict[str, Any],
     minimum_aggregate_count: int,
@@ -295,7 +391,36 @@ def _build_aggregate_public_result(
     columns = tool_response.get("columns") or []
     count_column = _detect_count_column(rows, columns)
     if count_column is None:
-        return None
+        # No COUNT column — check if this is a pure scalar aggregate (MIN/MAX/AVG etc.).
+        # If so, run a COUNT(*) over the same FROM/WHERE to get the actual subset size
+        # and use that for the privacy threshold check.
+        aggregate_columns = _detect_safe_aggregate_columns(rows, columns)
+        if not aggregate_columns:
+            return None
+        has_group_by = _sql_has_top_level_group_by(tool_response.get("sql") or "")
+        if has_group_by:
+            # Grouped aggregates without a COUNT column can't be checked per-group
+            return None
+        db_path = tool_response.get("db_path") or ""
+        sql = tool_response.get("sql") or ""
+        count_sql = _build_count_sql(sql)
+        subset_count = count_subset_rows(db_path, count_sql) if (count_sql and db_path) else None
+        if subset_count is not None and subset_count < minimum_aggregate_count:
+            return _build_privacy_error_result(
+                tool_response,
+                (
+                    "Privacy guardrail blocked this result because the matching count "
+                    f"({subset_count}) is below the minimum threshold "
+                    f"({minimum_aggregate_count})."
+                ),
+                matched_row_count=subset_count,
+            )
+        public_result = dict(tool_response)
+        public_result["aggregate_columns"] = aggregate_columns
+        public_result["public_result_kind"] = "safe_aggregate"
+        if subset_count is not None:
+            public_result["matched_row_count"] = subset_count
+        return public_result
 
     aggregate_columns = _detect_safe_aggregate_columns(rows, columns)
     has_group_by = _sql_has_top_level_group_by(tool_response.get("sql") or "")

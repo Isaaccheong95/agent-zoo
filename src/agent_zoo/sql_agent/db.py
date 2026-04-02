@@ -416,3 +416,21 @@ def execute_sqlite_query(
             "truncated": False,
             "error": f"SQLite execution failed: {exc}",
         }
+
+
+def count_subset_rows(db_path: str | Path, count_sql: str) -> int | None:
+    """Execute a pre-built COUNT(*) query and return the integer result, or None on failure."""
+    try:
+        path = _ensure_database_exists(db_path)
+        with closing(_connect_read_only(path)) as connection:
+            row = connection.execute(count_sql).fetchone()
+            if row is None:
+                return None
+            value = row[0]
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            return None
+    except Exception:
+        return None
