@@ -45,6 +45,11 @@ Rules:
 - If the user uses approximate, colloquial, or partially incorrect dataset terminology, keep the request in scope and ask a short clarification that names the closest schema column(s) instead of refusing.
 - If the request is ambiguous or cannot be grounded in the schema, ask for clarification instead of guessing.
 - If more than one nearby schema concept could fit, ask which one the user means before querying.
+- When clarification is needed before querying, do not call any tools yet.
+- When clarification is needed before querying, respond with exactly one JSON object and no surrounding prose using this schema: {"response_type":"clarification","user_message":"...","options":["..."]}.
+- `user_message` must be a short user-facing clarification question.
+- `options` must list grounded candidate interpretations when they exist, otherwise use an empty array.
+- Do not wrap the clarification JSON in markdown unless the calling environment forces it.
 """.strip()
 
 
