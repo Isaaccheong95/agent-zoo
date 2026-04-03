@@ -73,6 +73,31 @@ def create_fixture_database(db_path: Path) -> None:
     connection.close()
 
 
+def create_object_mode_fixture_database(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE records (
+            id INTEGER PRIMARY KEY,
+            person_id TEXT NOT NULL,
+            event_rank INTEGER NOT NULL,
+            city TEXT NOT NULL,
+            score REAL NOT NULL,
+            payload BLOB
+        );
+
+        INSERT INTO records (person_id, event_rank, city, score, payload) VALUES
+            ('p1', 2, 'Singapore', 10.0, x'01'),
+            ('p1', 1, 'Tokyo', 20.0, x'02'),
+            ('p2', 1, 'Paris', 30.0, x'03'),
+            ('p3', 2, 'Paris', 40.0, x'04'),
+            ('p3', 1, 'Tokyo', 50.0, x'05');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 def make_query_result(
     rows: list[dict],
     *,
@@ -211,6 +236,131 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("near-match", captured["system_prompt"])
 
 
+class SQLAgentObjectModeTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_root = REPO_ROOT / ".tmp_test_runs"
+        temp_root.mkdir(exist_ok=True)
+        self.db_path = temp_root / f"{uuid.uuid4().hex}.sqlite"
+        create_object_mode_fixture_database(self.db_path)
+
+    def tearDown(self) -> None:
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def _object_settings(self, **overrides) -> SQLAgentSettings:
+        settings = SQLAgentSettings(
+            db_path=self.db_path,
+            model="test-model",
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+        for key, value in overrides.items():
+            setattr(settings, key, value)
+        return settings
+
+    def test_execute_sqlite_query_preserves_row_level_behavior_without_object_id(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS total_rows FROM records",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["rows"][0]["total_rows"], 5)
+
+    def test_execute_sqlite_query_counts_distinct_objects_when_object_id_is_configured(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS total_rows FROM records",
+            object_id_column="person_id",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["rows"][0]["total_rows"], 3)
+
+    def test_execute_sqlite_query_selects_canonical_rows_using_object_order_column(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT person_id, city, score FROM records ORDER BY person_id",
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["row_count"], 3)
+        self.assertEqual(
+            result["rows"],
+            [
+                {"person_id": "p1", "city": "Tokyo", "score": 20.0},
+                {"person_id": "p2", "city": "Paris", "score": 30.0},
+                {"person_id": "p3", "city": "Tokyo", "score": 50.0},
+            ],
+        )
+
+    def test_execute_sqlite_query_uses_first_occurrence_when_object_order_column_is_omitted(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT person_id, city, score FROM records ORDER BY person_id",
+            object_id_column="person_id",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["row_count"], 3)
+        self.assertEqual(
+            result["rows"],
+            [
+                {"person_id": "p1", "city": "Singapore", "score": 10.0},
+                {"person_id": "p2", "city": "Paris", "score": 30.0},
+                {"person_id": "p3", "city": "Paris", "score": 40.0},
+            ],
+        )
+
+    def test_execute_sqlite_query_returns_clear_error_for_missing_object_id_column(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS total_rows FROM records",
+            object_id_column="missing_person_id",
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("object_id_column 'missing_person_id'", result["error"])
+
+    def test_execute_sqlite_query_returns_clear_error_for_unorderable_object_order_column(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS total_rows FROM records",
+            object_id_column="person_id",
+            object_order_column="payload",
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("object_order_column 'payload'", result["error"])
+
+    def test_grouped_aggregate_object_mode_uses_canonical_rows(self) -> None:
+        tool_response = execute_sqlite_query(
+            self.db_path,
+            "SELECT city, AVG(score) AS average_score FROM records GROUP BY city ORDER BY city",
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+        callback = build_remember_query_result_callback(self._object_settings(minimum_aggregate_count=1))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={})
+
+        callback(tool, {}, tool_context, tool_response)
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["matched_row_count"], 3)
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+        self.assertEqual(
+            public_result["rows"],
+            [
+                {"city": "Paris", "matching_count": 1, "average_score": 30.0},
+                {"city": "Tokyo", "matching_count": 2, "average_score": 35.0},
+            ],
+        )
+
+
 class SQLAgentPrivacyTestCase(unittest.TestCase):
     def _settings(self, **overrides) -> SQLAgentSettings:
         settings = SQLAgentSettings(
@@ -273,6 +423,43 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(overridden.minimum_aggregate_count, 7)
         self.assertTrue(overridden.capture_internal_rows)
         self.assertEqual(overridden.openai_api_base, "http://127.0.0.1:9000/v1")
+
+    def test_load_settings_supports_object_level_configuration(self) -> None:
+        settings = load_settings(
+            {
+                "db_path": str(REPO_ROOT / "dataset" / "titantic" / "titanic.sqlite"),
+                "model": "test-model",
+            }
+        )
+
+        self.assertIsNone(settings.object_id_column)
+        self.assertIsNone(settings.object_order_column)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SQL_AGENT_OBJECT_ID_COLUMN": "person_id",
+                "SQL_AGENT_OBJECT_ORDER_COLUMN": "event_rank",
+            },
+            clear=False,
+        ):
+            overridden = load_settings(
+                {
+                    "db_path": str(REPO_ROOT / "dataset" / "titantic" / "titanic.sqlite"),
+                    "model": "test-model",
+                }
+            )
+
+        self.assertEqual(overridden.object_id_column, "person_id")
+        self.assertEqual(overridden.object_order_column, "event_rank")
+        with self.assertRaises(ValueError):
+            load_settings(
+                {
+                    "db_path": str(REPO_ROOT / "dataset" / "titantic" / "titanic.sqlite"),
+                    "model": "test-model",
+                    "object_order_column": "event_rank",
+                }
+            )
 
     def test_build_root_agent_applies_openai_api_base_before_model_construction(self) -> None:
         from agent_zoo.sql_agent.agent import build_root_agent

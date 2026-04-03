@@ -76,6 +76,8 @@ def build_agent_instruction(settings: SQLAgentSettings) -> str:
 - Count aggregates only: {settings.count_aggregates_only}
 - Minimum aggregate count: {settings.minimum_aggregate_count}
 - Capture internal rows: {settings.capture_internal_rows}
+- Object ID column: {settings.object_id_column or "Not configured"}
+- Object order column: {settings.object_order_column or "Not configured"}
 
 ## Schema Snapshot
 ```text

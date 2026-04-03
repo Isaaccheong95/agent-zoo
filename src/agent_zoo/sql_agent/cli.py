@@ -12,6 +12,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help="LiteLLM model identifier to use.")
     parser.add_argument("--debug", action="store_true", help="Print intermediate ADK events while the agent is running.")
     parser.add_argument("--instruction-file", help="Optional path to a custom base instruction file.")
+    parser.add_argument("--object-id-column", help="Optional column name that identifies one logical object across multiple rows.")
+    parser.add_argument("--object-order-column", help="Optional orderable column name used to choose the canonical row per object.")
     parser.add_argument("--question", help="Run a single question and exit. If omitted, an interactive loop starts.")
     return parser.parse_args()
 
@@ -26,6 +28,8 @@ async def _main_async() -> int:
             "model": args.model,
             "debug": args.debug,
             "instruction_file": args.instruction_file,
+            "object_id_column": args.object_id_column,
+            "object_order_column": args.object_order_column,
         }
     )
 

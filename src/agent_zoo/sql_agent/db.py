@@ -41,6 +41,12 @@ UNSAFE_SQL_TOKENS = {
     "UPDATE",
     "VACUUM",
 }
+OBJECT_SOURCE_CTE_NAME = "__az_object_source"
+OBJECT_RANKED_CTE_NAME = "__az_object_ranked"
+OBJECT_CANONICAL_CTE_NAME = "__az_object_canonical"
+OBJECT_SOURCE_ORDINAL_COLUMN = "__az_source_ordinal"
+OBJECT_ROW_NUMBER_COLUMN = "__az_object_row_number"
+UNORDERABLE_DECLARED_TYPE_TOKENS = ("BLOB",)
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -191,6 +197,271 @@ def _scan_sql(sql: str) -> tuple[str, str, list[str]]:
 
 def _normalized_statement(sql: str) -> str:
     return _normalize_whitespace(sql).rstrip(";").strip()
+
+
+def _normalize_declared_type(value: str | None) -> str:
+    return _normalize_whitespace(str(value or "")).upper()
+
+
+def _is_orderable_declared_type(value: str | None) -> bool:
+    normalized = _normalize_declared_type(value)
+    return not any(token in normalized for token in UNORDERABLE_DECLARED_TYPE_TOKENS)
+
+
+def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
+    upper = sql.upper()
+    keyword_upper = keyword.upper()
+    keyword_len = len(keyword_upper)
+    state = "normal"
+    depth = 0
+    index = 0
+
+    while index < len(upper):
+        char = upper[index]
+        next_char = upper[index + 1] if index + 1 < len(upper) else ""
+
+        if state == "line_comment":
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            if char == "'" and next_char == "'":
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            index += 1
+            continue
+
+        if char == ")":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+
+        if depth == 0 and upper[index:index + keyword_len] == keyword_upper:
+            before = upper[index - 1] if index > 0 else " "
+            after = upper[index + keyword_len] if index + keyword_len < len(upper) else " "
+            if (not before.isalnum() and before != "_") and (not after.isalnum() and after != "_"):
+                return index
+
+        index += 1
+
+    return None
+
+
+def _extract_top_level_query_sections(sql: str) -> dict[str, str] | None:
+    select_pos = _find_top_level_keyword(sql, "SELECT")
+    from_pos = _find_top_level_keyword(sql, "FROM")
+    if select_pos is None or from_pos is None or from_pos <= select_pos:
+        return None
+
+    cut_pos = len(sql)
+    for terminal in ("GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
+        pos = _find_top_level_keyword(sql, terminal)
+        if pos is not None and pos > from_pos and pos < cut_pos:
+            cut_pos = pos
+
+    return {
+        "prefix": sql[:select_pos].rstrip(),
+        "select_clause": sql[select_pos + len("SELECT"):from_pos].strip(),
+        "from_clause": sql[from_pos:cut_pos].rstrip(),
+        "suffix": sql[cut_pos:].strip(),
+    }
+
+
+def _extract_source_segment(from_clause: str) -> str:
+    from_body = from_clause[len("FROM"):].strip()
+    where_pos = _find_top_level_keyword(from_body, "WHERE")
+    if where_pos is None:
+        return from_body
+    return from_body[:where_pos].rstrip()
+
+
+def _is_supported_object_level_source(source_segment: str) -> bool:
+    if not source_segment or source_segment.startswith("("):
+        return False
+    if re.search(r"\bJOIN\b", source_segment, flags=re.IGNORECASE):
+        return False
+    return "," not in source_segment
+
+
+def _extract_source_reference_name(source_segment: str) -> str | None:
+    match = re.match(
+        r'^(?P<source>"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)'
+        r'(?:\s+(?:AS\s+)?(?P<alias>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?$',
+        source_segment,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    alias = match.group("alias")
+    if alias:
+        return alias
+
+    source = match.group("source")
+    if source.startswith('"'):
+        return source
+    return source.rsplit(".", 1)[-1]
+
+
+def _has_top_level_set_operation(sql: str) -> bool:
+    return any(
+        _find_top_level_keyword(sql, keyword) is not None
+        for keyword in ("UNION", "INTERSECT", "EXCEPT")
+    )
+
+
+def _build_object_mode_sql(
+    sql: str,
+    object_id_column: str,
+    object_order_column: str | None,
+) -> tuple[str | None, str | None]:
+    if _has_top_level_set_operation(sql):
+        return None, "Object-level mode does not support UNION, INTERSECT, or EXCEPT queries."
+
+    sections = _extract_top_level_query_sections(sql)
+    if sections is None:
+        return None, "Object-level mode requires a top-level SELECT or WITH query with a FROM clause."
+
+    source_segment = _extract_source_segment(sections["from_clause"])
+    if not _is_supported_object_level_source(source_segment):
+        return None, (
+            "Object-level mode currently supports only single-source top-level queries "
+            "without joins, comma-separated sources, or subqueries in FROM."
+        )
+
+    source_reference_name = _extract_source_reference_name(source_segment)
+    if source_reference_name is None:
+        return None, "Object-level mode could not determine a stable source alias for canonicalization."
+
+    order_expression = OBJECT_SOURCE_ORDINAL_COLUMN
+    if object_order_column:
+        order_expression = (
+            f'{_quote_identifier(object_order_column)} ASC, '
+            f"{OBJECT_SOURCE_ORDINAL_COLUMN} ASC"
+        )
+
+    ctes = ", ".join(
+        [
+            f"{OBJECT_SOURCE_CTE_NAME} AS (SELECT * {sections['from_clause']})",
+            (
+                f"{OBJECT_RANKED_CTE_NAME} AS ("
+                f"SELECT {OBJECT_SOURCE_CTE_NAME}.*, "
+                f"ROW_NUMBER() OVER () AS {OBJECT_SOURCE_ORDINAL_COLUMN} "
+                f"FROM {OBJECT_SOURCE_CTE_NAME}"
+                f")"
+            ),
+            (
+                f"{OBJECT_CANONICAL_CTE_NAME} AS ("
+                f"SELECT * FROM ("
+                f"SELECT {OBJECT_RANKED_CTE_NAME}.*, "
+                f"ROW_NUMBER() OVER ("
+                f"PARTITION BY {_quote_identifier(object_id_column)} "
+                f"ORDER BY {order_expression}"
+                f") AS {OBJECT_ROW_NUMBER_COLUMN} "
+                f"FROM {OBJECT_RANKED_CTE_NAME}"
+                f") WHERE {OBJECT_ROW_NUMBER_COLUMN} = 1"
+                f")"
+            ),
+        ]
+    )
+
+    prefix = sections["prefix"].strip()
+    with_prefix = f"{prefix}, {ctes}" if prefix.upper().startswith("WITH") else f"WITH {ctes}"
+    suffix = f" {sections['suffix']}" if sections["suffix"] else ""
+    return (
+        f"{with_prefix} SELECT {sections['select_clause']} "
+        f"FROM {OBJECT_CANONICAL_CTE_NAME} AS {source_reference_name}{suffix}",
+        None,
+    )
+
+
+def _schema_columns_by_name(schema_summary: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    columns_by_name: dict[str, list[dict[str, Any]]] = {}
+    for table in schema_summary.get("tables", []):
+        for column in table.get("columns", []):
+            normalized_name = str(column.get("name", "")).strip().lower()
+            if not normalized_name:
+                continue
+            columns_by_name.setdefault(normalized_name, []).append(column)
+    return columns_by_name
+
+
+def validate_object_level_columns(
+    db_path: str | Path,
+    object_id_column: str | None,
+    object_order_column: str | None = None,
+) -> str | None:
+    normalized_object_id = str(object_id_column or "").strip()
+    normalized_object_order = str(object_order_column or "").strip()
+
+    if normalized_object_order and not normalized_object_id:
+        return "Object-level mode requires object_id_column when object_order_column is configured."
+    if not normalized_object_id:
+        return None
+
+    schema_summary = get_schema_summary(db_path)
+    if schema_summary.get("status") != "success":
+        return schema_summary.get("error") or "Unable to inspect the database schema."
+
+    columns_by_name = _schema_columns_by_name(schema_summary)
+    if normalized_object_id.lower() not in columns_by_name:
+        return f"Configured object_id_column '{normalized_object_id}' was not found in the database schema."
+
+    if normalized_object_order:
+        order_columns = columns_by_name.get(normalized_object_order.lower())
+        if not order_columns:
+            return (
+                f"Configured object_order_column '{normalized_object_order}' was not found in the database schema."
+            )
+        if all(not _is_orderable_declared_type(column.get("type")) for column in order_columns):
+            return (
+                f"Configured object_order_column '{normalized_object_order}' is not declared as an orderable SQLite type."
+            )
+
+    return None
 
 
 def _iter_user_tables(connection: sqlite3.Connection) -> Iterable[str]:
@@ -361,6 +632,8 @@ def execute_sqlite_query(
     sql: str,
     *,
     preview_rows: int = DEFAULT_PREVIEW_ROWS,
+    object_id_column: str | None = None,
+    object_order_column: str | None = None,
 ) -> dict[str, Any]:
     preview_rows = max(1, preview_rows)
     validation = validate_sql_read_only(sql, db_path)
@@ -379,16 +652,85 @@ def execute_sqlite_query(
             "error": validation["reason"],
         }
 
+    effective_sql = normalized_sql
+    if object_order_column and not object_id_column:
+        return {
+            "status": "error",
+            "db_path": validation["db_path"],
+            "sql": normalized_sql,
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "preview_row_count": 0,
+            "truncated": False,
+            "error": "Object-level mode requires object_id_column when object_order_column is configured.",
+        }
+
+    if object_id_column:
+        object_mode_error = validate_object_level_columns(
+            db_path,
+            object_id_column,
+            object_order_column,
+        )
+        if object_mode_error is not None:
+            return {
+                "status": "error",
+                "db_path": validation["db_path"],
+                "sql": normalized_sql,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "preview_row_count": 0,
+                "truncated": False,
+                "error": object_mode_error,
+            }
+
+        object_sql, object_sql_error = _build_object_mode_sql(
+            normalized_sql,
+            object_id_column,
+            object_order_column,
+        )
+        if object_sql_error is not None or object_sql is None:
+            return {
+                "status": "error",
+                "db_path": validation["db_path"],
+                "sql": normalized_sql,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "preview_row_count": 0,
+                "truncated": False,
+                "error": object_sql_error or "Object-level mode could not rewrite the query safely.",
+            }
+
+        rewritten_validation = validate_sql_read_only(object_sql, db_path)
+        if not rewritten_validation["is_valid"]:
+            return {
+                "status": "error",
+                "db_path": rewritten_validation["db_path"],
+                "sql": normalized_sql,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "preview_row_count": 0,
+                "truncated": False,
+                "error": (
+                    "Object-level mode could not canonicalize the query safely: "
+                    f"{rewritten_validation['reason']}"
+                ),
+            }
+        effective_sql = rewritten_validation.get("normalized_sql") or _normalized_statement(object_sql)
+
     try:
         with closing(_connect_read_only(db_path)) as connection:
-            cursor = connection.execute(normalized_sql)
+            cursor = connection.execute(effective_sql)
             columns = [description[0] for description in cursor.description or []]
             fetched_rows = cursor.fetchmany(preview_rows + 1)
             truncated = len(fetched_rows) > preview_rows
             preview = [dict(row) for row in fetched_rows[:preview_rows]]
 
             if truncated:
-                count_sql = f"SELECT COUNT(*) AS total_count FROM ({normalized_sql}) AS result_set"
+                count_sql = f"SELECT COUNT(*) AS total_count FROM ({effective_sql}) AS result_set"
                 row_count = int(connection.execute(count_sql).fetchone()[0])
             else:
                 row_count = len(preview)
@@ -396,7 +738,7 @@ def execute_sqlite_query(
         return {
             "status": "success",
             "db_path": str(_ensure_database_exists(db_path)),
-            "sql": normalized_sql,
+            "sql": effective_sql,
             "columns": columns,
             "rows": preview,
             "row_count": row_count,
@@ -408,7 +750,7 @@ def execute_sqlite_query(
         return {
             "status": "error",
             "db_path": str(_as_path(db_path)),
-            "sql": normalized_sql,
+            "sql": effective_sql,
             "columns": [],
             "rows": [],
             "row_count": 0,

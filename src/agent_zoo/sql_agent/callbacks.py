@@ -370,9 +370,11 @@ def _build_count_sql(sql: str) -> str | None:
 
     Returns None if the FROM clause cannot be found.
     """
+    select_pos = _find_top_level_keyword(sql, "SELECT")
     from_pos = _find_top_level_keyword(sql, "FROM")
-    if from_pos is None:
+    if select_pos is None or from_pos is None:
         return None
+    prefix = sql[:select_pos].rstrip()
     rest = sql[from_pos:]
     cut_pos = len(rest)
     for terminal in ("GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
@@ -380,14 +382,17 @@ def _build_count_sql(sql: str) -> str | None:
         if pos is not None and pos < cut_pos:
             cut_pos = pos
     from_clause = rest[:cut_pos].rstrip()
-    return f"SELECT COUNT(*) {from_clause}"
+    count_sql = f"SELECT COUNT(*) {from_clause}"
+    return f"{prefix} {count_sql}".strip()
 
 
 def _build_grouped_count_sql(sql: str) -> str | None:
+    select_pos = _find_top_level_keyword(sql, "SELECT")
     from_pos = _find_top_level_keyword(sql, "FROM")
     group_by_pos = _find_top_level_keyword(sql, "GROUP BY")
-    if from_pos is None or group_by_pos is None or group_by_pos <= from_pos:
+    if select_pos is None or from_pos is None or group_by_pos is None or group_by_pos <= from_pos:
         return None
+    prefix = sql[:select_pos].rstrip()
 
     from_rest = sql[from_pos:]
     from_cut_pos = len(from_rest)
@@ -407,7 +412,8 @@ def _build_grouped_count_sql(sql: str) -> str | None:
     if not group_by_clause:
         return None
 
-    return f"SELECT {group_by_clause}, COUNT(*) AS matching_count {from_clause}"
+    count_sql = f"SELECT {group_by_clause}, COUNT(*) AS matching_count {from_clause}"
+    return f"{prefix} {count_sql}".strip()
 
 
 def _is_top_level_scalar_count_sql(sql: str) -> bool:
