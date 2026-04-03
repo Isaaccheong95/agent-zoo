@@ -25,8 +25,15 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "dataset" / "titantic" / "titanic.sqlite"
 DEFAULT_MODEL = "openai/Qwen3.5-0.8B-GGUF"
 DEFAULT_PREVIEW_ROWS = 20
 DEFAULT_COUNT_AGGREGATES_ONLY = True
-DEFAULT_MINIMUM_AGGREGATE_COUNT = 3
+DEFAULT_MINIMUM_AGGREGATE_COUNT = 5
 DEFAULT_CAPTURE_INTERNAL_ROWS = False
+
+
+def _normalize_optional_column_name(value: str | None) -> str | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _ensure_local_openai_api_key() -> None:
@@ -71,6 +78,8 @@ class SQLAgentSettings:
     count_aggregates_only: bool = DEFAULT_COUNT_AGGREGATES_ONLY
     minimum_aggregate_count: int = DEFAULT_MINIMUM_AGGREGATE_COUNT
     capture_internal_rows: bool = DEFAULT_CAPTURE_INTERNAL_ROWS
+    object_id_column: str | None = None
+    object_order_column: str | None = None
     app_name: str = "sql_agent"
     user_id: str = "local_user"
     session_id: str = "sql_agent_session"
@@ -116,6 +125,14 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     if raw_capture_internal_rows is None:
         raw_capture_internal_rows = os.getenv("SQL_AGENT_CAPTURE_INTERNAL_ROWS")
 
+    raw_object_id_column = overrides.get("object_id_column")
+    if raw_object_id_column is None:
+        raw_object_id_column = os.getenv("SQL_AGENT_OBJECT_ID_COLUMN")
+
+    raw_object_order_column = overrides.get("object_order_column")
+    if raw_object_order_column is None:
+        raw_object_order_column = os.getenv("SQL_AGENT_OBJECT_ORDER_COLUMN")
+
     resolved_instruction = resolve_repo_path(raw_instruction_file)
     preview_rows = DEFAULT_PREVIEW_ROWS
     if raw_preview_rows not in (None, ""):
@@ -124,6 +141,13 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     minimum_aggregate_count = DEFAULT_MINIMUM_AGGREGATE_COUNT
     if raw_minimum_aggregate_count not in (None, ""):
         minimum_aggregate_count = max(1, int(raw_minimum_aggregate_count))
+
+    object_id_column = _normalize_optional_column_name(raw_object_id_column)
+    object_order_column = _normalize_optional_column_name(raw_object_order_column)
+    if object_order_column and not object_id_column:
+        raise ValueError(
+            "SQL agent object-level mode requires object_id_column when object_order_column is configured."
+        )
 
     return SQLAgentSettings(
         db_path=resolve_repo_path(raw_db_path) or DEFAULT_DB_PATH,
@@ -145,4 +169,6 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
             raw_capture_internal_rows,
             default=DEFAULT_CAPTURE_INTERNAL_ROWS,
         ),
+        object_id_column=object_id_column,
+        object_order_column=object_order_column,
     )

@@ -45,7 +45,13 @@ def build_sql_tools(settings: SQLAgentSettings) -> list[Callable]:
         """
 
         effective_preview_rows = settings.preview_rows if preview_rows is None else max(1, preview_rows)
-        return execute_sqlite_query(db_path or settings.db_path, sql, preview_rows=effective_preview_rows)
+        return execute_sqlite_query(
+            db_path or settings.db_path,
+            sql,
+            preview_rows=effective_preview_rows,
+            object_id_column=settings.object_id_column,
+            object_order_column=settings.object_order_column,
+        )
 
     inspect_sqlite_schema.__name__ = "inspect_sqlite_schema"
     execute_sqlite_read_only.__name__ = "execute_sqlite_read_only"
