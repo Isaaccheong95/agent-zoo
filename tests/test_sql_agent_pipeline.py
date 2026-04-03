@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
@@ -18,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 from agent_zoo.base import BaseAgent
 from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings
 from agent_zoo.sql_agent.pipeline import run_nl_to_sql_pipeline
+from agent_zoo.sql_agent.runtime import ask_question, ask_question_structured
 
 
 def create_pipeline_fixture(db_path: Path) -> None:
@@ -142,6 +145,79 @@ class SQLPipelineTestCase(unittest.TestCase):
             settings,
             session_id="test-session",
         )
+
+    def test_ask_question_returns_user_message_from_structured_envelope(self) -> None:
+        structured_response = json.dumps(
+            {
+                "schema_version": 1,
+                "response_type": "sql_result",
+                "user_message": "Found 216 matching rows.",
+                "sql_result": {
+                    "status": "success",
+                    "rows": [{"matching_count": 216}],
+                },
+            }
+        )
+
+        class FakeRunner:
+            def __init__(self, final_text: str) -> None:
+                self.app_name = "test-app"
+                self.session_service = SimpleNamespace(create_session=AsyncMock())
+                self._final_text = final_text
+
+            async def run_async(self, **kwargs):
+                yield SimpleNamespace(
+                    author="sql_agent",
+                    content=SimpleNamespace(parts=[SimpleNamespace(text=self._final_text)]),
+                    is_final_response=lambda: True,
+                )
+
+        response = asyncio.run(
+            ask_question(
+                "How many drinkers?",
+                SQLAgentSettings(db_path=self.db_path, model="openai/test-model"),
+                runner=FakeRunner(structured_response),
+                session_id="test-session",
+            )
+        )
+
+        self.assertEqual(response, "Found 216 matching rows.")
+
+    def test_ask_question_structured_returns_response_envelope(self) -> None:
+        structured_response = json.dumps(
+            {
+                "schema_version": 1,
+                "response_type": "clarification",
+                "user_message": "Which drinking frequency do you mean?",
+                "options": ["Occasionally", "Regularly"],
+            }
+        )
+
+        class FakeRunner:
+            def __init__(self, final_text: str) -> None:
+                self.app_name = "test-app"
+                self.session_service = SimpleNamespace(create_session=AsyncMock())
+                self._final_text = final_text
+
+            async def run_async(self, **kwargs):
+                yield SimpleNamespace(
+                    author="sql_agent",
+                    content=SimpleNamespace(parts=[SimpleNamespace(text=self._final_text)]),
+                    is_final_response=lambda: True,
+                )
+
+        response = asyncio.run(
+            ask_question_structured(
+                "How many drinkers?",
+                SQLAgentSettings(db_path=self.db_path, model="openai/test-model"),
+                runner=FakeRunner(structured_response),
+                session_id="test-session",
+            )
+        )
+
+        self.assertIsNotNone(response)
+        self.assertEqual(response["response_type"], "clarification")
+        self.assertEqual(response["options"], ["Occasionally", "Regularly"])
 
 
 if __name__ == "__main__":

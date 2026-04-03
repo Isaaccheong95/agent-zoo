@@ -22,6 +22,37 @@ def serialize_response_envelope(response: dict[str, Any]) -> str:
     return json.dumps(response, indent=2)
 
 
+def parse_response_envelope(raw_text: str) -> dict[str, Any] | None:
+    candidate = _unwrap_json_code_fence(raw_text)
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("schema_version") != RESPONSE_SCHEMA_VERSION:
+        return None
+
+    response_type = payload.get("response_type")
+    if response_type not in {"sql_result", "clarification"}:
+        return None
+
+    user_message = payload.get("user_message")
+    if not isinstance(user_message, str) or not user_message.strip():
+        return None
+
+    return payload
+
+
+def extract_user_message_from_response_text(raw_text: str) -> str:
+    payload = parse_response_envelope(raw_text)
+    if payload is None:
+        return raw_text
+    return payload["user_message"]
+
+
 def build_sql_result_response(tool_result: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": RESPONSE_SCHEMA_VERSION,
