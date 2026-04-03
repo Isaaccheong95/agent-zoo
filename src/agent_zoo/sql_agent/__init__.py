@@ -4,7 +4,6 @@ __all__ = [
     "SQLAgent",
     "SQLAgentSettings",
     "ask_question",
-    "ask_question_structured",
     "build_root_agent",
     "load_settings",
     "root_agent",
@@ -16,11 +15,6 @@ def __getattr__(name: str):
         from .runtime import ask_question
 
         return ask_question
-
-    if name == "ask_question_structured":
-        from .runtime import ask_question_structured
-
-        return ask_question_structured
 
     if name in {"SQLAgent", "build_root_agent", "root_agent"}:
         from .agent import SQLAgent, build_root_agent, root_agent

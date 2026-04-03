@@ -18,7 +18,6 @@ from google.adk.runners import InMemoryRunner
 from google.genai.types import Content, Part
 
 from .config import SQLAgentSettings
-from .formatting import extract_user_message_from_response_text, parse_response_envelope
 
 
 def _text_from_parts(parts: Iterable[Part]) -> str:
@@ -45,7 +44,7 @@ def _print_debug_event(event, settings: SQLAgentSettings) -> None:
                     print(f"[debug][tool-response] {function_response.name}: {function_response.response}")
 
 
-async def _ask_question_raw(
+async def ask_question(
     question: str,
     settings: SQLAgentSettings,
     *,
@@ -79,38 +78,6 @@ async def _ask_question_raw(
             final_response = _text_from_parts(event.content.parts)
 
     return final_response
-
-
-async def ask_question_structured(
-    question: str,
-    settings: SQLAgentSettings,
-    *,
-    runner: InMemoryRunner | None = None,
-    session_id: str | None = None,
-) -> dict | None:
-    final_response = await _ask_question_raw(
-        question,
-        settings,
-        runner=runner,
-        session_id=session_id,
-    )
-    return parse_response_envelope(final_response)
-
-
-async def ask_question(
-    question: str,
-    settings: SQLAgentSettings,
-    *,
-    runner: InMemoryRunner | None = None,
-    session_id: str | None = None,
-) -> str:
-    final_response = await _ask_question_raw(
-        question,
-        settings,
-        runner=runner,
-        session_id=session_id,
-    )
-    return extract_user_message_from_response_text(final_response)
 
 
 async def run_interactive_loop(settings: SQLAgentSettings) -> None:

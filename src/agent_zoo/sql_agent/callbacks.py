@@ -16,11 +16,7 @@ from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
-from .formatting import (
-    build_sql_result_response,
-    normalize_clarification_response,
-    serialize_response_envelope,
-)
+from .formatting import format_structured_response
 try:
     from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
@@ -30,8 +26,6 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
-SQL_FINAL_RESPONSE_STATE_KEY = "temp:sql_final_response"
-SQL_FINAL_RESPONSE_EMITTED_STATE_KEY = "temp:sql_final_response_emitted"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -40,14 +34,6 @@ SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "max",
     "maximum",
 )
-
-
-def _clear_state_keys(state: Any, *keys: str) -> None:
-    for key in keys:
-        if hasattr(state, "pop"):
-            state.pop(key, None)
-        elif key in state:
-            state[key] = None
 
 
 def _is_numeric(value: Any) -> bool:
@@ -77,69 +63,15 @@ def _is_safe_aggregate_column(column_name: str) -> bool:
 
 
 def _clear_private_result_state(state: Any) -> None:
-    _clear_state_keys(
-        state,
+    for key in (
         SQL_PUBLIC_RESULT_STATE_KEY,
         SQL_INTERNAL_RESULT_REF_STATE_KEY,
         SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
-        SQL_FINAL_RESPONSE_STATE_KEY,
-        SQL_FINAL_RESPONSE_EMITTED_STATE_KEY,
-    )
-
-
-def _store_final_response(state: Any, final_response: dict[str, Any]) -> None:
-    state[SQL_FINAL_RESPONSE_STATE_KEY] = final_response
-    state[SQL_FINAL_RESPONSE_EMITTED_STATE_KEY] = False
-
-
-def _get_final_response(state: Any) -> dict[str, Any] | None:
-    final_response = state.get(SQL_FINAL_RESPONSE_STATE_KEY)
-    if isinstance(final_response, dict):
-        return final_response
-
-    public_query_result = state.get(SQL_PUBLIC_RESULT_STATE_KEY)
-    if not isinstance(public_query_result, dict):
-        return None
-
-    final_response = build_sql_result_response(public_query_result)
-    state[SQL_FINAL_RESPONSE_STATE_KEY] = final_response
-    return final_response
-
-
-def _build_content_from_final_response(final_response: dict[str, Any]) -> types.Content:
-    return types.Content(
-        role="model",
-        parts=[types.Part(text=serialize_response_envelope(final_response))],
-    )
-
-
-def _build_llm_response_from_final_response(final_response: dict[str, Any]) -> LlmResponse:
-    return LlmResponse(content=_build_content_from_final_response(final_response))
-
-
-def _request_ends_with_tool_response(llm_request) -> bool:
-    contents = getattr(llm_request, "contents", None) or []
-    if not contents:
-        return False
-
-    last_content = contents[-1]
-    if getattr(last_content, "role", None) == "tool":
-        return True
-
-    last_parts = getattr(last_content, "parts", None) or []
-    return any(getattr(part, "function_response", None) is not None for part in last_parts)
-
-
-def _llm_response_has_function_call(llm_response: LlmResponse) -> bool:
-    content = getattr(llm_response, "content", None)
-    parts = getattr(content, "parts", None) or []
-    return any(getattr(part, "function_call", None) is not None for part in parts)
-
-
-def _extract_llm_response_text(llm_response: LlmResponse) -> str:
-    content = getattr(llm_response, "content", None)
-    parts = getattr(content, "parts", None) or []
-    return "".join(getattr(part, "text", "") or "" for part in parts).strip()
+    ):
+        if hasattr(state, "pop"):
+            state.pop(key, None)
+        elif key in state:
+            state[key] = None
 
 
 def _build_privacy_error_result(
@@ -686,10 +618,6 @@ def build_remember_query_result_callback(
             active_settings,
         )
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
-        _store_final_response(
-            tool_context.state,
-            build_sql_result_response(public_result),
-        )
 
         if active_settings.capture_internal_rows and tool_response.get("status") == "success":
             tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
@@ -703,30 +631,6 @@ def build_remember_query_result_callback(
     return remember_query_result
 
 
-def build_normalize_clarification_after_model_callback(
-    settings: SQLAgentSettings | None = None,
-):
-    def normalize_clarification_after_model(
-        callback_context=None,
-        llm_response: LlmResponse | None = None,
-        **kwargs,
-    ) -> LlmResponse | None:
-        context = callback_context
-        if context is None or llm_response is None:
-            return None
-        if _llm_response_has_function_call(llm_response):
-            return None
-
-        final_response = normalize_clarification_response(
-            _extract_llm_response_text(llm_response)
-        )
-        _store_final_response(context.state, final_response)
-        context.state[SQL_FINAL_RESPONSE_EMITTED_STATE_KEY] = True
-        return _build_llm_response_from_final_response(final_response)
-
-    return normalize_clarification_after_model
-
-
 def build_format_final_agent_response_callback(
     settings: SQLAgentSettings | None = None,
 ):
@@ -735,14 +639,14 @@ def build_format_final_agent_response_callback(
         if context is None:
             return None
 
-        final_response = _get_final_response(context.state)
-        if not isinstance(final_response, dict):
-            return None
-        if context.state.get(SQL_FINAL_RESPONSE_EMITTED_STATE_KEY):
-            _clear_state_keys(context.state, SQL_FINAL_RESPONSE_EMITTED_STATE_KEY)
+        public_query_result = context.state.get(SQL_PUBLIC_RESULT_STATE_KEY)
+        if not isinstance(public_query_result, dict):
             return None
 
-        return _build_content_from_final_response(final_response)
+        return types.Content(
+            role="model",
+            parts=[types.Part(text=format_structured_response(public_query_result))],
+        )
 
     return format_final_agent_response
 
@@ -755,12 +659,16 @@ def build_finalize_after_query_before_model_callback(
         if context is None:
             return None
 
-        final_response = _get_final_response(context.state)
-        if not isinstance(final_response, dict):
+        public_query_result = context.state.get(SQL_PUBLIC_RESULT_STATE_KEY)
+        if not isinstance(public_query_result, dict):
             return None
 
-        context.state[SQL_FINAL_RESPONSE_EMITTED_STATE_KEY] = True
-        return _build_llm_response_from_final_response(final_response)
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=format_structured_response(public_query_result))],
+            )
+        )
 
     return finalize_after_query
 
@@ -792,8 +700,15 @@ def build_scope_gate_callback(
         # Skip the check if the most recent content in the request is a tool
         # response — that means we're on the second LLM call within the same
         # turn (after the SQL tool ran), not at the start of a new user message.
-        if _request_ends_with_tool_response(llm_request):
-            return None
+        if llm_request is not None:
+            contents = getattr(llm_request, "contents", None) or []
+            if contents:
+                last_role = getattr(contents[-1], "role", None)
+                if last_role == "tool":
+                    return None
+                last_parts = getattr(contents[-1], "parts", None) or []
+                if any(getattr(p, "function_response", None) is not None for p in last_parts):
+                    return None
 
         user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
         allow, refusal = classifier(user_text)
@@ -823,9 +738,6 @@ def build_combined_before_model_callback(
     finalize = build_finalize_after_query_before_model_callback(active_settings)
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
-        if callback_context is not None and not _request_ends_with_tool_response(llm_request):
-            _clear_private_result_state(callback_context.state)
-
         result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
         if result is not None:
             return result
@@ -835,6 +747,5 @@ def build_combined_before_model_callback(
 
 
 remember_query_result = build_remember_query_result_callback()
-normalize_clarification_after_model = build_normalize_clarification_after_model_callback()
 format_final_agent_response = build_format_final_agent_response_callback()
 finalize_after_query_before_model = build_finalize_after_query_before_model_callback()

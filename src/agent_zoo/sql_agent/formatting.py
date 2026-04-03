@@ -8,128 +8,6 @@ be run as a standalone script.
 from __future__ import annotations
 
 import json
-from typing import Any
-
-
-RESPONSE_SCHEMA_VERSION = 1
-DEFAULT_CLARIFICATION_USER_MESSAGE = (
-    "I need clarification before I can run a query. Please restate the request more specifically."
-)
-INVALID_CLARIFICATION_PAYLOAD_ERROR = "invalid_clarification_payload"
-
-
-def serialize_response_envelope(response: dict[str, Any]) -> str:
-    return json.dumps(response, indent=2)
-
-
-def parse_response_envelope(raw_text: str) -> dict[str, Any] | None:
-    candidate = _unwrap_json_code_fence(raw_text)
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    if payload.get("schema_version") != RESPONSE_SCHEMA_VERSION:
-        return None
-
-    response_type = payload.get("response_type")
-    if response_type not in {"sql_result", "clarification"}:
-        return None
-
-    user_message = payload.get("user_message")
-    if not isinstance(user_message, str) or not user_message.strip():
-        return None
-
-    return payload
-
-
-def extract_user_message_from_response_text(raw_text: str) -> str:
-    payload = parse_response_envelope(raw_text)
-    if payload is None:
-        return raw_text
-    return payload["user_message"]
-
-
-def build_sql_result_response(tool_result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "schema_version": RESPONSE_SCHEMA_VERSION,
-        "response_type": "sql_result",
-        "user_message": summarize_execution_result(tool_result),
-        "sql_result": dict(tool_result),
-    }
-
-
-def build_clarification_response(
-    user_message: str,
-    options: list[str] | None = None,
-    *,
-    error: str | None = None,
-) -> dict[str, Any]:
-    response = {
-        "schema_version": RESPONSE_SCHEMA_VERSION,
-        "response_type": "clarification",
-        "user_message": user_message,
-        "options": options or [],
-    }
-    if error:
-        response["error"] = error
-    return response
-
-
-def _unwrap_json_code_fence(value: str) -> str:
-    stripped = value.strip()
-    if not stripped.startswith("```") or not stripped.endswith("```"):
-        return stripped
-
-    lines = stripped.splitlines()
-    if len(lines) < 2 or lines[-1].strip() != "```":
-        return stripped
-    return "\n".join(lines[1:-1]).strip()
-
-
-def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
-    candidate = _unwrap_json_code_fence(raw_text)
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("response_type") != "clarification":
-        return None
-
-    user_message = payload.get("user_message")
-    if not isinstance(user_message, str) or not user_message.strip():
-        return None
-
-    raw_options = payload.get("options", [])
-    if raw_options is None:
-        options: list[str] = []
-    elif not isinstance(raw_options, list):
-        return None
-    else:
-        options = []
-        for option in raw_options:
-            if not isinstance(option, str) or not option.strip():
-                return None
-            options.append(option.strip())
-
-    return build_clarification_response(user_message.strip(), options)
-
-
-def normalize_clarification_response(raw_text: str) -> dict[str, Any]:
-    clarification = parse_clarification_response(raw_text)
-    if clarification is not None:
-        return clarification
-    return build_clarification_response(
-        DEFAULT_CLARIFICATION_USER_MESSAGE,
-        [],
-        error=INVALID_CLARIFICATION_PAYLOAD_ERROR,
-    )
 
 def format_result_payload(tool_result: dict) -> str:
     if tool_result["status"] != "success":
@@ -242,4 +120,23 @@ def build_default_explanation(tool_result: dict) -> str:
 
 
 def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
-    return serialize_response_envelope(build_sql_result_response(tool_result))
+    sql = tool_result.get("sql") or "Not executed"
+    result_payload = format_result_payload(tool_result)
+
+    code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
+    result_block = f"```{code_block}\n{result_payload}\n```".strip()
+
+    output = (
+        "Generated SQL:\n"
+        f"```sql\n{sql}\n```\n\n"
+        "Result:\n"
+        f"{result_block}"
+    )
+
+    if tool_result.get("public_result_kind") == "detail_count_fallback":
+        output += (
+            "\n\nNote: Individual row-level data cannot be returned due to privacy guardrails. "
+            "Only the number of matching records is shown."
+        )
+
+    return output

@@ -24,7 +24,6 @@ from .callbacks import (
     build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
-    build_normalize_clarification_after_model_callback,
     build_remember_query_result_callback,
 )
 from .config import SQLAgentSettings, _ensure_local_openai_api_key, load_settings
@@ -68,7 +67,6 @@ def build_root_agent(settings: SQLAgentSettings | None = None) -> LlmAgent:
         tools=build_sql_tools(active_settings),
         generate_content_config=types.GenerateContentConfig(temperature=0.0),
         before_model_callback=build_combined_before_model_callback(active_settings),
-        after_model_callback=build_normalize_clarification_after_model_callback(active_settings),
         after_tool_callback=build_remember_query_result_callback(active_settings),
         after_agent_callback=build_format_final_agent_response_callback(active_settings),
     )

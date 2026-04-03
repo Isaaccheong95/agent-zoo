@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 import sqlite3
 import sys
@@ -12,8 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from google.genai import types
-
 
 CURRENT_FILE = Path(__file__).resolve()
 REPO_ROOT = CURRENT_FILE.parent if (CURRENT_FILE.parent / "src").exists() else CURRENT_FILE.parents[1]
@@ -22,20 +19,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent_zoo.sql_agent.callbacks import (
-    SQL_FINAL_RESPONSE_STATE_KEY,
     SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     SQL_INTERNAL_RESULT_REF_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
-    build_normalize_clarification_after_model_callback,
     build_remember_query_result_callback,
 )
-from agent_zoo.sql_agent.config import (
-    DEFAULT_MINIMUM_AGGREGATE_COUNT,
-    SQLAgentSettings,
-    load_settings,
-)
+from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
 from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
@@ -221,7 +212,6 @@ class SQLiteHelpersTestCase(unittest.TestCase):
 
         self.assertIn("approximate, colloquial, or partially incorrect dataset terminology", instruction)
         self.assertIn("nearby schema concept", instruction)
-        self.assertIn('"response_type":"clarification"', instruction)
 
     def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
         captured: dict[str, str] = {}
@@ -409,7 +399,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         self.assertTrue(settings.count_aggregates_only)
-        self.assertEqual(settings.minimum_aggregate_count, DEFAULT_MINIMUM_AGGREGATE_COUNT)
+        self.assertEqual(settings.minimum_aggregate_count, 3)
         self.assertFalse(settings.capture_internal_rows)
 
         with patch.dict(
@@ -487,17 +477,16 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             with patch("agent_zoo.sql_agent.agent.LiteLlm", side_effect=construct_model) as mocked_model:
-                with patch("agent_zoo.sql_agent.agent.LlmAgent", return_value=SimpleNamespace()) as mocked_agent:
+                with patch("agent_zoo.sql_agent.agent.LlmAgent", return_value=SimpleNamespace()):
                     with patch("agent_zoo.sql_agent.agent.build_agent_instruction", return_value="instructions"):
                         with patch("agent_zoo.sql_agent.agent.build_sql_tools", return_value=[]):
                             build_root_agent(settings)
 
         mocked_model.assert_called_once_with(model="openai/test-model")
-        self.assertIsNotNone(mocked_agent.call_args.kwargs["after_model_callback"])
 
     def test_detail_rows_become_public_matching_count_by_default(self) -> None:
         state = self._invoke_after_tool(
-            self._settings(minimum_aggregate_count=1),
+            self._settings(),
             make_query_result(
                 [
                     {"name": "Alice"},
@@ -571,7 +560,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 return self._value.get(key, default)
 
         state = self._invoke_after_tool_with_state(
-            self._settings(minimum_aggregate_count=1),
+            self._settings(),
             make_query_result(
                 [{"matching_count": 4}],
                 columns=["matching_count"],
@@ -776,7 +765,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(state[SQL_PUBLIC_RESULT_STATE_KEY], raw_result)
 
     def test_formatted_final_response_omits_raw_rows_in_privacy_mode(self) -> None:
-        settings = self._settings(minimum_aggregate_count=1)
+        settings = self._settings()
         tool_state = self._invoke_after_tool(
             settings,
             make_query_result(
@@ -792,12 +781,10 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         content = callback(SimpleNamespace(state=tool_state))
 
         self.assertIsNotNone(content)
-        response_payload = json.loads(content.parts[0].text)
-        self.assertEqual(response_payload["response_type"], "sql_result")
-        self.assertEqual(response_payload["user_message"], "Found 4 matching rows.")
-        self.assertEqual(response_payload["sql_result"]["rows"], [{"matching_count": 4}])
-        self.assertNotIn("Alice", content.parts[0].text)
-        self.assertNotIn('"name"', content.parts[0].text)
+        response_text = content.parts[0].text
+        self.assertIn("Found 4 matching rows.", response_text)
+        self.assertNotIn("Alice", response_text)
+        self.assertNotIn('"name"', response_text)
 
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
@@ -823,61 +810,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        response_payload = json.loads(result.content.parts[0].text)
-        self.assertEqual(response_payload["response_type"], "sql_result")
-        self.assertEqual(response_payload["sql_result"]["matched_row_count"], 4)
-
-    def test_after_model_callback_normalizes_clarification_response(self) -> None:
-        callback = build_normalize_clarification_after_model_callback(self._settings())
-        state: dict[str, object] = {}
-
-        result = callback(
-            callback_context=SimpleNamespace(state=state),
-            llm_response=SimpleNamespace(
-                content=types.Content(
-                    role="model",
-                    parts=[
-                        types.Part(
-                            text=(
-                                '{"response_type":"clarification","user_message":'
-                                '"Which status do you mean by not working?",'
-                                '"options":["Unemployed only","Unemployed and Retired"]}'
-                            )
-                        )
-                    ],
-                )
-            ),
-        )
-
-        self.assertIsNotNone(result)
-        response_payload = json.loads(result.content.parts[0].text)
-        self.assertEqual(response_payload["response_type"], "clarification")
-        self.assertEqual(response_payload["user_message"], "Which status do you mean by not working?")
-        self.assertEqual(
-            response_payload["options"],
-            ["Unemployed only", "Unemployed and Retired"],
-        )
-        self.assertEqual(state[SQL_FINAL_RESPONSE_STATE_KEY], response_payload)
-
-    def test_after_model_callback_fails_safe_on_malformed_clarification_payload(self) -> None:
-        callback = build_normalize_clarification_after_model_callback(self._settings())
-
-        result = callback(
-            callback_context=SimpleNamespace(state={}),
-            llm_response=SimpleNamespace(
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Can you clarify what you mean by not working?")],
-                )
-            ),
-        )
-
-        self.assertIsNotNone(result)
-        response_payload = json.loads(result.content.parts[0].text)
-        self.assertEqual(response_payload["response_type"], "clarification")
-        self.assertEqual(response_payload["options"], [])
-        self.assertEqual(response_payload["error"], "invalid_clarification_payload")
-        self.assertNotIn("not working", response_payload["user_message"].lower())
+        self.assertIn("Found 4 matching rows.", result.content.parts[0].text)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
