@@ -69,7 +69,6 @@ def build_llm_scope_gate(
                 },
             )
             verdict = (response.choices[0].message.content or "").strip().upper()
-            print("LLM judge response", response)
 
         except Exception:
             return True, None  # Fail open on classifier error

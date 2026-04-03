@@ -16,7 +16,11 @@ from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
-from .formatting import format_structured_response
+from .formatting import (
+    format_clarification_response,
+    format_structured_response,
+    normalize_clarification_response,
+)
 try:
     from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
@@ -72,6 +76,31 @@ def _clear_private_result_state(state: Any) -> None:
             state.pop(key, None)
         elif key in state:
             state[key] = None
+
+
+def _request_ends_with_tool_response(llm_request) -> bool:
+    contents = getattr(llm_request, "contents", None) or []
+    if not contents:
+        return False
+
+    last_content = contents[-1]
+    if getattr(last_content, "role", None) == "tool":
+        return True
+
+    last_parts = getattr(last_content, "parts", None) or []
+    return any(getattr(part, "function_response", None) is not None for part in last_parts)
+
+
+def _llm_response_has_function_call(llm_response: LlmResponse) -> bool:
+    content = getattr(llm_response, "content", None)
+    parts = getattr(content, "parts", None) or []
+    return any(getattr(part, "function_call", None) is not None for part in parts)
+
+
+def _extract_llm_response_text(llm_response: LlmResponse) -> str:
+    content = getattr(llm_response, "content", None)
+    parts = getattr(content, "parts", None) or []
+    return "".join(getattr(part, "text", "") or "" for part in parts).strip()
 
 
 def _build_privacy_error_result(
@@ -651,6 +680,39 @@ def build_format_final_agent_response_callback(
     return format_final_agent_response
 
 
+def build_normalize_clarification_after_model_callback(
+    settings: SQLAgentSettings | None = None,
+):
+    def normalize_clarification_after_model(
+        callback_context=None,
+        llm_response: LlmResponse | None = None,
+        **kwargs,
+    ) -> LlmResponse | None:
+        if llm_response is None or _llm_response_has_function_call(llm_response):
+            return None
+
+        response_text = _extract_llm_response_text(llm_response)
+        if not response_text:
+            return None
+
+        clarification = normalize_clarification_response(response_text)
+        if clarification is None:
+            return None
+
+        formatted_response = format_clarification_response(clarification)
+        if not formatted_response:
+            return None
+
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=formatted_response)],
+            )
+        )
+
+    return normalize_clarification_after_model
+
+
 def build_finalize_after_query_before_model_callback(
     settings: SQLAgentSettings | None = None,
 ):
@@ -700,15 +762,8 @@ def build_scope_gate_callback(
         # Skip the check if the most recent content in the request is a tool
         # response — that means we're on the second LLM call within the same
         # turn (after the SQL tool ran), not at the start of a new user message.
-        if llm_request is not None:
-            contents = getattr(llm_request, "contents", None) or []
-            if contents:
-                last_role = getattr(contents[-1], "role", None)
-                if last_role == "tool":
-                    return None
-                last_parts = getattr(contents[-1], "parts", None) or []
-                if any(getattr(p, "function_response", None) is not None for p in last_parts):
-                    return None
+        if _request_ends_with_tool_response(llm_request):
+            return None
 
         user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
         allow, refusal = classifier(user_text)
@@ -738,6 +793,9 @@ def build_combined_before_model_callback(
     finalize = build_finalize_after_query_before_model_callback(active_settings)
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        if callback_context is not None and not _request_ends_with_tool_response(llm_request):
+            _clear_private_result_state(callback_context.state)
+
         result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
         if result is not None:
             return result
@@ -747,5 +805,5 @@ def build_combined_before_model_callback(
 
 
 remember_query_result = build_remember_query_result_callback()
+normalize_clarification_after_model = build_normalize_clarification_after_model_callback()
 format_final_agent_response = build_format_final_agent_response_callback()
-finalize_after_query_before_model = build_finalize_after_query_before_model_callback()

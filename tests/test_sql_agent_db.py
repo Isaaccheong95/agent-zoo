@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from google.genai import types
+
 
 CURRENT_FILE = Path(__file__).resolve()
 REPO_ROOT = CURRENT_FILE.parent if (CURRENT_FILE.parent / "src").exists() else CURRENT_FILE.parents[1]
@@ -24,6 +26,7 @@ from agent_zoo.sql_agent.callbacks import (
     SQL_PUBLIC_RESULT_STATE_KEY,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
+    build_normalize_clarification_after_model_callback,
     build_remember_query_result_callback,
 )
 from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
@@ -212,6 +215,8 @@ class SQLiteHelpersTestCase(unittest.TestCase):
 
         self.assertIn("approximate, colloquial, or partially incorrect dataset terminology", instruction)
         self.assertIn("nearby schema concept", instruction)
+        self.assertIn('"response_type":"clarification"', instruction)
+        self.assertIn("available category values", instruction)
 
     def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
         captured: dict[str, str] = {}
@@ -399,7 +404,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         self.assertTrue(settings.count_aggregates_only)
-        self.assertEqual(settings.minimum_aggregate_count, 3)
+        self.assertEqual(settings.minimum_aggregate_count, 5)
         self.assertFalse(settings.capture_internal_rows)
 
         with patch.dict(
@@ -477,16 +482,17 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             with patch("agent_zoo.sql_agent.agent.LiteLlm", side_effect=construct_model) as mocked_model:
-                with patch("agent_zoo.sql_agent.agent.LlmAgent", return_value=SimpleNamespace()):
+                with patch("agent_zoo.sql_agent.agent.LlmAgent", return_value=SimpleNamespace()) as mocked_agent:
                     with patch("agent_zoo.sql_agent.agent.build_agent_instruction", return_value="instructions"):
                         with patch("agent_zoo.sql_agent.agent.build_sql_tools", return_value=[]):
                             build_root_agent(settings)
 
         mocked_model.assert_called_once_with(model="openai/test-model")
+        self.assertIsNotNone(mocked_agent.call_args.kwargs["after_model_callback"])
 
     def test_detail_rows_become_public_matching_count_by_default(self) -> None:
         state = self._invoke_after_tool(
-            self._settings(),
+            self._settings(minimum_aggregate_count=1),
             make_query_result(
                 [
                     {"name": "Alice"},
@@ -560,7 +566,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 return self._value.get(key, default)
 
         state = self._invoke_after_tool_with_state(
-            self._settings(),
+            self._settings(minimum_aggregate_count=1),
             make_query_result(
                 [{"matching_count": 4}],
                 columns=["matching_count"],
@@ -765,7 +771,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(state[SQL_PUBLIC_RESULT_STATE_KEY], raw_result)
 
     def test_formatted_final_response_omits_raw_rows_in_privacy_mode(self) -> None:
-        settings = self._settings()
+        settings = self._settings(minimum_aggregate_count=1)
         tool_state = self._invoke_after_tool(
             settings,
             make_query_result(
@@ -782,7 +788,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertIsNotNone(content)
         response_text = content.parts[0].text
-        self.assertIn("Found 4 matching rows.", response_text)
+        self.assertIn("```", response_text)
+        self.assertIn("4", response_text)
         self.assertNotIn("Alice", response_text)
         self.assertNotIn('"name"', response_text)
 
@@ -810,7 +817,91 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertIn("Found 4 matching rows.", result.content.parts[0].text)
+        self.assertIn("SELECT COUNT(*) AS matching_count FROM people", result.content.parts[0].text)
+        self.assertIn("```", result.content.parts[0].text)
+        self.assertIn("4", result.content.parts[0].text)
+
+    def test_after_model_callback_formats_structured_clarification_options(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"Which occupation status should I count as not working?",'
+                                '"options":["Employed","Retired","Unemployed","Unknown","Student"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Which occupation status should I count as not working?", response_text)
+        self.assertIn("- Employed", response_text)
+        self.assertIn("- Student", response_text)
+        self.assertNotIn("Available categories:", response_text)
+
+    def test_after_model_callback_strips_reasoning_from_clarification_path(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = """The user is asking about patients who are \"not working\". Looking at the sococc field (occupation status), I need to identify which categories represent people who are not working.
+
+From the schema and guidance:
+
+sococc: Occupation status
+Stored SQLite values seen: \"Employed\", \"Retired\", \"Unemployed\", \"Unknown\", \"Student\"
+The question \"not working\" is ambiguous. It could mean:
+
+Unemployed (no job)
+Retired (no longer working)
+Student (not working for income)
+Unknown - uncertain status
+
+I need clarification on your question. Could you please specify which category or combination of categories you'd like me to count?"""
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertNotIn("The user is asking", response_text)
+        self.assertNotIn("Looking at the sococc field", response_text)
+        self.assertIn("Could you please specify which category or combination of categories you'd like me to count?", response_text)
+        self.assertIn("- Employed", response_text)
+        self.assertIn("- Retired", response_text)
+        self.assertIn("- Unemployed", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertIn("- Student", response_text)
+        self.assertNotIn("- sococc", response_text)
+
+    def test_after_model_callback_ignores_non_clarification_plain_text(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text="Found 4 matching rows.")],
+                )
+            ),
+        )
+
+        self.assertIsNone(result)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
