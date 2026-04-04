@@ -4,6 +4,7 @@
 
 - [What You'll Find](#what-youll-find)
 - [Project Goals](#project-goals)
+- [Shared Agent Features](#shared-agent-features)
 - [Structure](#structure)
 - [Getting Started](#getting-started)
 - [Why This Repo Exists](#why-this-repo-exists)
