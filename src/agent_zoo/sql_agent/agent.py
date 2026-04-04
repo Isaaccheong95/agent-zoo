@@ -28,6 +28,7 @@ from .callbacks import (
 )
 from .config import SQLAgentSettings, _ensure_local_openai_api_key, load_settings
 from .instructions import build_agent_instruction
+from .result import SQLAgentStructuredResult
 from .tools import build_sql_tools
 
 SQL_AGENT_NAME = "sql_agent"
@@ -43,6 +44,11 @@ class SQLAgent(BaseAgent):
 
     def __init__(self, settings: SQLAgentSettings | None = None) -> None:
         self.settings = settings or load_settings()
+
+    async def query(self, question: str, **kwargs: Any) -> SQLAgentStructuredResult:
+        from .runtime import ask_question_result
+
+        return await ask_question_result(question, self.settings, **kwargs)
 
     async def ask(self, question: str, **kwargs: Any) -> str:
         from .runtime import ask_question

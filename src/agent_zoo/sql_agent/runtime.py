@@ -17,7 +17,14 @@ from typing import Iterable
 from google.adk.runners import InMemoryRunner
 from google.genai.types import Content, Part
 
+from .callbacks import (
+    SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
+    SQL_INTERNAL_RESULT_REF_STATE_KEY,
+    SQL_PUBLIC_RESULT_STATE_KEY,
+)
 from .config import SQLAgentSettings
+from .db import get_schema_summary
+from .result import SQLAgentStructuredResult, build_structured_result
 
 
 def _text_from_parts(parts: Iterable[Part]) -> str:
@@ -44,13 +51,13 @@ def _print_debug_event(event, settings: SQLAgentSettings) -> None:
                     print(f"[debug][tool-response] {function_response.name}: {function_response.response}")
 
 
-async def ask_question(
+async def _run_question(
     question: str,
     settings: SQLAgentSettings,
     *,
     runner: InMemoryRunner | None = None,
     session_id: str | None = None,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     from .agent import build_root_agent
 
     local_runner = runner or InMemoryRunner(agent=build_root_agent(settings), app_name=settings.app_name)
@@ -77,7 +84,58 @@ async def ask_question(
         if event.is_final_response() and event.author != "user" and event.content and event.content.parts:
             final_response = _text_from_parts(event.content.parts)
 
+    session = await local_runner.session_service.get_session(
+        app_name=local_runner.app_name,
+        user_id=settings.user_id,
+        session_id=active_session_id,
+    )
+    return final_response, dict(getattr(session, "state", {}) or {})
+
+
+async def ask_question(
+    question: str,
+    settings: SQLAgentSettings,
+    *,
+    runner: InMemoryRunner | None = None,
+    session_id: str | None = None,
+) -> str:
+    final_response, _ = await _run_question(
+        question,
+        settings,
+        runner=runner,
+        session_id=session_id,
+    )
     return final_response
+
+
+async def ask_question_result(
+    question: str,
+    settings: SQLAgentSettings,
+    *,
+    runner: InMemoryRunner | None = None,
+    session_id: str | None = None,
+) -> SQLAgentStructuredResult:
+    final_response, state = await _run_question(
+        question,
+        settings,
+        runner=runner,
+        session_id=session_id,
+    )
+
+    schema_summary = get_schema_summary(settings.db_path)
+    schema_text = schema_summary.get("schema_text") if schema_summary.get("status") == "success" else None
+
+    internal_result = None
+    if state.get(SQL_INTERNAL_RESULT_REF_STATE_KEY) == SQL_INTERNAL_QUERY_RESULT_STATE_KEY:
+        internal_result = state.get(SQL_INTERNAL_QUERY_RESULT_STATE_KEY)
+
+    return build_structured_result(
+        question=question,
+        final_response=final_response,
+        public_result=state.get(SQL_PUBLIC_RESULT_STATE_KEY),
+        internal_result=internal_result,
+        schema_text=schema_text,
+    )
 
 
 async def run_interactive_loop(settings: SQLAgentSettings) -> None:
