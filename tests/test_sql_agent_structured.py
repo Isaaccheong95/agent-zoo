@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings
+from agent_zoo.sql_agent.runtime import ask_question_result
 from agent_zoo.sql_agent.result import SQLAgentStructuredResult, build_structured_result
 from agent_zoo.tabular import TabularPayload
 
@@ -100,6 +101,47 @@ class SQLAgentStructuredResultTestCase(unittest.TestCase):
             settings,
             session_id="test-session",
         )
+
+    def test_ask_question_result_enables_internal_capture_by_default(self) -> None:
+        settings = SQLAgentSettings(
+            db_path=self.db_path,
+            model="openai/test-model",
+            capture_internal_rows=False,
+        )
+
+        async def fake_run(question, active_settings, **kwargs):
+            self.assertEqual(question, "How many rows are there?")
+            self.assertTrue(active_settings.capture_internal_rows)
+            return "Found 2 matching rows.", {
+                "temp:sql_public_result": {
+                    "status": "success",
+                    "sql": "SELECT COUNT(*) AS matching_count FROM patients",
+                    "columns": ["matching_count"],
+                    "rows": [{"matching_count": 2}],
+                    "row_count": 1,
+                    "preview_row_count": 1,
+                    "truncated": False,
+                    "error": None,
+                },
+                "temp:sql_internal_result_ref": "temp:sql_internal_query_result",
+                "temp:sql_internal_query_result": {
+                    "status": "success",
+                    "sql": "SELECT name FROM patients",
+                    "columns": ["name"],
+                    "rows": [{"name": "Alice"}],
+                    "row_count": 2,
+                    "preview_row_count": 1,
+                    "truncated": True,
+                    "error": None,
+                },
+            }
+
+        with patch("agent_zoo.sql_agent.runtime._run_question", new=fake_run):
+            with patch("agent_zoo.sql_agent.runtime.get_schema_summary", return_value={"status": "success", "schema_text": "patients(name TEXT)"}):
+                result = asyncio.run(ask_question_result("How many rows are there?", settings))
+
+        self.assertIsNotNone(result.internal_data)
+        self.assertEqual(result.internal_data.row_count, 2)
 
 
 if __name__ == "__main__":

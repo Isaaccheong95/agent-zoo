@@ -12,6 +12,7 @@ To ask one question and exit, use
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Iterable
 
 from google.adk.runners import InMemoryRunner
@@ -114,15 +115,20 @@ async def ask_question_result(
     *,
     runner: InMemoryRunner | None = None,
     session_id: str | None = None,
+    capture_internal_rows: bool = True,
 ) -> SQLAgentStructuredResult:
+    active_settings = settings
+    if capture_internal_rows and runner is None and not settings.capture_internal_rows:
+        active_settings = replace(settings, capture_internal_rows=True)
+
     final_response, state = await _run_question(
         question,
-        settings,
+        active_settings,
         runner=runner,
         session_id=session_id,
     )
 
-    schema_summary = get_schema_summary(settings.db_path)
+    schema_summary = get_schema_summary(active_settings.db_path)
     schema_text = schema_summary.get("schema_text") if schema_summary.get("status") == "success" else None
 
     internal_result = None
