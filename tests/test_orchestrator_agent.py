@@ -23,6 +23,7 @@ from agent_zoo.orchestrator_agent import (
     build_question_inputs,
     build_tabular_analysis_inputs,
 )
+from agent_zoo.request_guard import allow_request, clarification_request, out_of_scope_request
 from agent_zoo.sql_agent.result import SQLAgentStructuredResult, build_structured_result
 from agent_zoo.tabular import TabularPayload
 from google.adk.agents import SequentialAgent
@@ -41,6 +42,10 @@ class FakeSQLAgent:
 class EchoAgent:
     async def ask(self, question: str) -> str:
         return f"echo:{question}"
+
+
+def _allow_request_guard(question: str, domain_text: str):
+    return allow_request()
 
 
 class OrchestratorAgentTestCase(unittest.TestCase):
@@ -76,6 +81,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
                 )
             },
             default_workflow="echo_workflow",
+            request_guard=_allow_request_guard,
         )
 
         result = asyncio.run(orchestrator.ask("hello"))
@@ -110,7 +116,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
             schema_text="patients(name TEXT, age INTEGER)",
         )
         sql_agent = FakeSQLAgent(sql_result)
-        analysis_agent = DataAnalysisAgent()
+        analysis_agent = DataAnalysisAgent(request_guard=_allow_request_guard)
         orchestrator = OrchestratorAgent(
             agents={"sql": sql_agent, "analysis": analysis_agent},
             workflows={
@@ -136,6 +142,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
                 )
             },
             default_workflow="sql_then_analysis",
+            request_guard=_allow_request_guard,
         )
 
         result = asyncio.run(orchestrator.orchestrate("Analyze patient rows"))
@@ -162,7 +169,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
             schema_text="patients(name TEXT, age INTEGER)",
         )
         orchestrator = OrchestratorAgent(
-            agents={"sql": FakeSQLAgent(sql_result), "analysis": DataAnalysisAgent()},
+            agents={"sql": FakeSQLAgent(sql_result), "analysis": DataAnalysisAgent(request_guard=_allow_request_guard)},
             workflows={
                 "sql_then_analysis": WorkflowDefinition(
                     steps=[
@@ -186,6 +193,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
                 )
             },
             default_workflow="sql_then_analysis",
+            request_guard=_allow_request_guard,
         )
 
         with self.assertRaises(OrchestrationError) as context:
@@ -212,7 +220,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
             schema_text="patients(name TEXT, age INTEGER)",
         )
         orchestrator = OrchestratorAgent(
-            agents={"sql": FakeSQLAgent(sql_result), "analysis": DataAnalysisAgent()},
+            agents={"sql": FakeSQLAgent(sql_result), "analysis": DataAnalysisAgent(request_guard=_allow_request_guard)},
             workflows={
                 "sql_then_analysis": WorkflowDefinition(
                     steps=[
@@ -236,6 +244,7 @@ class OrchestratorAgentTestCase(unittest.TestCase):
                 )
             },
             default_workflow="sql_then_analysis",
+            request_guard=_allow_request_guard,
         )
 
         result = asyncio.run(orchestrator.orchestrate("Analyze count"))
@@ -251,12 +260,89 @@ class OrchestratorAgentTestCase(unittest.TestCase):
                 )
             },
             default_workflow="missing",
+            request_guard=_allow_request_guard,
         )
 
         with self.assertRaises(OrchestrationError) as context:
             asyncio.run(orchestrator.orchestrate("test"))
 
         self.assertIn("is not registered", str(context.exception))
+
+    def test_preflight_out_of_scope_short_circuits_before_steps(self) -> None:
+        sql_result = build_structured_result(
+            question="Analyze patient rows",
+            final_response="Found 3 matching rows.",
+            public_result={
+                "status": "success",
+                "sql": "SELECT COUNT(*) AS matching_count FROM patients",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 3}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+            },
+            internal_result=None,
+            schema_text="patients(name TEXT, age INTEGER)",
+        )
+        sql_agent = FakeSQLAgent(sql_result)
+        orchestrator = OrchestratorAgent(
+            agents={"sql": sql_agent},
+            workflows={
+                "sql_only": WorkflowDefinition(
+                    steps=[
+                        WorkflowStep(
+                            agent_name="sql",
+                            method_name="query",
+                            output_key="sql_result",
+                            input_builder=build_question_inputs(),
+                        )
+                    ],
+                    final_output_key="sql_result",
+                )
+            },
+            default_workflow="sql_only",
+            request_guard=lambda question, domain_text: out_of_scope_request(
+                "I'm an orchestrator agent. Please ask about one of the registered data workflows instead."
+            ),
+        )
+
+        result = asyncio.run(orchestrator.orchestrate("Tell me a joke"))
+
+        self.assertEqual(result.response_type, "out_of_scope")
+        self.assertEqual(result.step_results, [])
+        self.assertEqual(sql_agent.questions, [])
+        self.assertIn("registered data workflows", result.final_text)
+
+    def test_preflight_clarification_short_circuits_before_steps(self) -> None:
+        orchestrator = OrchestratorAgent(
+            agents={"echo": EchoAgent()},
+            workflows={
+                "echo_workflow": WorkflowDefinition(
+                    steps=[
+                        WorkflowStep(
+                            agent_name="echo",
+                            method_name="ask",
+                            output_key="reply",
+                            input_builder=build_question_inputs(),
+                        )
+                    ],
+                    final_output_key="reply",
+                )
+            },
+            default_workflow="echo_workflow",
+            request_guard=lambda question, domain_text: clarification_request(
+                "Which kind of workflow do you want?",
+                ["SQL only", "SQL then analysis"],
+            ),
+        )
+
+        result = asyncio.run(orchestrator.orchestrate("Help me analyze this"))
+
+        self.assertEqual(result.response_type, "clarification")
+        self.assertEqual(result.step_results, [])
+        self.assertEqual(result.clarification_options, ["SQL only", "SQL then analysis"])
+        self.assertIn("Which kind of workflow", result.final_text)
 
 
 if __name__ == "__main__":

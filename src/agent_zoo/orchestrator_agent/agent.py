@@ -10,8 +10,22 @@ from google.genai import types
 
 try:
     from ..base import BaseAgent
+    from ..request_guard import (
+        DEFAULT_REQUEST_GUARD_MODEL,
+        RequestGuard,
+        RequestGuardDecision,
+        build_llm_request_guard,
+        format_request_guard_decision,
+    )
 except ImportError:  # Support ADK loading this package as top-level `orchestrator_agent`.
     from base import BaseAgent  # type: ignore[no-redef]
+    from request_guard import (  # type: ignore[no-redef]
+        DEFAULT_REQUEST_GUARD_MODEL,
+        RequestGuard,
+        RequestGuardDecision,
+        build_llm_request_guard,
+        format_request_guard_decision,
+    )
 
 from .models import (
     OrchestrationContext,
@@ -26,6 +40,14 @@ from .models import (
 ORCHESTRATOR_AGENT_NAME = "orchestrator_agent"
 ORCHESTRATOR_AGENT_DESCRIPTION = (
     "Coordinates registered sub-agents through explicit workflows and passes structured artifacts between them."
+)
+ORCHESTRATOR_REFUSAL_MESSAGE = (
+    "I'm an orchestrator agent. I can coordinate the registered data agents and supported workflows, "
+    "but I can't answer unrelated general questions."
+)
+ORCHESTRATOR_CLARIFICATION_GUIDANCE = (
+    "If the request could map to more than one workflow or the user intent is underspecified, ask a short "
+    "clarification question and offer grounded options based on the registered agents or workflows."
 )
 
 
@@ -70,6 +92,53 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _describe_agent(agent_name: str, agent: Any) -> str:
+    description = ""
+    get_description = getattr(agent, "get_description", None)
+    if callable(get_description):
+        try:
+            description = str(get_description() or "")
+        except Exception:
+            description = ""
+    if not description:
+        description = str(getattr(agent, "description", "") or "")
+    if not description:
+        description = f"Agent type: {agent.__class__.__name__}"
+    return f"- {agent_name}: {description}"
+
+
+def _describe_workflow(workflow_name: str, workflow: WorkflowDefinition) -> str:
+    if workflow.description:
+        return f"- {workflow_name}: {workflow.description}"
+    if workflow.steps:
+        steps_text = " -> ".join(f"{step.agent_name}.{step.method_name}" for step in workflow.steps)
+        return f"- {workflow_name}: {steps_text}"
+    return f"- {workflow_name}: no steps configured"
+
+
+def _build_orchestrator_domain_text(
+    agents: Mapping[str, Any],
+    workflows: Mapping[str, WorkflowDefinition],
+) -> str:
+    agent_lines = [
+        _describe_agent(agent_name, agent)
+        for agent_name, agent in agents.items()
+    ] or ["- No registered agents"]
+    workflow_lines = [
+        _describe_workflow(workflow_name, workflow)
+        for workflow_name, workflow in workflows.items()
+    ] or ["- No registered workflows"]
+    return "\n".join(
+        [
+            "This agent only coordinates registered agents through explicit workflows.",
+            "Registered agents:",
+            *agent_lines,
+            "Registered workflows:",
+            *workflow_lines,
+        ]
+    )
+
+
 class OrchestratorAgent(BaseAgent):
     name = ORCHESTRATOR_AGENT_NAME
     description = ORCHESTRATOR_AGENT_DESCRIPTION
@@ -81,11 +150,39 @@ class OrchestratorAgent(BaseAgent):
         workflows: Mapping[str, WorkflowDefinition],
         default_workflow: str | None = None,
         router: Router | None = None,
+        request_guard: RequestGuard | None = None,
+        request_guard_model: str | None = None,
+        openai_api_base: str | None = None,
+        enable_request_guard: bool = True,
     ) -> None:
         self.agents = dict(agents)
         self.workflows = dict(workflows)
         self.default_workflow = default_workflow
         self.router = router
+        if request_guard is not None:
+            self.request_guard = request_guard
+        elif enable_request_guard:
+            self.request_guard = build_llm_request_guard(
+                request_guard_model or DEFAULT_REQUEST_GUARD_MODEL,
+                agent_label="an orchestrator agent",
+                refusal_message=ORCHESTRATOR_REFUSAL_MESSAGE,
+                clarification_guidance=ORCHESTRATOR_CLARIFICATION_GUIDANCE,
+                openai_api_base=openai_api_base,
+            )
+        else:
+            self.request_guard = None
+
+    def _guard_request(self, question: str) -> RequestGuardDecision | None:
+        if self.request_guard is None or not question.strip():
+            return None
+
+        decision = self.request_guard(
+            question,
+            _build_orchestrator_domain_text(self.agents, self.workflows),
+        )
+        if decision.is_allow:
+            return None
+        return decision
 
     def _select_workflow(self, question: str, workflow_name: str | None) -> str:
         if workflow_name is not None:
@@ -114,12 +211,26 @@ class OrchestratorAgent(BaseAgent):
         workflow_name: str | None = None,
         initial_artifacts: Mapping[str, Any] | None = None,
     ) -> OrchestrationResult:
+        artifacts = dict(initial_artifacts or {})
+        guard_decision = self._guard_request(question)
+        if guard_decision is not None:
+            return OrchestrationResult(
+                question=question,
+                workflow_name=workflow_name or "preflight_guard",
+                final_output=guard_decision,
+                final_text=format_request_guard_decision(guard_decision),
+                step_results=[],
+                artifacts=artifacts,
+                response_type=guard_decision.response_type,
+                clarification_options=list(guard_decision.options),
+            )
+
         selected_workflow = self._select_workflow(question, workflow_name)
         workflow = self.workflows[selected_workflow]
         context = OrchestrationContext(
             question=question,
             workflow_name=selected_workflow,
-            artifacts=dict(initial_artifacts or {}),
+            artifacts=artifacts,
         )
 
         for step in workflow.steps:

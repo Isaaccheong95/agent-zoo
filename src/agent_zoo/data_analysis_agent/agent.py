@@ -11,9 +11,23 @@ from google.genai import types
 
 try:
     from ..base import BaseAgent
+    from ..request_guard import (
+        DEFAULT_REQUEST_GUARD_MODEL,
+        RequestGuard,
+        RequestGuardDecision,
+        build_llm_request_guard,
+        format_request_guard_decision,
+    )
     from ..tabular import TabularPayload
 except ImportError:  # Support ADK loading this package as top-level `data_analysis_agent`.
     from base import BaseAgent  # type: ignore[no-redef]
+    from request_guard import (  # type: ignore[no-redef]
+        DEFAULT_REQUEST_GUARD_MODEL,
+        RequestGuard,
+        RequestGuardDecision,
+        build_llm_request_guard,
+        format_request_guard_decision,
+    )
     from tabular import TabularPayload  # type: ignore[no-redef]
 
 
@@ -21,6 +35,14 @@ DATA_ANALYSIS_AGENT_NAME = "data_analysis_agent"
 DATA_ANALYSIS_AGENT_DESCRIPTION = (
     "Interprets structured tabular results, surfaces findings and caveats, "
     "and suggests next analytical steps."
+)
+DATA_ANALYSIS_REFUSAL_MESSAGE = (
+    "I'm a data analysis agent. I can interpret the provided dataset result, summarize patterns, "
+    "note caveats, and suggest next analytical steps. I can't answer unrelated general questions."
+)
+DATA_ANALYSIS_CLARIFICATION_GUIDANCE = (
+    "If the request could refer to more than one column, grouping, metric, or analysis angle, ask a short "
+    "clarification question and suggest grounded options based on the available columns or result context."
 )
 
 
@@ -181,6 +203,23 @@ def _next_steps(payload: TabularPayload) -> list[str]:
     return next_steps
 
 
+def _build_analysis_domain_text(payload: TabularPayload) -> str:
+    lines = [
+        "This agent only analyzes the already-provided tabular result. It can summarize patterns, note caveats, and suggest next analytical steps.",
+        f"Columns: {', '.join(payload.columns) if payload.columns else 'No columns provided'}",
+        f"Row count: {payload.row_count}",
+        f"Preview row count: {payload.preview_row_count}",
+        f"Truncated: {payload.truncated}",
+    ]
+    if payload.sql:
+        lines.append(f"SQL provenance: {payload.sql}")
+    if payload.schema_text:
+        lines.append(f"Schema context: {payload.schema_text[:2000]}")
+    if payload.metadata:
+        lines.append(f"Metadata keys: {', '.join(sorted(str(key) for key in payload.metadata.keys()))}")
+    return "\n".join(lines)
+
+
 def _format_analysis_result(result: AnalysisResult) -> str:
     sections = [f"Summary: {result.summary}"]
 
@@ -203,6 +242,8 @@ class AnalysisResult:
     final_text: str
     question: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    response_type: str = "analysis"
+    clarification_options: list[str] = field(default_factory=list)
 
 
 def analyze_tabular_payload(
@@ -233,9 +274,74 @@ def analyze_tabular_payload(
     return result
 
 
+def _build_guarded_analysis_result(
+    decision: RequestGuardDecision,
+    *,
+    question: str | None,
+    payload: TabularPayload,
+) -> AnalysisResult:
+    return AnalysisResult(
+        summary=decision.user_message or "",
+        findings=[],
+        caveats=[],
+        next_steps=[],
+        final_text=format_request_guard_decision(decision),
+        question=question,
+        metadata={
+            "row_count": payload.row_count,
+            "preview_row_count": payload.preview_row_count,
+            "truncated": payload.truncated,
+            "columns": list(payload.columns),
+        },
+        response_type=decision.response_type,
+        clarification_options=list(decision.options),
+    )
+
+
 class DataAnalysisAgent(BaseAgent):
     name = DATA_ANALYSIS_AGENT_NAME
     description = DATA_ANALYSIS_AGENT_DESCRIPTION
+
+    def __init__(
+        self,
+        *,
+        request_guard: RequestGuard | None = None,
+        request_guard_model: str | None = None,
+        openai_api_base: str | None = None,
+        enable_request_guard: bool = True,
+    ) -> None:
+        if request_guard is not None:
+            self.request_guard = request_guard
+        elif enable_request_guard:
+            self.request_guard = build_llm_request_guard(
+                request_guard_model or DEFAULT_REQUEST_GUARD_MODEL,
+                agent_label="a data analysis agent",
+                refusal_message=DATA_ANALYSIS_REFUSAL_MESSAGE,
+                clarification_guidance=DATA_ANALYSIS_CLARIFICATION_GUIDANCE,
+                openai_api_base=openai_api_base,
+            )
+        else:
+            self.request_guard = None
+
+    def _guard_request(
+        self,
+        question: str | None,
+        payload: TabularPayload,
+    ) -> RequestGuardDecision | None:
+        if self.request_guard is None:
+            return None
+
+        effective_question = (question or "").strip()
+        if not effective_question:
+            return None
+
+        decision = self.request_guard(
+            effective_question,
+            _build_analysis_domain_text(payload),
+        )
+        if decision.is_allow:
+            return None
+        return decision
 
     async def analyze(
         self,
@@ -243,7 +349,16 @@ class DataAnalysisAgent(BaseAgent):
         *,
         question: str | None = None,
     ) -> AnalysisResult:
-        return analyze_tabular_payload(payload, question=question)
+        effective_question = question or payload.question
+        decision = self._guard_request(effective_question, payload)
+        if decision is not None:
+            return _build_guarded_analysis_result(
+                decision,
+                question=effective_question,
+                payload=payload,
+            )
+
+        return analyze_tabular_payload(payload, question=effective_question)
 
     async def ask(
         self,

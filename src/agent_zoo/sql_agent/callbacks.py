@@ -14,13 +14,13 @@ from typing import Any
 from google.adk.models import LlmResponse
 from google.genai import types
 
+try:
+    from ..clarification import format_clarification_response, normalize_clarification_response
+except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
+    from clarification import format_clarification_response, normalize_clarification_response  # type: ignore[no-redef]
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
-from .formatting import (
-    format_clarification_response,
-    format_structured_response,
-    normalize_clarification_response,
-)
+from .formatting import format_structured_response
 try:
     from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.

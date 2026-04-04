@@ -15,8 +15,13 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent_zoo.base import BaseAgent
 from agent_zoo.data_analysis_agent import DataAnalysisAgent, analyze_tabular_payload
+from agent_zoo.request_guard import allow_request, clarification_request, out_of_scope_request
 from agent_zoo.tabular import TabularPayload
 from google.adk.agents import SequentialAgent
+
+
+def _allow_request_guard(question: str, domain_text: str):
+    return allow_request()
 
 
 class DataAnalysisAgentTestCase(unittest.TestCase):
@@ -36,7 +41,7 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         self.assertIsInstance(module.root_agent, SequentialAgent)
 
     def test_namespace_exports_instantiable_agent(self) -> None:
-        agent = DataAnalysisAgent()
+        agent = DataAnalysisAgent(request_guard=_allow_request_guard)
 
         self.assertIsInstance(agent, BaseAgent)
         self.assertEqual(agent.get_name(), "data_analysis_agent")
@@ -84,7 +89,7 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         )
 
     def test_ask_returns_formatted_analysis_text(self) -> None:
-        agent = DataAnalysisAgent()
+        agent = DataAnalysisAgent(request_guard=_allow_request_guard)
         payload = TabularPayload.from_rows(
             [{"total_patients": 8}],
             question="How many patients are there?",
@@ -95,6 +100,42 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         self.assertIn("Summary:", response)
         self.assertIn("Findings:", response)
         self.assertIn("Next steps:", response)
+
+    def test_analyze_returns_out_of_scope_response_when_guard_refuses(self) -> None:
+        agent = DataAnalysisAgent(
+            request_guard=lambda question, domain_text: out_of_scope_request(
+                "I'm a data analysis agent. Please ask about the provided result instead of unrelated topics."
+            )
+        )
+        payload = TabularPayload.from_rows(
+            [{"total_patients": 8}],
+            question="Tell me a joke",
+        )
+
+        result = asyncio.run(agent.analyze(payload, question="Tell me a joke"))
+
+        self.assertEqual(result.response_type, "out_of_scope")
+        self.assertEqual(result.findings, [])
+        self.assertIn("provided result", result.final_text)
+
+    def test_analyze_returns_clarification_response_when_guard_is_unsure(self) -> None:
+        agent = DataAnalysisAgent(
+            request_guard=lambda question, domain_text: clarification_request(
+                "Which result dimension do you want me to focus on?",
+                ["age", "fare", "survival"],
+            )
+        )
+        payload = TabularPayload.from_rows(
+            [{"age": 30, "fare": 10.5, "survived": 1}],
+            question="Explain the pattern",
+        )
+
+        result = asyncio.run(agent.analyze(payload, question="Explain the pattern"))
+
+        self.assertEqual(result.response_type, "clarification")
+        self.assertEqual(result.clarification_options, ["age", "fare", "survival"])
+        self.assertIn("Which result dimension", result.final_text)
+        self.assertIn("- age", result.final_text)
 
 
 if __name__ == "__main__":

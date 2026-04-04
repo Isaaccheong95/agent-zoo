@@ -42,6 +42,7 @@ class WorkflowDefinition:
     steps: list[WorkflowStep]
     final_output_key: str | None = None
     final_text_builder: FinalTextBuilder | None = None
+    description: str | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +117,8 @@ class OrchestrationResult:
     final_text: str
     step_results: list[StepExecutionResult]
     artifacts: dict[str, Any]
+    response_type: str = "final"
+    clarification_options: list[str] = field(default_factory=list)
 
 
 def build_question_inputs(
