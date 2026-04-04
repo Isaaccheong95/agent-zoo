@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -24,6 +25,7 @@ from agent_zoo.orchestrator_agent import (
 )
 from agent_zoo.sql_agent.result import SQLAgentStructuredResult, build_structured_result
 from agent_zoo.tabular import TabularPayload
+from google.adk.agents import SequentialAgent
 
 
 class FakeSQLAgent:
@@ -42,6 +44,21 @@ class EchoAgent:
 
 
 class OrchestratorAgentTestCase(unittest.TestCase):
+    def test_top_level_package_exposes_adk_root_agent(self) -> None:
+        package_root = REPO_ROOT / "src" / "agent_zoo"
+        original_sys_path = list(sys.path)
+        sys.path.insert(0, str(package_root))
+        try:
+            if "orchestrator_agent" in sys.modules:
+                del sys.modules["orchestrator_agent"]
+            module = importlib.import_module("orchestrator_agent")
+        finally:
+            sys.path[:] = original_sys_path
+            sys.modules.pop("orchestrator_agent", None)
+
+        self.assertTrue(hasattr(module, "root_agent"))
+        self.assertIsInstance(module.root_agent, SequentialAgent)
+
     def test_single_agent_workflow_returns_text(self) -> None:
         orchestrator = OrchestratorAgent(
             agents={"echo": EchoAgent()},

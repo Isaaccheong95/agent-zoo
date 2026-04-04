@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -15,9 +16,25 @@ if str(SRC_ROOT) not in sys.path:
 from agent_zoo.base import BaseAgent
 from agent_zoo.data_analysis_agent import DataAnalysisAgent, analyze_tabular_payload
 from agent_zoo.tabular import TabularPayload
+from google.adk.agents import SequentialAgent
 
 
 class DataAnalysisAgentTestCase(unittest.TestCase):
+    def test_top_level_package_exposes_adk_root_agent(self) -> None:
+        package_root = REPO_ROOT / "src" / "agent_zoo"
+        original_sys_path = list(sys.path)
+        sys.path.insert(0, str(package_root))
+        try:
+            if "data_analysis_agent" in sys.modules:
+                del sys.modules["data_analysis_agent"]
+            module = importlib.import_module("data_analysis_agent")
+        finally:
+            sys.path[:] = original_sys_path
+            sys.modules.pop("data_analysis_agent", None)
+
+        self.assertTrue(hasattr(module, "root_agent"))
+        self.assertIsInstance(module.root_agent, SequentialAgent)
+
     def test_namespace_exports_instantiable_agent(self) -> None:
         agent = DataAnalysisAgent()
 

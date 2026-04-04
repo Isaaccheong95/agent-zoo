@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from statistics import fmean
 from typing import Any
 
+from google.adk.agents import SequentialAgent
+from google.genai import types
+
 try:
     from ..base import BaseAgent
     from ..tabular import TabularPayload
@@ -19,6 +22,29 @@ DATA_ANALYSIS_AGENT_DESCRIPTION = (
     "Interprets structured tabular results, surfaces findings and caveats, "
     "and suggests next analytical steps."
 )
+
+
+def _default_root_agent_message(callback_context=None, **kwargs) -> types.Content:
+    return types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                text=(
+                    "The data_analysis_agent package loaded successfully, but it is intended to be used "
+                    "programmatically with structured TabularPayload inputs. Instantiate DataAnalysisAgent in "
+                    "Python code or add a custom ADK root_agent if you want a direct ADK web workflow."
+                )
+            )
+        ],
+    )
+
+
+def build_root_agent() -> SequentialAgent:
+    return SequentialAgent(
+        name=DATA_ANALYSIS_AGENT_NAME,
+        description=DATA_ANALYSIS_AGENT_DESCRIPTION,
+        before_agent_callback=_default_root_agent_message,
+    )
 
 
 def _is_numeric(value: Any) -> bool:
@@ -227,3 +253,6 @@ class DataAnalysisAgent(BaseAgent):
     ) -> str:
         result = await self.analyze(data, question=question)
         return result.final_text
+
+
+root_agent = build_root_agent()
