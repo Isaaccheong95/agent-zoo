@@ -1,4 +1,4 @@
-from .agent import OrchestrationError, OrchestratorAgent
+from .agent import OrchestrationError, OrchestratorAgent, build_root_agent, root_agent
 from .models import (
     HandoffPolicy,
     OrchestrationContext,
@@ -17,6 +17,8 @@ __all__ = [
     "OrchestratorAgent",
     "WorkflowDefinition",
     "WorkflowStep",
+    "build_root_agent",
     "build_question_inputs",
     "build_tabular_analysis_inputs",
+    "root_agent",
 ]

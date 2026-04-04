@@ -5,6 +5,9 @@ from __future__ import annotations
 import inspect
 from typing import Any, Mapping
 
+from google.adk.agents import SequentialAgent
+from google.genai import types
+
 try:
     from ..base import BaseAgent
 except ImportError:  # Support ADK loading this package as top-level `orchestrator_agent`.
@@ -24,6 +27,29 @@ ORCHESTRATOR_AGENT_NAME = "orchestrator_agent"
 ORCHESTRATOR_AGENT_DESCRIPTION = (
     "Coordinates registered sub-agents through explicit workflows and passes structured artifacts between them."
 )
+
+
+def _default_root_agent_message(callback_context=None, **kwargs) -> types.Content:
+    return types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                text=(
+                    "The generic orchestrator package loaded successfully, but it does not ship with a default "
+                    "workflow registry for ADK web. Instantiate OrchestratorAgent programmatically with registered "
+                    "agents and workflows, or add a custom ADK root_agent tailored to your application."
+                )
+            )
+        ],
+    )
+
+
+def build_root_agent() -> SequentialAgent:
+    return SequentialAgent(
+        name=ORCHESTRATOR_AGENT_NAME,
+        description=ORCHESTRATOR_AGENT_DESCRIPTION,
+        before_agent_callback=_default_root_agent_message,
+    )
 
 
 def _coerce_final_text(value: Any) -> str:
@@ -156,4 +182,7 @@ class OrchestratorAgent(BaseAgent):
         return result.final_text
 
 
-__all__ = ["OrchestrationError", "OrchestratorAgent"]
+root_agent = build_root_agent()
+
+
+__all__ = ["OrchestrationError", "OrchestratorAgent", "build_root_agent", "root_agent"]
