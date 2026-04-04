@@ -25,6 +25,7 @@ class OrchestrationError(RuntimeError):
 
 
 InputBuilder = Callable[["OrchestrationContext"], dict[str, Any]]
+InstructionBuilder = Callable[["OrchestrationContext"], str | None]
 FinalTextBuilder = Callable[["OrchestrationContext"], str]
 Router = Callable[[str, Mapping[str, Any], Mapping[str, "WorkflowDefinition"]], str | None]
 
@@ -137,6 +138,8 @@ def build_tabular_analysis_inputs(
     payload_arg: str = "payload",
     include_question: bool = True,
     handoff_policy: HandoffPolicy = HandoffPolicy.INTERNAL_PREFERRED,
+    instructions_arg: str = "instructions",
+    instructions_builder: InstructionBuilder | None = None,
 ) -> InputBuilder:
     def builder(context: OrchestrationContext) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -144,6 +147,10 @@ def build_tabular_analysis_inputs(
         }
         if include_question:
             kwargs["question"] = context.question
+        if instructions_builder is not None:
+            instructions = instructions_builder(context)
+            if instructions not in (None, ""):
+                kwargs[instructions_arg] = str(instructions)
         return kwargs
 
     return builder

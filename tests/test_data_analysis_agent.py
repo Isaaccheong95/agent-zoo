@@ -14,10 +14,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent_zoo.base import BaseAgent
-from agent_zoo.data_analysis_agent import DataAnalysisAgent, analyze_tabular_payload
+from agent_zoo.data_analysis_agent import DataAnalysisAgent, analyze_tabular_payload, load_settings
 from agent_zoo.request_guard import allow_request, clarification_request, out_of_scope_request
 from agent_zoo.tabular import TabularPayload
-from google.adk.agents import SequentialAgent
+from agent_zoo.data_analysis_agent.tools import build_data_analysis_tools
+from google.adk.agents import LlmAgent
 
 
 def _allow_request_guard(question: str, domain_text: str):
@@ -38,7 +39,7 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
             sys.modules.pop("data_analysis_agent", None)
 
         self.assertTrue(hasattr(module, "root_agent"))
-        self.assertIsInstance(module.root_agent, SequentialAgent)
+        self.assertIsInstance(module.root_agent, LlmAgent)
 
     def test_namespace_exports_instantiable_agent(self) -> None:
         agent = DataAnalysisAgent(request_guard=_allow_request_guard)
@@ -47,7 +48,7 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         self.assertEqual(agent.get_name(), "data_analysis_agent")
         self.assertEqual(
             agent.get_description(),
-            "Interprets structured tabular results, surfaces findings and caveats, and suggests next analytical steps.",
+            "Interprets structured tabular results, can inspect dataset slices directly when needed, surfaces findings and caveats, and suggests next analytical steps.",
         )
 
     def test_analyze_tabular_payload_highlights_ranked_groups(self) -> None:
@@ -100,6 +101,37 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         self.assertIn("Summary:", response)
         self.assertIn("Findings:", response)
         self.assertIn("Next steps:", response)
+
+    def test_analyze_preserves_orchestrator_instructions(self) -> None:
+        agent = DataAnalysisAgent(request_guard=_allow_request_guard)
+        payload = TabularPayload.from_rows(
+            [{"city": "Tokyo", "matching_count": 10}],
+            question="Explain the pattern",
+        )
+
+        result = asyncio.run(
+            agent.analyze(
+                payload,
+                question="Explain the pattern",
+                instructions="Focus on the strongest ranking signal.",
+            )
+        )
+
+        self.assertEqual(result.instructions_received, "Focus on the strongest ranking signal.")
+        self.assertEqual(
+            result.metadata.get("instructions_received"),
+            "Focus on the strongest ranking signal.",
+        )
+
+    def test_standalone_root_agent_registers_dataset_tools(self) -> None:
+        tool_names = {
+            tool.__name__
+            for tool in build_data_analysis_tools(load_settings())
+        }
+
+        self.assertIn("inspect_dataset_schema", tool_names)
+        self.assertIn("execute_dataset_read_only", tool_names)
+        self.assertIn("analyze_dataset_with_sql", tool_names)
 
     def test_analyze_returns_out_of_scope_response_when_guard_refuses(self) -> None:
         agent = DataAnalysisAgent(

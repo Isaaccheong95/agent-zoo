@@ -1,20 +1,24 @@
 # Data Analysis Agent
 
-This package contains a lightweight agent for interpreting already-available tabular results.
+This package now supports two complementary modes:
 
-Its job is not to query data. Its job is to look at a table or summary result and produce:
+- a standalone ADK-web agent that can inspect the dataset directly and answer dataset questions
+- a lightweight programmatic analysis surface for interpreting already-available tabular results
+
+Its analysis core is still focused on looking at a table or summary result and producing:
 
 - a short summary
 - findings
 - caveats
 - suggested next analytical steps
 
-The agent is deliberately narrow so it stays reusable and easy to compose with other agents.
+The agent stays deliberately narrow so it remains reusable and easy to compose with other agents.
 
 ## What it does
 
-The data analysis agent is designed for descriptive downstream analysis, such as:
+The data analysis agent is designed for dataset-grounded descriptive analysis, such as:
 
+- answering user questions about the current dataset through direct read-only dataset access
 - interpreting grouped result tables
 - calling out the highest and lowest values in a ranking
 - noting truncation or small-sample caveats
@@ -24,12 +28,12 @@ The data analysis agent is designed for descriptive downstream analysis, such as
 
 The first version does not:
 
-- query the database directly
+- modify the database
 - generate SQL
 - build charts
 - perform advanced statistical inference
 
-Those responsibilities should stay with the SQL agent, a future figure builder, or other specialized agents.
+Write-capable database actions, charting, and richer statistical workflows should stay with other specialized agents.
 
 ## Public API
 
@@ -37,14 +41,39 @@ The package exports:
 
 - `DataAnalysisAgent`
 - `AnalysisResult`
+- `DataAnalysisAgentSettings`
 - `analyze_tabular_payload(...)`
+- `analyze_query_result(...)`
+- `load_settings(...)`
+- `build_root_agent(...)`
 
 There are two usage surfaces:
 
 - `analyze(...)`: structured programmatic result
 - `ask(...)`: user-facing convenience string
 
-This mirrors the intended split between machine-facing composition and human-facing display.
+There is also a standalone ADK `root_agent` surface for direct dataset-aware chat usage.
+
+This mirrors the intended split between machine-facing composition, human-facing display, and direct ADK-web use.
+
+## Standalone ADK-web usage
+
+When loaded in ADK web, `data_analysis_agent` now exposes a real `root_agent`.
+
+That standalone agent can:
+
+- inspect the dataset schema
+- run read-only dataset queries
+- analyze the resulting table in one tool call
+- answer dataset-grounded user questions without requiring a pre-supplied `TabularPayload`
+
+Its direct dataset-access tools are:
+
+- `inspect_dataset_schema`
+- `execute_dataset_read_only`
+- `analyze_dataset_with_sql`
+
+The standalone ADK path is intended for direct dataset question-answering. The programmatic `DataAnalysisAgent` class remains the reusable payload-analysis surface for downstream orchestration.
 
 ## Request guard behavior
 
@@ -118,7 +147,7 @@ In normal app code, the most common custom-guard cases are:
 - custom refusal wording
 - custom clarification choices
 
-## Standalone usage
+## Standalone programmatic payload usage
 
 You can use the analysis agent directly with a `TabularPayload`.
 
@@ -153,19 +182,27 @@ text = asyncio.run(agent.ask(data=payload))
 print(text)
 ```
 
-## SQL-fed usage
+## Orchestrated SQL-fed usage
 
-The intended SQL-fed path is:
+The preferred composed path is now:
 
-1. call `SQLAgent.query(...)`
-2. resolve the tabular payload from the structured SQL result
-3. pass that payload into `DataAnalysisAgent.analyze(...)`
+1. the SQL agent queries the dataset and returns a structured artifact
+2. the orchestrator resolves the payload from that artifact
+3. the orchestrator passes the payload plus explicit instructions into `DataAnalysisAgent.analyze(...)`
 
 ```python
 import asyncio
 from pathlib import Path
 
 from agent_zoo.data_analysis_agent import DataAnalysisAgent
+from agent_zoo.orchestrator_agent import (
+    HandoffPolicy,
+    OrchestratorAgent,
+    WorkflowDefinition,
+    WorkflowStep,
+    build_question_inputs,
+    build_tabular_analysis_inputs,
+)
 from agent_zoo.sql_agent import SQLAgent, load_settings
 
 settings = load_settings(
@@ -177,17 +214,41 @@ settings = load_settings(
 
 sql_agent = SQLAgent(settings=settings)
 analysis_agent = DataAnalysisAgent()
-
-sql_result = asyncio.run(
-    sql_agent.query("Show the count by city and give me the raw result")
+orchestrator = OrchestratorAgent(
+    agents={"sql": sql_agent, "analysis": analysis_agent},
+    workflows={
+        "sql_then_analysis": WorkflowDefinition(
+            steps=[
+                WorkflowStep(
+                    agent_name="sql",
+                    method_name="query",
+                    output_key="sql_result",
+                    input_builder=build_question_inputs(),
+                ),
+                WorkflowStep(
+                    agent_name="analysis",
+                    method_name="analyze",
+                    output_key="analysis_result",
+                    input_builder=build_tabular_analysis_inputs(
+                        "sql_result",
+                        handoff_policy=HandoffPolicy.INTERNAL_PREFERRED,
+                        instructions_builder=lambda context: (
+                            f"Explain the strongest pattern for: {context.question}"
+                        ),
+                    ),
+                ),
+            ],
+            final_output_key="analysis_result",
+        )
+    },
+    default_workflow="sql_then_analysis",
 )
 
-payload = sql_result.get_tabular_payload(prefer_internal=True)
-analysis = asyncio.run(
-    analysis_agent.analyze(payload, question="Explain the pattern in the result")
+result = asyncio.run(
+    orchestrator.orchestrate("Show the count by city and explain the pattern")
 )
 
-print(analysis.final_text)
+print(result.final_text)
 ```
 
 ## Input contract
@@ -203,7 +264,7 @@ The analysis agent works on `TabularPayload`, which can carry:
 - SQL provenance
 - optional metadata
 
-This lets the same agent work in both standalone mode and SQL-fed mode.
+This lets the same agent work in both standalone ADK-web mode and orchestrated payload-analysis mode.
 
 ## Output contract
 
@@ -218,6 +279,7 @@ This lets the same agent work in both standalone mode and SQL-fed mode.
 - `metadata`
 - `response_type`
 - `clarification_options`
+- `instructions_received`
 
 For orchestration and app integration, the structured result is the preferred surface. For direct display, `final_text` is usually enough.
 
@@ -229,13 +291,15 @@ When the request guard short-circuits, `AnalysisResult` still comes back in the 
 
 ## Current behavior notes
 
-The current implementation is intentionally heuristic and lightweight. It does not use an LLM. That keeps it deterministic, concise, and easy to test.
+The standalone ADK root agent uses an LLM plus direct read-only dataset tools.
 
-That also means it is best suited for:
+The programmatic payload-analysis surface remains intentionally heuristic and lightweight. That keeps it deterministic, concise, and easy to test.
+
+The payload-analysis path is best suited for:
 
 - ranked tables
 - simple grouped summaries
 - scalar results
 - preview tables where caveat handling matters
 
-If you later want richer narrative analysis, you can add a model-backed layer on top of the same `TabularPayload` input contract without changing how other agents hand data into this package.
+If you later want richer downstream narrative analysis, you can add a model-backed layer on top of the same `TabularPayload` input contract without changing how the orchestrator hands data into this package.

@@ -153,6 +153,9 @@ orchestrator = OrchestratorAgent(
                     input_builder=build_tabular_analysis_inputs(
                         "sql_result",
                         handoff_policy=HandoffPolicy.INTERNAL_PREFERRED,
+                        instructions_builder=lambda context: (
+                            f"Explain the strongest pattern for: {context.question}"
+                        ),
                     ),
                 ),
             ],
@@ -186,6 +189,8 @@ The orchestrator supports three handoff modes when a downstream step needs tabul
 - `PUBLIC_ONLY`: always use the public structured payload
 
 For SQL-to-analysis workflows, the normal choice is `INTERNAL_PREFERRED` or `INTERNAL_REQUIRED` so the analysis agent can work on the fuller queried dataset instead of only a privacy-collapsed public summary.
+
+The orchestrator is also the intended owner of downstream analysis instructions. SQLAgent should return a structured query artifact, and the orchestrator should decide what analysis focus to pass into `DataAnalysisAgent.analyze(...)` through `build_tabular_analysis_inputs(..., instructions_builder=...)`.
 
 ## Important SQL-agent note
 

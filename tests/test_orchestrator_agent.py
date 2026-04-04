@@ -150,6 +150,75 @@ class OrchestratorAgentTestCase(unittest.TestCase):
         self.assertEqual(sql_agent.questions, ["Analyze patient rows"])
         self.assertIn("preview of 2 rows out of 3", result.final_text)
 
+    def test_sql_to_analysis_workflow_passes_orchestrator_instructions(self) -> None:
+        sql_result = build_structured_result(
+            question="Analyze patient rows",
+            final_response="Found 3 matching rows.",
+            public_result={
+                "status": "success",
+                "sql": "SELECT COUNT(*) AS matching_count FROM patients",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 3}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "public_result_kind": "detail_count_fallback",
+            },
+            internal_result={
+                "status": "success",
+                "sql": "SELECT name, age FROM patients",
+                "columns": ["name", "age"],
+                "rows": [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 44}],
+                "row_count": 3,
+                "preview_row_count": 2,
+                "truncated": True,
+                "error": None,
+            },
+            schema_text="patients(name TEXT, age INTEGER)",
+        )
+        orchestrator = OrchestratorAgent(
+            agents={
+                "sql": FakeSQLAgent(sql_result),
+                "analysis": DataAnalysisAgent(request_guard=_allow_request_guard),
+            },
+            workflows={
+                "sql_then_analysis": WorkflowDefinition(
+                    steps=[
+                        WorkflowStep(
+                            agent_name="sql",
+                            method_name="query",
+                            output_key="sql_result",
+                            input_builder=build_question_inputs(),
+                        ),
+                        WorkflowStep(
+                            agent_name="analysis",
+                            method_name="analyze",
+                            output_key="analysis_result",
+                            input_builder=build_tabular_analysis_inputs(
+                                "sql_result",
+                                handoff_policy=HandoffPolicy.INTERNAL_PREFERRED,
+                                instructions_builder=lambda context: (
+                                    f"Focus on the strongest patient pattern for: {context.question}"
+                                ),
+                            ),
+                        ),
+                    ],
+                    final_output_key="analysis_result",
+                )
+            },
+            default_workflow="sql_then_analysis",
+            request_guard=_allow_request_guard,
+        )
+
+        result = asyncio.run(orchestrator.orchestrate("Analyze patient rows"))
+
+        analysis_result = result.artifacts["analysis_result"]
+        self.assertEqual(
+            analysis_result.instructions_received,
+            "Focus on the strongest patient pattern for: Analyze patient rows",
+        )
+
     def test_internal_required_handoff_fails_when_internal_payload_missing(self) -> None:
         sql_result = build_structured_result(
             question="Analyze count",

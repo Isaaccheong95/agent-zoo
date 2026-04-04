@@ -1,13 +1,18 @@
-"""Minimal reusable agent for interpreting tabular query results."""
+"""Reusable agent surfaces for dataset-aware and payload-based analysis."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from statistics import fmean
-from typing import Any
+from typing import TYPE_CHECKING, Any, Mapping
 
-from google.adk.agents import SequentialAgent
+from google.adk.agents import LlmAgent
+from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
+
+if TYPE_CHECKING:
+    from .config import DataAnalysisAgentSettings
 
 try:
     from ..base import BaseAgent
@@ -33,8 +38,8 @@ except ImportError:  # Support ADK loading this package as top-level `data_analy
 
 DATA_ANALYSIS_AGENT_NAME = "data_analysis_agent"
 DATA_ANALYSIS_AGENT_DESCRIPTION = (
-    "Interprets structured tabular results, surfaces findings and caveats, "
-    "and suggests next analytical steps."
+    "Interprets structured tabular results, can inspect dataset slices directly when needed, "
+    "surfaces findings and caveats, and suggests next analytical steps."
 )
 DATA_ANALYSIS_REFUSAL_MESSAGE = (
     "I'm a data analysis agent. I can interpret the provided dataset result, summarize patterns, "
@@ -44,29 +49,11 @@ DATA_ANALYSIS_CLARIFICATION_GUIDANCE = (
     "If the request could refer to more than one column, grouping, metric, or analysis angle, ask a short "
     "clarification question and suggest grounded options based on the available columns or result context."
 )
-
-
-def _default_root_agent_message(callback_context=None, **kwargs) -> types.Content:
-    return types.Content(
-        role="model",
-        parts=[
-            types.Part(
-                text=(
-                    "The data_analysis_agent package loaded successfully, but it is intended to be used "
-                    "programmatically with structured TabularPayload inputs. Instantiate DataAnalysisAgent in "
-                    "Python code or add a custom ADK root_agent if you want a direct ADK web workflow."
-                )
-            )
-        ],
-    )
-
-
-def build_root_agent() -> SequentialAgent:
-    return SequentialAgent(
-        name=DATA_ANALYSIS_AGENT_NAME,
-        description=DATA_ANALYSIS_AGENT_DESCRIPTION,
-        before_agent_callback=_default_root_agent_message,
-    )
+def _apply_llm_env_settings(openai_api_base: str | None) -> None:
+    if openai_api_base:
+        os.environ["OPENAI_API_BASE"] = openai_api_base
+    if os.getenv("OPENAI_API_BASE") and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = "local-openai-compatible-key"
 
 
 def _is_numeric(value: Any) -> bool:
@@ -244,18 +231,42 @@ class AnalysisResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     response_type: str = "analysis"
     clarification_options: list[str] = field(default_factory=list)
+    instructions_received: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "findings": list(self.findings),
+            "caveats": list(self.caveats),
+            "next_steps": list(self.next_steps),
+            "final_text": self.final_text,
+            "question": self.question,
+            "metadata": dict(self.metadata),
+            "response_type": self.response_type,
+            "clarification_options": list(self.clarification_options),
+            "instructions_received": self.instructions_received,
+        }
 
 
 def analyze_tabular_payload(
     payload: TabularPayload,
     *,
     question: str | None = None,
+    instructions: str | None = None,
 ) -> AnalysisResult:
     effective_question = question or payload.question
     summary = _summary(payload)
     findings = _findings(payload)
     caveats = _caveats(payload)
     next_steps = _next_steps(payload)
+    metadata = {
+        "row_count": payload.row_count,
+        "preview_row_count": payload.preview_row_count,
+        "truncated": payload.truncated,
+        "columns": list(payload.columns),
+    }
+    if instructions:
+        metadata["instructions_received"] = instructions
     result = AnalysisResult(
         summary=summary,
         findings=findings,
@@ -263,15 +274,30 @@ def analyze_tabular_payload(
         next_steps=next_steps,
         final_text="",
         question=effective_question,
-        metadata={
-            "row_count": payload.row_count,
-            "preview_row_count": payload.preview_row_count,
-            "truncated": payload.truncated,
-            "columns": list(payload.columns),
-        },
+        metadata=metadata,
+        instructions_received=instructions,
     )
     result.final_text = _format_analysis_result(result)
     return result
+
+
+def analyze_query_result(
+    result: Mapping[str, Any],
+    *,
+    question: str | None = None,
+    schema_text: str | None = None,
+    instructions: str | None = None,
+) -> AnalysisResult:
+    payload = TabularPayload.from_sql_result(
+        result,
+        question=question,
+        schema_text=schema_text,
+    )
+    return analyze_tabular_payload(
+        payload,
+        question=question,
+        instructions=instructions,
+    )
 
 
 def _build_guarded_analysis_result(
@@ -279,7 +305,16 @@ def _build_guarded_analysis_result(
     *,
     question: str | None,
     payload: TabularPayload,
+    instructions: str | None = None,
 ) -> AnalysisResult:
+    metadata = {
+        "row_count": payload.row_count,
+        "preview_row_count": payload.preview_row_count,
+        "truncated": payload.truncated,
+        "columns": list(payload.columns),
+    }
+    if instructions:
+        metadata["instructions_received"] = instructions
     return AnalysisResult(
         summary=decision.user_message or "",
         findings=[],
@@ -287,14 +322,10 @@ def _build_guarded_analysis_result(
         next_steps=[],
         final_text=format_request_guard_decision(decision),
         question=question,
-        metadata={
-            "row_count": payload.row_count,
-            "preview_row_count": payload.preview_row_count,
-            "truncated": payload.truncated,
-            "columns": list(payload.columns),
-        },
+        metadata=metadata,
         response_type=decision.response_type,
         clarification_options=list(decision.options),
+        instructions_received=instructions,
     )
 
 
@@ -348,6 +379,7 @@ class DataAnalysisAgent(BaseAgent):
         payload: TabularPayload,
         *,
         question: str | None = None,
+        instructions: str | None = None,
     ) -> AnalysisResult:
         effective_question = question or payload.question
         decision = self._guard_request(effective_question, payload)
@@ -356,18 +388,56 @@ class DataAnalysisAgent(BaseAgent):
                 decision,
                 question=effective_question,
                 payload=payload,
+                instructions=instructions,
             )
 
-        return analyze_tabular_payload(payload, question=effective_question)
+        return analyze_tabular_payload(
+            payload,
+            question=effective_question,
+            instructions=instructions,
+        )
 
     async def ask(
         self,
         question: str | None = None,
         *,
         data: TabularPayload,
+        instructions: str | None = None,
     ) -> str:
-        result = await self.analyze(data, question=question)
+        result = await self.analyze(data, question=question, instructions=instructions)
         return result.final_text
+
+
+def build_root_agent(settings: DataAnalysisAgentSettings | None = None) -> LlmAgent:
+    try:
+        from .callbacks import (
+            build_normalize_clarification_after_model_callback,
+            build_request_guard_before_model_callback,
+        )
+        from .config import load_settings
+        from .instructions import build_agent_instruction
+        from .tools import build_data_analysis_tools
+    except ImportError:  # Support ADK loading this package as top-level `data_analysis_agent`.
+        from callbacks import (  # type: ignore[no-redef]
+            build_normalize_clarification_after_model_callback,
+            build_request_guard_before_model_callback,
+        )
+        from config import load_settings  # type: ignore[no-redef]
+        from instructions import build_agent_instruction  # type: ignore[no-redef]
+        from tools import build_data_analysis_tools  # type: ignore[no-redef]
+
+    active_settings = settings or load_settings()
+    _apply_llm_env_settings(active_settings.openai_api_base)
+    return LlmAgent(
+        model=LiteLlm(model=active_settings.model),
+        name=DATA_ANALYSIS_AGENT_NAME,
+        description=DATA_ANALYSIS_AGENT_DESCRIPTION,
+        instruction=build_agent_instruction(active_settings),
+        tools=build_data_analysis_tools(active_settings),
+        generate_content_config=types.GenerateContentConfig(temperature=0.0),
+        before_model_callback=build_request_guard_before_model_callback(active_settings),
+        after_model_callback=build_normalize_clarification_after_model_callback(active_settings),
+    )
 
 
 root_agent = build_root_agent()
