@@ -6,8 +6,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Callable, Mapping
 
-from ..sql_agent.result import SQLAgentStructuredResult
-from ..tabular import TabularPayload
+try:
+    from ..sql_agent.result import SQLAgentStructuredResult
+    from ..tabular import TabularPayload
+except ImportError:  # Support ADK loading this package as top-level `orchestrator_agent`.
+    from sql_agent.result import SQLAgentStructuredResult  # type: ignore[no-redef]
+    from tabular import TabularPayload  # type: ignore[no-redef]
 
 
 class HandoffPolicy(StrEnum):

@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from ..tabular import TabularPayload
+try:
+    from ..tabular import TabularPayload
+except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
+    from tabular import TabularPayload  # type: ignore[no-redef]
 
 
 def _extract_error(result: Mapping[str, Any] | None) -> str | None:
