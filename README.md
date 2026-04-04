@@ -28,6 +28,41 @@ This repository is intended to grow into a library of task-focused agents, such 
 - Modular: each agent should be self-contained and easy to extend
 - Practical: focused on real developer, data, and automation workflows
 
+## Shared Agent Features
+
+The package now includes shared building blocks that multiple agents can reuse instead of re-implementing the same behavior independently.
+
+### Shared request guard
+
+[src/agent_zoo/request_guard.py](src/agent_zoo/request_guard.py) provides a reusable LLM-as-judge guard that supports three outcomes:
+
+- allow
+- out of scope
+- clarification needed
+
+This is the intended path for agents that need consistent in-scope checking, refusal messaging, and clarification behavior.
+
+### Shared clarification utilities
+
+[src/agent_zoo/clarification.py](src/agent_zoo/clarification.py) provides shared helpers for:
+
+- building clarification payloads
+- normalizing clarification output
+- formatting clarification text for the user
+
+This keeps clarification behavior consistent across agents.
+
+### Convention for future agents
+
+If you add a new agent package later, the preferred pattern is:
+
+1. keep the agent-specific business logic inside the agent package
+2. reuse [src/agent_zoo/request_guard.py](src/agent_zoo/request_guard.py) for allow/refuse/clarify behavior
+3. reuse [src/agent_zoo/clarification.py](src/agent_zoo/clarification.py) for clarification formatting and normalization
+4. keep the shared BaseAgent contract in [src/agent_zoo/base.py](src/agent_zoo/base.py) unchanged unless a new requirement truly applies to every agent
+
+This keeps new agents aligned with the SQL agent, the data analysis agent, and the orchestrator without introducing a larger framework.
+
 ## Structure
 
 Each agent lives in its own folder and should include its own:

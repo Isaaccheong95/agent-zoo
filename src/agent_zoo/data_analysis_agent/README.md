@@ -46,6 +46,78 @@ There are two usage surfaces:
 
 This mirrors the intended split between machine-facing composition and human-facing display.
 
+## Request guard behavior
+
+The analysis agent now uses the shared request-guard layer by default.
+
+That means it can:
+
+- accept in-scope analysis requests
+- refuse clearly out-of-scope requests
+- ask for clarification when the user's intent is ambiguous
+
+This guard runs before analysis starts. It uses the user question plus the available tabular context such as columns, SQL provenance, schema text, and metadata.
+
+The guard fails open on LLM errors, which means analysis is still allowed to proceed if the judge call itself breaks.
+
+## Disable the default request guard
+
+If you do not want request-guard behavior, disable it explicitly:
+
+```python
+from agent_zoo.data_analysis_agent import DataAnalysisAgent
+
+agent = DataAnalysisAgent(enable_request_guard=False)
+```
+
+## Inject a custom request guard
+
+You can inject your own guard callable instead of using the default LLM-backed guard.
+
+The callable signature is:
+
+```python
+(question: str, domain_text: str) -> RequestGuardDecision
+```
+
+Example:
+
+```python
+import asyncio
+
+from agent_zoo.data_analysis_agent import DataAnalysisAgent
+from agent_zoo.request_guard import allow_request, clarification_request
+from agent_zoo.tabular import TabularPayload
+
+
+def custom_guard(question: str, domain_text: str):
+    if "pattern" in question.lower():
+        return clarification_request(
+            "Which pattern do you want me to focus on?",
+            ["distribution", "ranking", "outliers"],
+        )
+    return allow_request()
+
+
+payload = TabularPayload.from_rows([
+    {"city": "Tokyo", "matching_count": 10},
+    {"city": "Paris", "matching_count": 4},
+])
+
+agent = DataAnalysisAgent(request_guard=custom_guard)
+result = asyncio.run(agent.analyze(payload, question="Explain the pattern"))
+
+print(result.response_type)
+print(result.final_text)
+```
+
+In normal app code, the most common custom-guard cases are:
+
+- testing without real LLM calls
+- stricter scope rules for a specific app
+- custom refusal wording
+- custom clarification choices
+
 ## Standalone usage
 
 You can use the analysis agent directly with a `TabularPayload`.
@@ -144,8 +216,16 @@ This lets the same agent work in both standalone mode and SQL-fed mode.
 - `final_text`
 - `question`
 - `metadata`
+- `response_type`
+- `clarification_options`
 
 For orchestration and app integration, the structured result is the preferred surface. For direct display, `final_text` is usually enough.
+
+When the request guard short-circuits, `AnalysisResult` still comes back in the same structured shape, but:
+
+- `response_type` will be `out_of_scope` or `clarification`
+- `findings`, `caveats`, and `next_steps` will be empty
+- `final_text` will contain the refusal or clarification text
 
 ## Current behavior notes
 

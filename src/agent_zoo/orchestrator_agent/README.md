@@ -31,6 +31,67 @@ The main exports are:
 - `ask(...)` returns final user-facing text
 - `orchestrate(...)` returns a structured `OrchestrationResult`
 
+## Request guard behavior
+
+The orchestrator now uses the shared request-guard layer by default.
+
+That means it can:
+
+- refuse clearly out-of-scope requests before any workflow runs
+- ask the user to clarify ambiguous intent before workflow selection
+- allow normal execution when the request is in scope
+
+The request guard runs before workflow selection and before any child agent is invoked. If it returns refusal or clarification, the orchestrator executes zero workflow steps.
+
+## Disable the default request guard
+
+If you want routing only and do not want guard behavior, disable it explicitly:
+
+```python
+from agent_zoo.orchestrator_agent import OrchestratorAgent
+
+orchestrator = OrchestratorAgent(
+    agents={...},
+    workflows={...},
+    default_workflow="sql_then_analysis",
+    enable_request_guard=False,
+)
+```
+
+## Inject a custom request guard
+
+You can inject a custom guard callable if you want deterministic tests or app-specific routing constraints.
+
+```python
+from agent_zoo.orchestrator_agent import OrchestratorAgent
+from agent_zoo.request_guard import allow_request, clarification_request
+
+
+def custom_guard(question: str, domain_text: str):
+    lowered = question.lower()
+    if "analyze" in lowered and "chart" in lowered:
+        return clarification_request(
+            "Do you want analysis only or analysis plus a chart workflow?",
+            ["analysis only", "analysis plus chart"],
+        )
+    return allow_request()
+
+
+orchestrator = OrchestratorAgent(
+    agents={...},
+    workflows={...},
+    default_workflow="sql_then_analysis",
+    request_guard=custom_guard,
+)
+```
+
+Common reasons to inject a custom guard:
+
+- deterministic unit tests
+- stricter app-specific scope boundaries
+- custom refusal messages
+- custom clarification rules before workflow selection
+
 ## How registration works
 
 You pass in:
@@ -41,6 +102,8 @@ You pass in:
 - optionally a `router` callable if you want light workflow selection logic
 
 The orchestrator does not care whether the registered agent is a SQL agent, analysis agent, figure agent, or something else. It only cares that the named agent exposes the method the workflow step asks for.
+
+The request guard follows the same principle: it uses the registered agents and workflows to build its domain summary, but the orchestrator itself stays generic.
 
 ## Example: register a SQL agent and a data analysis agent
 
@@ -107,6 +170,12 @@ print(result.final_text)
 print(result.workflow_name)
 print(result.artifacts.keys())
 ```
+
+`OrchestrationResult` also carries guarded outcomes. If the request is refused or needs clarification before execution:
+
+- `response_type` is set to `out_of_scope` or `clarification`
+- `clarification_options` contains any suggested choices
+- `step_results` is empty because no workflow steps ran
 
 ## Handoff policy
 
