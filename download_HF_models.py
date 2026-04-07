@@ -1,5 +1,10 @@
 # Download LLM model weights from Hugging Face Hub so that they can be loaded locally
 import os
+
+# The workspace is on a noexec mount, so hf_xet native extensions cannot be loaded here.
+# Force standard HTTP downloads instead of Xet-backed downloads.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 from huggingface_hub import snapshot_download
 from dotenv import load_dotenv
 
@@ -7,7 +12,10 @@ load_dotenv()  # Load environment variables from .env file, including HF_TOKEN
 
 # Add the Hugging Face repo IDs you want to download.
 repo_ids = [
-    "QuantFactory/SmolLM-1.7B-Instruct-GGUF"
+    "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF",
+    "unsloth/medgemma-1.5-4b-it-GGUF",
+    "unsloth/gemma-4-E4B-it-GGUF",
+    "unsloth/gemma-4-26B-A4B-it-GGUF"
 ]
 
 for repo_id in repo_ids:

@@ -12,7 +12,7 @@ dependencies = [
     "google-adk[extensions]>=1.27.1",
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
-    "huggingface_hub",
+    "huggingface_hub[hf_xet]",
     "openai",
     "google-genai",
     "python-dotenv>=1.0.1"

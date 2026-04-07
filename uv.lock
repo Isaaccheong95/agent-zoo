@@ -10,12 +10,12 @@ resolution-markers = [
 
 [[package]]
 name = "agent-zoo"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-adk", extra = ["extensions"] },
     { name = "google-genai" },
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", extra = ["hf-xet"] },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "openai" },
@@ -26,7 +26,7 @@ dependencies = [
 requires-dist = [
     { name = "google-adk", extras = ["extensions"], specifier = ">=1.27.1" },
     { name = "google-genai" },
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", extras = ["hf-xet"] },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "numpy", specifier = ">=2.4.3" },
     { name = "openai" },
@@ -2104,6 +2104,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b4/a8/94ccc0aec97b996a3a68f3e1fa06a4bd7185dd02bf22bfba794a0ade8440/huggingface_hub-1.7.1.tar.gz", hash = "sha256:be38fe66e9b03c027ad755cb9e4b87ff0303c98acf515b5d579690beb0bf3048", size = 722097, upload-time = "2026-03-13T09:36:07.758Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6f/75/ca21955d6117a394a482c7862ce96216239d0e3a53133ae8510727a8bcfa/huggingface_hub-1.7.1-py3-none-any.whl", hash = "sha256:38c6cce7419bbde8caac26a45ed22b0cea24152a8961565d70ec21f88752bfaa", size = 616308, upload-time = "2026-03-13T09:36:06.062Z" },
+]
+
+[package.optional-dependencies]
+hf-xet = [
+    { name = "hf-xet" },
 ]
 
 [[package]]
