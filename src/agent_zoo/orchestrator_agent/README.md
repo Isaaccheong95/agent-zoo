@@ -31,6 +31,8 @@ The main exports are:
 - `ask(...)` returns final user-facing text
 - `orchestrate(...)` returns a structured `OrchestrationResult`
 
+The exported `root_agent` is only a minimal ADK package-loading placeholder. The main reusable coordination surface in this package is the programmatic `OrchestratorAgent`.
+
 ## Request guard behavior
 
 The orchestrator now uses the shared request-guard layer by default.

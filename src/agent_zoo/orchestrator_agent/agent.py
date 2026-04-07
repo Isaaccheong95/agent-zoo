@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import inspect
+from typing import AsyncGenerator
 from typing import Any, Mapping
 
-from google.adk.agents import SequentialAgent
+from google.adk.agents import BaseAgent as AdkBaseAgent
+from google.adk.events import Event
+from google.adk.agents.invocation_context import InvocationContext
 from google.genai import types
 
 try:
@@ -66,8 +69,18 @@ def _default_root_agent_message(callback_context=None, **kwargs) -> types.Conten
     )
 
 
-def build_root_agent() -> SequentialAgent:
-    return SequentialAgent(
+class _OrchestratorPlaceholderAgent(AdkBaseAgent):
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        if False:
+            yield Event(invocation_id=ctx.invocation_id, author=self.name)
+
+    async def _run_live_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        if False:
+            yield Event(invocation_id=ctx.invocation_id, author=self.name)
+
+
+def build_root_agent() -> AdkBaseAgent:
+    return _OrchestratorPlaceholderAgent(
         name=ORCHESTRATOR_AGENT_NAME,
         description=ORCHESTRATOR_AGENT_DESCRIPTION,
         before_agent_callback=_default_root_agent_message,
