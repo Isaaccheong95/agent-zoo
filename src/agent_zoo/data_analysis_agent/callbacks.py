@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from google.adk.models import LlmResponse
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest, LlmResponse
 from google.genai import types
 
 try:
@@ -94,11 +95,16 @@ def build_request_guard_before_model_callback(
     )
     domain_text = _build_dataset_domain_text(active_settings)
 
-    def request_guard_before_model(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+    def request_guard_before_model(
+        callback_context: CallbackContext,
+        llm_request: LlmRequest,
+    ) -> LlmResponse | None:
+        _ = callback_context
+
         if _request_ends_with_tool_response(llm_request):
             return None
 
-        user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+        user_text = _extract_last_user_text(llm_request)
         decision = guard(user_text, domain_text)
         if decision.is_allow:
             return None
@@ -116,12 +122,15 @@ def build_request_guard_before_model_callback(
 def build_normalize_clarification_after_model_callback(
     settings: DataAnalysisAgentSettings | None = None,
 ):
+    _ = settings
+
     def normalize_clarification_after_model(
-        callback_context=None,
-        llm_response: LlmResponse | None = None,
-        **kwargs,
+        callback_context: CallbackContext,
+        llm_response: LlmResponse,
     ) -> LlmResponse | None:
-        if llm_response is None or _llm_response_has_function_call(llm_response):
+        _ = callback_context
+
+        if _llm_response_has_function_call(llm_response):
             return None
 
         response_text = _extract_llm_response_text(llm_response)

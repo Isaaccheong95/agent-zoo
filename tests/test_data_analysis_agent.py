@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -132,6 +133,16 @@ class DataAnalysisAgentTestCase(unittest.TestCase):
         self.assertIn("inspect_dataset_schema", tool_names)
         self.assertIn("execute_dataset_read_only", tool_names)
         self.assertIn("analyze_dataset_with_sql", tool_names)
+
+    def test_standalone_tool_signatures_stay_minimal(self) -> None:
+        tool_signatures = {
+            tool.__name__: list(inspect.signature(tool).parameters)
+            for tool in build_data_analysis_tools(load_settings())
+        }
+
+        self.assertEqual(tool_signatures["inspect_dataset_schema"], [])
+        self.assertEqual(tool_signatures["execute_dataset_read_only"], ["sql"])
+        self.assertEqual(tool_signatures["analyze_dataset_with_sql"], ["question", "sql"])
 
     def test_analyze_returns_out_of_scope_response_when_guard_refuses(self) -> None:
         agent = DataAnalysisAgent(

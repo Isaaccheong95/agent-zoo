@@ -7,6 +7,7 @@ from typing import AsyncGenerator
 from typing import Any, Mapping
 
 from google.adk.agents import BaseAgent as AdkBaseAgent
+from google.adk.agents.callback_context import CallbackContext
 from google.adk.events import Event
 from google.adk.agents.invocation_context import InvocationContext
 from google.genai import types
@@ -54,15 +55,17 @@ ORCHESTRATOR_CLARIFICATION_GUIDANCE = (
 )
 
 
-def _default_root_agent_message(callback_context=None, **kwargs) -> types.Content:
+def _default_root_agent_message(callback_context: CallbackContext) -> types.Content:
+    _ = callback_context
+
     return types.Content(
         role="model",
         parts=[
             types.Part(
                 text=(
-                    "The generic orchestrator package loaded successfully, but it does not ship with a default "
-                    "workflow registry for ADK web. Instantiate OrchestratorAgent programmatically with registered "
-                    "agents and workflows, or add a custom ADK root_agent tailored to your application."
+                    "The generic orchestrator package loaded successfully, but it does not provide a default "
+                    "workflow registry for ADK web. Use OrchestratorAgent programmatically with explicit agents "
+                    "and workflows, or define an application-specific root_agent for ADK execution."
                 )
             )
         ],

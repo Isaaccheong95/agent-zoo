@@ -73,6 +73,8 @@ Its direct dataset-access tools are:
 - `execute_dataset_read_only`
 - `analyze_dataset_with_sql`
 
+Those tools are intentionally fixed to the configured dataset and preview settings. The ADK-exposed tool surface does not ask the model to choose runtime overrides such as database paths or preview limits.
+
 The standalone ADK path is intended for direct dataset question-answering. The programmatic `DataAnalysisAgent` class remains the reusable payload-analysis surface for downstream orchestration.
 
 ## Request guard behavior
@@ -189,6 +191,8 @@ The preferred composed path is now:
 1. the SQL agent queries the dataset and returns a structured artifact
 2. the orchestrator resolves the payload from that artifact
 3. the orchestrator passes the payload plus explicit instructions into `DataAnalysisAgent.analyze(...)`
+
+Not every SQL-backed request needs the analysis step. Direct lookup or aggregate prompts such as "how many women are smokers?" can stop at a `sql_only` workflow and return the SQL result directly. Use `sql_then_analysis` only when the user is asking for interpretation, explanation, or analytical framing.
 
 ```python
 import asyncio

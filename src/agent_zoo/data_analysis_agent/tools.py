@@ -18,50 +18,34 @@ def build_data_analysis_tools(settings: DataAnalysisAgentSettings) -> list[Calla
     except ImportError:  # Support ADK loading this package as top-level `data_analysis_agent`.
         from agent import analyze_query_result  # type: ignore[no-redef]
 
-    def inspect_dataset_schema(db_path: str | None = None) -> dict:
-        """Inspect the SQLite schema for the configured dataset or an override path."""
+    def inspect_dataset_schema() -> dict:
+        """Inspect the SQLite schema for the configured dataset."""
 
-        return get_schema_summary(db_path or settings.db_path)
+        return get_schema_summary(settings.db_path)
 
-    def execute_dataset_read_only(
-        sql: str,
-        db_path: str | None = None,
-        preview_rows: int | None = None,
-    ) -> dict:
-        """Validate and execute a read-only SQLite query for analysis purposes."""
+    def execute_dataset_read_only(sql: str) -> dict:
+        """Validate and execute one read-only SQLite query against the configured dataset."""
 
-        effective_preview_rows = settings.preview_rows if preview_rows is None else max(1, int(preview_rows))
         return execute_sqlite_query(
-            db_path or settings.db_path,
+            settings.db_path,
             sql,
-            preview_rows=effective_preview_rows,
+            preview_rows=settings.preview_rows,
             object_id_column=settings.object_id_column,
             object_order_column=settings.object_order_column,
         )
 
-    def analyze_dataset_with_sql(
-        question: str,
-        sql: str,
-        instructions: str | None = None,
-        db_path: str | None = None,
-        preview_rows: int | None = None,
-    ) -> dict:
+    def analyze_dataset_with_sql(question: str, sql: str) -> dict:
         """Execute one read-only query and return both the query result and a structured analysis."""
 
-        effective_db_path = db_path or settings.db_path
-        schema_summary = get_schema_summary(effective_db_path)
+        schema_summary = get_schema_summary(settings.db_path)
         schema_text = schema_summary.get("schema_text") if schema_summary.get("status") == "success" else None
-        query_result = execute_dataset_read_only(
-            sql=sql,
-            db_path=effective_db_path,
-            preview_rows=preview_rows,
-        )
+        query_result = execute_dataset_read_only(sql=sql)
         if query_result.get("status") != "success":
             return {
                 "status": "error",
                 "question": question,
                 "sql": query_result.get("sql") or sql,
-                "instructions": instructions,
+                "instructions": None,
                 "query_result": query_result,
                 "analysis": None,
                 "error": query_result.get("error"),
@@ -71,13 +55,13 @@ def build_data_analysis_tools(settings: DataAnalysisAgentSettings) -> list[Calla
             query_result,
             question=question,
             schema_text=schema_text,
-            instructions=instructions,
+            instructions=None,
         )
         return {
             "status": "success",
             "question": question,
             "sql": query_result.get("sql") or sql,
-            "instructions": instructions,
+            "instructions": None,
             "query_result": query_result,
             "analysis": analysis_result.to_dict(),
             "error": None,

@@ -44,6 +44,11 @@ class EchoAgent:
         return f"echo:{question}"
 
 
+class UnexpectedAnalysisAgent:
+    async def analyze(self, payload: TabularPayload, *, question: str | None = None, instructions: str | None = None):
+        raise AssertionError("analysis agent should not be called for sql_only routing")
+
+
 def _allow_request_guard(question: str, domain_text: str):
     return allow_request()
 
@@ -87,6 +92,72 @@ class OrchestratorAgentTestCase(unittest.TestCase):
         result = asyncio.run(orchestrator.ask("hello"))
 
         self.assertEqual(result, "echo:hello")
+
+    def test_router_can_choose_sql_only_workflow_for_direct_lookup(self) -> None:
+        sql_result = build_structured_result(
+            question="How many women are smokers?",
+            final_response="17",
+            public_result={
+                "status": "success",
+                "sql": "SELECT COUNT(*) AS matching_count FROM titanic WHERE Sex = 'female' AND Smoker = 1",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 17}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "public_result_kind": "count_aggregate",
+            },
+            internal_result=None,
+            schema_text="titanic(Sex TEXT, Smoker INTEGER)",
+        )
+        sql_agent = FakeSQLAgent(sql_result)
+        orchestrator = OrchestratorAgent(
+            agents={
+                "sql": sql_agent,
+                "analysis": UnexpectedAnalysisAgent(),
+            },
+            workflows={
+                "sql_only": WorkflowDefinition(
+                    steps=[
+                        WorkflowStep(
+                            agent_name="sql",
+                            method_name="query",
+                            output_key="sql_result",
+                            input_builder=build_question_inputs(),
+                        )
+                    ],
+                    final_output_key="sql_result",
+                ),
+                "sql_then_analysis": WorkflowDefinition(
+                    steps=[
+                        WorkflowStep(
+                            agent_name="sql",
+                            method_name="query",
+                            output_key="sql_result",
+                            input_builder=build_question_inputs(),
+                        ),
+                        WorkflowStep(
+                            agent_name="analysis",
+                            method_name="analyze",
+                            output_key="analysis_result",
+                            input_builder=build_tabular_analysis_inputs("sql_result"),
+                        ),
+                    ],
+                    final_output_key="analysis_result",
+                ),
+            },
+            router=lambda question, agents, workflows: (
+                "sql_only" if question.lower().startswith("how many") else "sql_then_analysis"
+            ),
+            request_guard=_allow_request_guard,
+        )
+
+        result = asyncio.run(orchestrator.orchestrate("How many women are smokers?"))
+
+        self.assertEqual(result.workflow_name, "sql_only")
+        self.assertEqual(sql_agent.questions, ["How many women are smokers?"])
+        self.assertEqual(result.final_text, "17")
 
     def test_sql_to_analysis_workflow_prefers_internal_payload(self) -> None:
         sql_result = build_structured_result(

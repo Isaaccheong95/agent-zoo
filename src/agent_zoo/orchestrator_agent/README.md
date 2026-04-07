@@ -107,6 +107,8 @@ The orchestrator does not care whether the registered agent is a SQL agent, anal
 
 The request guard follows the same principle: it uses the registered agents and workflows to build its domain summary, but the orchestrator itself stays generic.
 
+In practice, this means the orchestrator can stay thin and select between explicit workflows such as `sql_only` and `sql_then_analysis` without becoming a central LLM planner.
+
 ## Example: register a SQL agent and a data analysis agent
 
 ```python
@@ -140,6 +142,17 @@ orchestrator = OrchestratorAgent(
         "analysis": analysis_agent,
     },
     workflows={
+        "sql_only": WorkflowDefinition(
+            steps=[
+                WorkflowStep(
+                    agent_name="sql",
+                    method_name="query",
+                    output_key="sql_result",
+                    input_builder=build_question_inputs(),
+                ),
+            ],
+            final_output_key="sql_result",
+        ),
         "sql_then_analysis": WorkflowDefinition(
             steps=[
                 WorkflowStep(
@@ -162,13 +175,15 @@ orchestrator = OrchestratorAgent(
                 ),
             ],
             final_output_key="analysis_result",
-        )
+        ),
     },
-    default_workflow="sql_then_analysis",
+    router=lambda question, agents, workflows: (
+        "sql_only" if question.lower().startswith("how many") else "sql_then_analysis"
+    ),
 )
 
 result = asyncio.run(
-    orchestrator.orchestrate("Show the age distribution and explain the pattern")
+    orchestrator.orchestrate("How many women are smokers?")
 )
 
 print(result.final_text)
@@ -207,6 +222,7 @@ Keep workflows explicit and small.
 Good first workflows:
 
 - one-agent passthrough
+- SQL only for direct counts and lookups
 - SQL query then analysis
 - analysis then figure
 
