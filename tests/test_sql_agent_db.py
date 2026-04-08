@@ -23,7 +23,9 @@ if str(SRC_ROOT) not in sys.path:
 from agent_zoo.sql_agent.callbacks import (
     SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     SQL_INTERNAL_RESULT_REF_STATE_KEY,
+    SQL_PENDING_CLARIFICATION_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
+    build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
     build_normalize_clarification_after_model_callback,
@@ -823,9 +825,10 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
     def test_after_model_callback_formats_structured_clarification_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {}
 
         result = callback(
-            callback_context=SimpleNamespace(state={}),
+            callback_context=SimpleNamespace(state=state),
             llm_response=SimpleNamespace(
                 content=types.Content(
                     role="model",
@@ -848,6 +851,10 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIn("- Employed", response_text)
         self.assertIn("- Student", response_text)
         self.assertNotIn("Available categories:", response_text)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
+            ["Employed", "Retired", "Unemployed", "Unknown", "Student"],
+        )
 
     def test_after_model_callback_strips_reasoning_from_clarification_path(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
@@ -941,6 +948,66 @@ I need clarification on your question. Could you please specify which category o
         self.assertNotIn("user_message", response_text)
         self.assertNotIn("- alcoholics", response_text)
         self.assertNotIn("- Alcoholic", response_text)
+
+    def test_after_model_callback_drops_subject_echo_from_fallback_options(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = (
+            'The phrase "alcoholics" is ambiguous for this dataset. '
+            "Which category should I use for 'alcoholics'? "
+            'Please choose from "alcoholics", "Never", "Occasionally", "Regularly", "Unknown".'
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Which category should I use for 'alcoholics'?", response_text)
+        self.assertIn("- Never", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("- alcoholics", response_text)
+
+    def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
+        classifier_calls: list[str] = []
+
+        def fake_classifier(user_text: str) -> tuple[bool, str | None]:
+            classifier_calls.append(user_text)
+            return False, "blocked"
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_classifier):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "user_message": "Which category should I use for 'alcoholics'?",
+                "options": ["Never", "Occasionally", "Regularly", "Unknown"],
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="occasionally and regularly")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(classifier_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("The user is replying to the previous clarification", rewritten_text)
+        self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
+        self.assertIn("User clarification reply: occasionally and regularly", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()

@@ -30,6 +30,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
+SQL_PENDING_CLARIFICATION_STATE_KEY = "temp:sql_pending_clarification"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -78,6 +79,22 @@ def _clear_private_result_state(state: Any) -> None:
             state[key] = None
 
 
+def _clear_pending_clarification_state(state: Any) -> None:
+    if hasattr(state, "pop"):
+        state.pop(SQL_PENDING_CLARIFICATION_STATE_KEY, None)
+    elif SQL_PENDING_CLARIFICATION_STATE_KEY in state:
+        state[SQL_PENDING_CLARIFICATION_STATE_KEY] = None
+
+
+def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
+    if state is None or not hasattr(state, "get"):
+        return None
+    pending = state.get(SQL_PENDING_CLARIFICATION_STATE_KEY)
+    if not isinstance(pending, dict):
+        return None
+    return pending
+
+
 def _request_ends_with_tool_response(llm_request) -> bool:
     contents = getattr(llm_request, "contents", None) or []
     if not contents:
@@ -101,6 +118,104 @@ def _extract_llm_response_text(llm_response: LlmResponse) -> str:
     content = getattr(llm_response, "content", None)
     parts = getattr(content, "parts", None) or []
     return "".join(getattr(part, "text", "") or "" for part in parts).strip()
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _extract_matching_clarification_options(
+    user_text: str,
+    options: list[str],
+) -> list[str]:
+    normalized_user_text = _normalize_match_text(user_text)
+    if not normalized_user_text:
+        return []
+
+    matches: list[str] = []
+    for option in options:
+        normalized_option = _normalize_match_text(option)
+        if not normalized_option:
+            continue
+        if re.search(rf"(?<!\w){re.escape(normalized_option)}(?!\w)", normalized_user_text):
+            matches.append(option)
+    return matches
+
+
+def _looks_like_new_query(user_text: str) -> bool:
+    normalized_user_text = user_text.strip().casefold()
+    if not normalized_user_text:
+        return False
+    if "?" in normalized_user_text:
+        return True
+    return normalized_user_text.startswith(
+        (
+            "how ",
+            "what ",
+            "which ",
+            "show ",
+            "count ",
+            "list ",
+            "find ",
+            "give ",
+            "calculate ",
+            "compute ",
+            "filter ",
+            "sql ",
+            "who ",
+            "where ",
+            "when ",
+        )
+    )
+
+
+def _replace_last_user_text(llm_request, replacement_text: str) -> bool:
+    contents = getattr(llm_request, "contents", None) or []
+    for index in range(len(contents) - 1, -1, -1):
+        content = contents[index]
+        if getattr(content, "role", None) != "user":
+            continue
+        contents[index] = types.Content(
+            role="user",
+            parts=[types.Part(text=replacement_text)],
+        )
+        return True
+    return False
+
+
+def _apply_pending_clarification_followup(llm_request, clarification: dict[str, Any]) -> bool:
+    user_text = _extract_last_user_text(llm_request)
+    if not user_text:
+        return False
+
+    options = [
+        option
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    ]
+    matched_options = _extract_matching_clarification_options(user_text, options)
+    word_count = len(re.findall(r"\w+", user_text))
+    if not matched_options and (word_count > 8 or _looks_like_new_query(user_text)):
+        return False
+
+    rewritten_sections = [
+        "The user is replying to the previous clarification for the same dataset request.",
+        f"Clarification question: {clarification.get('user_message') or ''}",
+    ]
+    if options:
+        rewritten_sections.append(
+            "Available options:\n" + "\n".join(f"- {option}" for option in options)
+        )
+    if matched_options:
+        rewritten_sections.append(
+            "Matched options from the reply: " + ", ".join(matched_options)
+        )
+    rewritten_sections.append(f"User clarification reply: {user_text}")
+    rewritten_sections.append(
+        "Interpret this as clarification for the prior dataset question and continue from there."
+    )
+
+    return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
 
 
 def _build_privacy_error_result(
@@ -699,6 +814,9 @@ def build_normalize_clarification_after_model_callback(
         if clarification is None:
             return None
 
+        if callback_context is not None:
+            callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+
         formatted_response = format_clarification_response(clarification)
         if not formatted_response:
             return None
@@ -795,6 +913,16 @@ def build_combined_before_model_callback(
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
+            pending_clarification = _get_pending_clarification(callback_context.state)
+            clarification_followup = False
+            if pending_clarification is not None:
+                clarification_followup = _apply_pending_clarification_followup(
+                    llm_request,
+                    pending_clarification,
+                )
+                _clear_pending_clarification_state(callback_context.state)
+            if clarification_followup:
+                return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
         result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
         if result is not None:

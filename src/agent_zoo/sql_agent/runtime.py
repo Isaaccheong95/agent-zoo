@@ -20,6 +20,27 @@ from google.genai.types import Content, Part
 from .config import SQLAgentSettings
 
 
+_RUNNER_CACHE: dict[tuple[object, ...], InMemoryRunner] = {}
+_INITIALIZED_SESSION_KEYS: set[tuple[tuple[object, ...], str]] = set()
+
+
+def _runner_cache_key(settings: SQLAgentSettings) -> tuple[object, ...]:
+    return (
+        settings.app_name,
+        settings.user_id,
+        str(settings.db_path),
+        settings.model,
+        settings.openai_api_base,
+        str(settings.instruction_file) if settings.instruction_file is not None else None,
+        settings.preview_rows,
+        settings.count_aggregates_only,
+        settings.minimum_aggregate_count,
+        settings.capture_internal_rows,
+        settings.object_id_column,
+        settings.object_order_column,
+    )
+
+
 def _text_from_parts(parts: Iterable[Part]) -> str:
     return "".join(part.text for part in parts if part.text)
 
@@ -53,15 +74,24 @@ async def ask_question(
 ) -> str:
     from .agent import build_root_agent
 
-    local_runner = runner or InMemoryRunner(agent=build_root_agent(settings), app_name=settings.app_name)
     active_session_id = session_id or settings.session_id
-
     if runner is None:
-        await local_runner.session_service.create_session(
-            app_name=local_runner.app_name,
-            user_id=settings.user_id,
-            session_id=active_session_id,
-        )
+        cache_key = _runner_cache_key(settings)
+        local_runner = _RUNNER_CACHE.get(cache_key)
+        if local_runner is None:
+            local_runner = InMemoryRunner(agent=build_root_agent(settings), app_name=settings.app_name)
+            _RUNNER_CACHE[cache_key] = local_runner
+
+        session_key = (cache_key, active_session_id)
+        if session_key not in _INITIALIZED_SESSION_KEYS:
+            await local_runner.session_service.create_session(
+                app_name=local_runner.app_name,
+                user_id=settings.user_id,
+                session_id=active_session_id,
+            )
+            _INITIALIZED_SESSION_KEYS.add(session_key)
+    else:
+        local_runner = runner
 
     content = Content(role="user", parts=[Part(text=question)])
     final_response = "No final response was received from the agent."

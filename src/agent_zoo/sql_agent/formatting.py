@@ -228,6 +228,30 @@ def _extract_user_message(raw_text: str, options: list[str]) -> str | None:
     return None
 
 
+def _prune_subject_echo_options(user_message: str | None, options: list[str]) -> list[str]:
+    if not user_message or len(options) < 2:
+        return options
+
+    subject_match = re.search(
+        r"\bwhich\s+category\b.*\b(?:for|by)\s+[\"'](?P<subject>[^\"'\n]{1,60})[\"']\s*\??$",
+        user_message,
+        flags=re.IGNORECASE,
+    )
+    if subject_match is None:
+        return options
+
+    subject = _normalize_whitespace(subject_match.group("subject"))
+    if not subject:
+        return options
+
+    pruned_options = [
+        option
+        for option in options
+        if option.casefold() != subject.casefold()
+    ]
+    return pruned_options or options
+
+
 def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     clarification = parse_clarification_response(raw_text)
     if clarification is not None:
@@ -252,6 +276,7 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
         )[:10]
 
     user_message = _extract_user_message(raw_text, options)
+    options = _prune_subject_echo_options(user_message, options)
     if user_message is None and not options:
         return None
     return build_clarification_response(user_message, options)
