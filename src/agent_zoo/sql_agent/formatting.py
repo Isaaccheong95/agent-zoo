@@ -89,6 +89,18 @@ def _extract_jsonish_options(raw_text: str) -> list[str]:
     return options
 
 
+def _is_quoted_option_source_line(line: str) -> bool:
+    normalized_line = _normalize_whitespace(line)
+    if not normalized_line:
+        return False
+    if re.search(r"\bchoose\s+from\b", normalized_line, flags=re.IGNORECASE):
+        return True
+    if ":" not in normalized_line:
+        return False
+    label_text = normalized_line.split(":", 1)[0]
+    return bool(re.search(r"\b(?:categories|options|values)\b", label_text, flags=re.IGNORECASE))
+
+
 def _extract_embedded_clarification_json(raw_text: str) -> str | None:
     marker_index = raw_text.find('"response_type"')
     if marker_index == -1:
@@ -204,6 +216,8 @@ def _extract_quoted_options(raw_text: str) -> list[str]:
 
     options: list[str] = []
     for line in raw_text.splitlines():
+        if not _is_quoted_option_source_line(line):
+            continue
         quoted_values = [match.group(1) for match in re.finditer(r'"([^"\n]{1,60})"', line)]
         if len(quoted_values) >= 2:
             options.extend(quoted_values)

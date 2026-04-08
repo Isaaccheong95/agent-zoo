@@ -1235,6 +1235,37 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         self.assertIn("- Unknown", response_text)
         self.assertNotIn("- alcoholics", response_text)
 
+    def test_after_model_callback_ignores_quoted_prose_outside_option_sections(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = """The user is asking about \"alcoholics\" which is a colloquial term.
+The available categories for alcohol consumption are:
+- \"Never\"
+- \"Occasionally\"
+- \"Regularly\"
+- \"Unknown\"
+\"Alcoholic\" is not an exact match to any stored value. The closest interpretation would be \"Regularly\".
+Could you please specify which category you'd like me to use?"""
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Could you please specify which category you'd like me to use?", response_text)
+        self.assertIn("- Never", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("- alcoholics", response_text)
+        self.assertNotIn("- Alcoholic", response_text)
+
     def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
         scope_gate_calls: list[str] = []
         resolver_calls: list[tuple[str, str, list[str], str]] = []
@@ -1334,6 +1365,47 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
         self.assertIn("User clarification reply: count both drinking categories", rewritten_text)
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+    def test_combined_before_model_callback_stores_terminal_user_question_as_topic_context(self) -> None:
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            return True, None
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        llm_request = SimpleNamespace(
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "The SQLite database is a snapshot of the current filtered cohort from the web app.\n"
+                                "Use only the table `filtered_dataset`.\n"
+                                "\n"
+                                "Relevant categorical value guidance:\n"
+                                "- socalc: Stored SQLite values seen in the current cohort: \"Never\", \"Occasionally\", \"Regularly\", \"Unknown\"\n"
+                                "\n"
+                                "User question:\n"
+                                "how many females are alcoholics"
+                            )
+                        )
+                    ],
+                )
+            ]
+        )
+        state: dict[str, object] = {}
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(state[SQL_LAST_USER_TEXT_STATE_KEY], "how many females are alcoholics")
 
     def test_combined_before_model_callback_keeps_custom_rule_followup_in_clarification_flow(self) -> None:
         scope_gate_calls: list[str] = []

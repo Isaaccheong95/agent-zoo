@@ -970,6 +970,29 @@ def _extract_last_user_text(llm_request) -> str:
     return ""
 
 
+def _extract_topic_context_text(user_text: str) -> str:
+    normalized_text = user_text.strip()
+    if not normalized_text:
+        return ""
+
+    non_empty_lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in normalized_text.splitlines()
+        if line.strip()
+    ]
+    if len(non_empty_lines) <= 1:
+        return non_empty_lines[0] if non_empty_lines else ""
+
+    for line in reversed(non_empty_lines):
+        if line.endswith(":"):
+            continue
+        if re.match(r"^(?:[-*•]|\d+[.)])\s*", line):
+            continue
+        return line
+
+    return re.sub(r"\s+", " ", normalized_text).strip()
+
+
 def build_scope_gate_callback(
     classifier,
     refusal_message: str = DEFAULT_REFUSAL_MESSAGE,
@@ -1033,7 +1056,7 @@ def build_combined_before_model_callback(
             _clear_private_result_state(callback_context.state)
             user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
             if user_text:
-                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = user_text
+                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = _extract_topic_context_text(user_text)
                 _print_clarification_debug(active_settings, "before-model-user-prompt", user_text)
             pending_clarification = _get_pending_clarification(callback_context.state)
             clarification_followup = False
