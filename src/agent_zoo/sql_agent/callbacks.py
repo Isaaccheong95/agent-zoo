@@ -38,7 +38,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
-SQL_PENDING_CLARIFICATION_STATE_KEY = "temp:sql_pending_clarification"
+SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
 SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
@@ -201,6 +201,68 @@ def _prune_topic_context_option(
 
     normalized_clarification = dict(clarification)
     normalized_clarification["options"] = pruned_options
+    return normalized_clarification
+
+
+def _match_clarification_values_to_schema_guidance(
+    clarification: dict[str, Any],
+    raw_text: str,
+    categorical_value_guidance: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not categorical_value_guidance:
+        return clarification
+
+    normalized_raw_text = _normalize_match_text(raw_text)
+    normalized_option_keys = {
+        _normalize_match_text(option)
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    }
+
+    best_values: list[str] | None = None
+    best_score = (0, 0)
+    ambiguous_best_match = False
+    for entry in categorical_value_guidance:
+        values = [
+            value.strip()
+            for value in entry.get("values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not values:
+            continue
+
+        overlap_count = 0
+        for value in values:
+            normalized_value = _normalize_match_text(value)
+            if not normalized_value:
+                continue
+            if normalized_value in normalized_option_keys:
+                overlap_count += 1
+                continue
+            if re.search(rf"(?<!\w){re.escape(normalized_value)}(?!\w)", normalized_raw_text):
+                overlap_count += 1
+
+        if overlap_count == 0:
+            continue
+
+        normalized_column_name = _normalize_match_text(str(entry.get("column") or ""))
+        column_mentioned = bool(
+            normalized_column_name
+            and re.search(rf"(?<!\w){re.escape(normalized_column_name)}(?!\w)", normalized_raw_text)
+        )
+        score = (overlap_count, int(column_mentioned))
+        if score > best_score:
+            best_score = score
+            best_values = values
+            ambiguous_best_match = False
+        elif score == best_score:
+            ambiguous_best_match = True
+
+    if best_values is None or ambiguous_best_match:
+        return clarification
+
+    normalized_clarification = dict(clarification)
+    normalized_clarification["options"] = best_values
     return normalized_clarification
 
 
@@ -884,6 +946,12 @@ def build_normalize_clarification_after_model_callback(
     settings: SQLAgentSettings | None = None,
 ):
     active_settings = settings or load_settings()
+    schema_summary = get_schema_summary(
+        active_settings.db_path,
+        include_categorical_value_guidance=active_settings.include_categorical_value_guidance,
+        max_categorical_values=active_settings.max_categorical_values,
+    )
+    categorical_value_guidance = schema_summary.get("categorical_value_guidance") or []
 
     def normalize_clarification_after_model(
         callback_context=None,
@@ -901,6 +969,12 @@ def build_normalize_clarification_after_model_callback(
         clarification = normalize_clarification_response(response_text)
         if clarification is None:
             return None
+
+        clarification = _match_clarification_values_to_schema_guidance(
+            clarification,
+            response_text,
+            categorical_value_guidance,
+        )
 
         topic_context = None
         if callback_context is not None:

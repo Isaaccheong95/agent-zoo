@@ -1173,7 +1173,17 @@ I need clarification on your question. Could you please specify which category o
         self.assertNotIn("- Alcoholic", response_text)
 
     def test_after_model_callback_prefers_embedded_clarification_json_over_fallback_regex(self) -> None:
-        callback = build_normalize_clarification_after_model_callback(self._settings())
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                ],
+            },
+        ):
+            callback = build_normalize_clarification_after_model_callback(self._settings())
         raw_response = """The user is asking about \"females who are alcoholics\". Let me map this to the schema:
 
 1. \"females\" → gender = \"Female\"
@@ -1200,9 +1210,11 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         self.assertIn("I need clarification on what you mean by 'alcoholics'.", response_text)
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
+        self.assertIn("- Never", response_text)
         self.assertIn("- Regularly", response_text)
         self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Other interpretation", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("- Other interpretation", response_text)
         self.assertNotIn("\\n\\nOptions:", response_text)
         self.assertNotIn("Options:", response_text)
         self.assertFalse(response_text.startswith("ionally'"))
@@ -1236,7 +1248,16 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         self.assertNotIn("- alcoholics", response_text)
 
     def test_after_model_callback_ignores_quoted_prose_outside_option_sections(self) -> None:
-        callback = build_normalize_clarification_after_model_callback(self._settings())
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                ],
+            },
+        ):
+            callback = build_normalize_clarification_after_model_callback(self._settings())
         raw_response = """The user is asking about \"alcoholics\" which is a colloquial term.
 The available categories for alcohol consumption are:
 - \"Never\"
@@ -1265,6 +1286,54 @@ Could you please specify which category you'd like me to use?"""
         self.assertIn("- Unknown", response_text)
         self.assertNotIn("- alcoholics", response_text)
         self.assertNotIn("- Alcoholic", response_text)
+
+    def test_after_model_callback_clamps_options_to_exact_dataset_categories(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                ],
+            },
+        ):
+            callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = """The user is asking about \"alcoholics\" but the socalc field has categories: \"Never\", \"Occasionally\", \"Regularly\", \"Unknown\".
+
+\"Alcoholic\" is not a direct match to any stored value. I need to clarify what the user means by \"alcoholic\" since it could map to:
+- \"Regularly\" (heavy drinkers)
+- \"Occasionally\" (anyone who drinks)
+- Both combined
+
+I need clarification on what you mean by \"alcoholics\" since the socalc field has these categories: \"Never\", \"Occasionally\", \"Regularly\", \"Unknown\".
+
+Which category or combination should I use for \"alcoholic\"?
+
+- Regularly
+- Occasionally
+- Both Regularly and Occasionally
+- Something else"""
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("- Never", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("- Both combined", response_text)
+        self.assertNotIn("- Both Regularly and Occasionally", response_text)
+        self.assertNotIn("- Something else", response_text)
 
     def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
         scope_gate_calls: list[str] = []
@@ -1406,6 +1475,66 @@ Could you please specify which category you'd like me to use?"""
 
         self.assertIsNone(result)
         self.assertEqual(state[SQL_LAST_USER_TEXT_STATE_KEY], "how many females are alcoholics")
+
+    def test_pending_clarification_state_survives_invocation_boundary(self) -> None:
+        scope_gate_calls: list[str] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ):
+            before_callback = build_combined_before_model_callback(self._settings())
+
+        after_callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many males are alcoholics",
+        }
+
+        clarification_response = after_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"Which category should I use for \'alcoholics\'?",'
+                                '"options":["Never","Occasionally","Regularly","Unknown"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(clarification_response)
+        self.assertIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+        persisted_state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith("temp:")
+        }
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="occasionally and regularly")])]
+        )
+
+        result = before_callback(
+            callback_context=SimpleNamespace(state=persisted_state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("The user is replying to the previous clarification", rewritten_text)
+        self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, persisted_state)
 
     def test_combined_before_model_callback_keeps_custom_rule_followup_in_clarification_flow(self) -> None:
         scope_gate_calls: list[str] = []
