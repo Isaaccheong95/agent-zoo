@@ -36,7 +36,7 @@ from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
 from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
-from agent_zoo.scope_guard import build_llm_clarification_topic_gate, build_llm_scope_gate
+from agent_zoo.scope_guard import build_llm_clarification_resolver, build_llm_scope_gate
 
 
 def create_fixture_database(db_path: Path) -> None:
@@ -243,47 +243,73 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("schema-adjacent wording", captured["system_prompt"])
         self.assertIn("near-match", captured["system_prompt"])
 
-    def test_clarification_topic_gate_includes_current_topic_context(self) -> None:
+    def test_clarification_resolver_includes_current_topic_context(self) -> None:
         captured: dict[str, str] = {}
 
         def completion(**kwargs):
             captured["system_prompt"] = kwargs["messages"][0]["content"]
             captured["user_prompt"] = kwargs["messages"][1]["content"]
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="CLARIFICATION_REPLY"))]
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_type":"selected_options","selected_options":["Occasionally","Regularly"],"custom_rule":""}'
+                        )
+                    )
+                ]
             )
 
-        classifier = build_llm_clarification_topic_gate("test-model")
+        classifier = build_llm_clarification_resolver("test-model")
 
         with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
-            is_topic_change = classifier(
+            resolution = classifier(
                 "how many females are alcoholics",
                 "Which category should I use for 'alcoholics'?",
                 ["Never", "Occasionally", "Regularly", "Unknown"],
                 "occasionally and regularly",
             )
 
-        self.assertFalse(is_topic_change)
-        self.assertIn("CLARIFICATION_REPLY", captured["system_prompt"])
-        self.assertIn("TOPIC_CHANGE", captured["system_prompt"])
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "selected_options",
+                "selected_options": ["Occasionally", "Regularly"],
+                "custom_rule": "",
+            },
+        )
+        self.assertIn('"resolution_type"', captured["system_prompt"])
+        self.assertIn("selected_options", captured["system_prompt"])
+        self.assertIn("topic_change", captured["system_prompt"])
         self.assertIn("Current dataset question/topic", captured["user_prompt"])
         self.assertIn("how many females are alcoholics", captured["user_prompt"])
         self.assertIn("Pending clarification question", captured["user_prompt"])
         self.assertIn("Available clarification options", captured["user_prompt"])
         self.assertIn("Latest user reply", captured["user_prompt"])
 
-    def test_clarification_topic_gate_fails_open_on_classifier_error(self) -> None:
-        classifier = build_llm_clarification_topic_gate("test-model")
+    def test_clarification_resolver_fails_open_on_invalid_output(self) -> None:
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+            )
 
-        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=RuntimeError("boom"))}):
-            is_topic_change = classifier(
+        classifier = build_llm_clarification_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = classifier(
                 "how many females are alcoholics",
                 "Which category should I use for 'alcoholics'?",
                 ["Never", "Occasionally", "Regularly", "Unknown"],
                 "tell me a joke",
             )
 
-        self.assertFalse(is_topic_change)
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "custom_rule",
+                "selected_options": [],
+                "custom_rule": "tell me a joke",
+            },
+        )
 
 
 class SQLAgentObjectModeTestCase(unittest.TestCase):
@@ -1065,19 +1091,19 @@ I need clarification on your question. Could you please specify which category o
 
     def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
         scope_gate_calls: list[str] = []
-        topic_router_calls: list[tuple[str, str, list[str], str]] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
 
-        def fake_topic_router(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> bool:
-            topic_router_calls.append((topic_context, clarification_question, options, user_reply))
-            return False
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": user_reply}
 
         with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
-            "agent_zoo.sql_agent.callbacks.build_llm_clarification_topic_gate",
-            return_value=fake_topic_router,
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
         ):
             callback = build_combined_before_model_callback(self._settings())
 
@@ -1099,7 +1125,7 @@ I need clarification on your question. Could you please specify which category o
 
         self.assertIsNone(result)
         self.assertEqual(scope_gate_calls, [])
-        self.assertEqual(topic_router_calls, [])
+        self.assertEqual(resolver_calls, [])
         rewritten_text = llm_request.contents[-1].parts[0].text
         self.assertIn("The user is replying to the previous clarification", rewritten_text)
         self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
@@ -1108,19 +1134,23 @@ I need clarification on your question. Could you please specify which category o
 
     def test_combined_before_model_callback_skips_scope_gate_for_selection_like_followup(self) -> None:
         scope_gate_calls: list[str] = []
-        topic_router_calls: list[tuple[str, str, list[str], str]] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
 
-        def fake_topic_router(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> bool:
-            topic_router_calls.append((topic_context, clarification_question, options, user_reply))
-            return False
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {
+                "resolution_type": "selected_options",
+                "selected_options": ["Occasionally", "Regularly"],
+                "custom_rule": "",
+            }
 
         with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
-            "agent_zoo.sql_agent.callbacks.build_llm_clarification_topic_gate",
-            return_value=fake_topic_router,
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
         ):
             callback = build_combined_before_model_callback(self._settings())
 
@@ -1143,7 +1173,7 @@ I need clarification on your question. Could you please specify which category o
         self.assertIsNone(result)
         self.assertEqual(scope_gate_calls, [])
         self.assertEqual(
-            topic_router_calls,
+            resolver_calls,
             [
                 (
                     "how many females are alcoholics",
@@ -1155,24 +1185,85 @@ I need clarification on your question. Could you please specify which category o
         )
         rewritten_text = llm_request.contents[-1].parts[0].text
         self.assertIn("Clarification question: Which category should I use for 'alcoholics'?", rewritten_text)
+        self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
         self.assertIn("User clarification reply: count both drinking categories", rewritten_text)
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
-    def test_combined_before_model_callback_applies_scope_gate_for_topic_change(self) -> None:
+    def test_combined_before_model_callback_keeps_custom_rule_followup_in_clarification_flow(self) -> None:
         scope_gate_calls: list[str] = []
-        topic_router_calls: list[tuple[str, str, list[str], str]] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
 
-        def fake_topic_router(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> bool:
-            topic_router_calls.append((topic_context, clarification_question, options, user_reply))
-            return True
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {
+                "resolution_type": "custom_rule",
+                "selected_options": [],
+                "custom_rule": "match any drinking category",
+            }
 
         with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
-            "agent_zoo.sql_agent.callbacks.build_llm_clarification_topic_gate",
-            return_value=fake_topic_router,
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "topic_context": "how many females are alcoholics",
+                "user_message": "Which category should I use for 'alcoholics'?",
+                "options": ["Never", "Occasionally", "Regularly", "Unknown"],
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="match any drinking category")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(
+            resolver_calls,
+            [
+                (
+                    "how many females are alcoholics",
+                    "Which category should I use for 'alcoholics'?",
+                    ["Never", "Occasionally", "Regularly", "Unknown"],
+                    "match any drinking category",
+                )
+            ],
+        )
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Resolved custom rule from the reply: match any drinking category", rewritten_text)
+        self.assertIn("User clarification reply: match any drinking category", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+    def test_combined_before_model_callback_applies_scope_gate_for_topic_change(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {
+                "resolution_type": "topic_change",
+                "selected_options": [],
+                "custom_rule": "",
+            }
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
         ):
             callback = build_combined_before_model_callback(self._settings())
 
@@ -1195,7 +1286,7 @@ I need clarification on your question. Could you please specify which category o
         self.assertIsNotNone(result)
         self.assertEqual(result.content.parts[0].text, "blocked")
         self.assertEqual(
-            topic_router_calls,
+            resolver_calls,
             [
                 (
                     "how many females are alcoholics",

@@ -24,13 +24,13 @@ from .formatting import (
 try:
     from ..scope_guard import (
         DEFAULT_REFUSAL_MESSAGE,
-        build_llm_clarification_topic_gate,
+        build_llm_clarification_resolver,
         build_llm_scope_gate,
     )
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
     from scope_guard import (  # type: ignore[no-redef]
         DEFAULT_REFUSAL_MESSAGE,
-        build_llm_clarification_topic_gate,
+        build_llm_clarification_resolver,
         build_llm_scope_gate,
     )
 
@@ -185,18 +185,22 @@ def _prune_topic_context_option(
     return normalized_clarification
 
 
-def _pending_clarification_reply_is_topic_change(
-    classifier,
+def _resolve_pending_clarification_reply(
+    resolver,
     clarification: dict[str, Any],
     user_text: str,
-) -> bool:
+) -> dict[str, Any]:
     if not user_text or not user_text.strip():
-        return False
+        return {
+            "resolution_type": "custom_rule",
+            "selected_options": [],
+            "custom_rule": "",
+        }
 
     topic_context = clarification.get("topic_context")
     clarification_question = clarification.get("user_message")
     options = clarification.get("options") or []
-    return classifier(
+    return resolver(
         topic_context if isinstance(topic_context, str) else "",
         clarification_question if isinstance(clarification_question, str) else "",
         [
@@ -227,12 +231,29 @@ def _apply_pending_clarification_followup(llm_request, clarification: dict[str, 
     if not user_text:
         return False
 
+    return _apply_pending_clarification_followup_with_resolution(llm_request, clarification, user_text)
+
+
+def _apply_pending_clarification_followup_with_resolution(
+    llm_request,
+    clarification: dict[str, Any],
+    user_text: str,
+    *,
+    matched_options: list[str] | None = None,
+    custom_rule: str | None = None,
+) -> bool:
+    if not user_text:
+        return False
+
     options = [
         option
         for option in clarification.get("options") or []
         if isinstance(option, str) and option.strip()
     ]
-    matched_options = _extract_matching_clarification_options(user_text, options)
+    resolved_options = [
+        option for option in (matched_options or []) if option in options
+    ] or _extract_matching_clarification_options(user_text, options)
+    normalized_custom_rule = custom_rule.strip() if isinstance(custom_rule, str) else ""
 
     rewritten_sections = [
         "The user is replying to the previous clarification for the same dataset request.",
@@ -242,9 +263,13 @@ def _apply_pending_clarification_followup(llm_request, clarification: dict[str, 
         rewritten_sections.append(
             "Available options:\n" + "\n".join(f"- {option}" for option in options)
         )
-    if matched_options:
+    if resolved_options:
         rewritten_sections.append(
-            "Matched options from the reply: " + ", ".join(matched_options)
+            "Matched options from the reply: " + ", ".join(resolved_options)
+        )
+    if normalized_custom_rule:
+        rewritten_sections.append(
+            "Resolved custom rule from the reply: " + normalized_custom_rule
         )
     rewritten_sections.append(f"User clarification reply: {user_text}")
     rewritten_sections.append(
@@ -971,7 +996,7 @@ def build_combined_before_model_callback(
     schema_summary = get_schema_summary(active_settings.db_path)
     schema_text = schema_summary.get("schema_text") or ""
     classifier = build_llm_scope_gate(active_settings.model, schema_text)
-    clarification_topic_classifier = build_llm_clarification_topic_gate(
+    clarification_resolver = build_llm_clarification_resolver(
         active_settings.model,
         debug=active_settings.debug,
     )
@@ -1019,34 +1044,44 @@ def build_combined_before_model_callback(
                             _extract_last_user_text(llm_request),
                         )
                         _clear_pending_clarification_state(callback_context.state)
-                elif _pending_clarification_reply_is_topic_change(
-                    clarification_topic_classifier,
-                    pending_clarification,
-                    user_text,
-                ):
-                    _print_clarification_debug(
-                        active_settings,
-                        "before-model-topic-router-decision",
-                        "TOPIC_CHANGE",
-                    )
-                    _clear_pending_clarification_state(callback_context.state)
                 else:
+                    clarification_resolution = _resolve_pending_clarification_reply(
+                        clarification_resolver,
+                        pending_clarification,
+                        user_text,
+                    )
                     _print_clarification_debug(
                         active_settings,
-                        "before-model-topic-router-decision",
-                        "CLARIFICATION_REPLY",
+                        "before-model-clarification-resolution",
+                        clarification_resolution,
                     )
-                    clarification_followup = _apply_pending_clarification_followup(
-                        llm_request,
-                        pending_clarification,
-                    )
-                    if clarification_followup:
+                    if clarification_resolution.get("resolution_type") == "topic_change":
                         _print_clarification_debug(
                             active_settings,
-                            "before-model-followup-rewritten",
-                            _extract_last_user_text(llm_request),
+                            "before-model-topic-router-decision",
+                            "TOPIC_CHANGE",
                         )
                         _clear_pending_clarification_state(callback_context.state)
+                    else:
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-topic-router-decision",
+                            clarification_resolution.get("resolution_type") or "custom_rule",
+                        )
+                        clarification_followup = _apply_pending_clarification_followup_with_resolution(
+                            llm_request,
+                            pending_clarification,
+                            user_text,
+                            matched_options=clarification_resolution.get("selected_options"),
+                            custom_rule=clarification_resolution.get("custom_rule"),
+                        )
+                        if clarification_followup:
+                            _print_clarification_debug(
+                                active_settings,
+                                "before-model-followup-rewritten",
+                                _extract_last_user_text(llm_request),
+                            )
+                            _clear_pending_clarification_state(callback_context.state)
             if clarification_followup:
                 _print_clarification_debug(
                     active_settings,
