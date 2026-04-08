@@ -47,7 +47,7 @@ Rules:
 - If more than one nearby schema concept could fit, ask which one the user means before querying.
 - When clarification is needed before querying, do not call any tools yet.
 - When clarification is needed before querying, respond with exactly one JSON object and no surrounding prose using this schema: {"response_type":"clarification","user_message":"...","options":["..."]}.
-- `user_message` must be a short user-facing clarification question.
+- `user_message` must be a short user-facing clarification question. When `options` are present, tell the user they may choose one or more options or describe their own rule.
 - `options` must list grounded category labels or nearby schema interpretations the user can choose from.
 - If the ambiguity is about a categorical field, prefer listing the available category values in `options`.
 - Do not expose chain-of-thought, internal analysis, or rationale in clarification responses.

@@ -220,6 +220,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("nearby schema concept", instruction)
         self.assertIn('"response_type":"clarification"', instruction)
         self.assertIn("available category values", instruction)
+        self.assertIn("choose one or more options or describe their own rule", instruction)
 
     def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
         captured: dict[str, str] = {}
@@ -919,6 +920,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Which occupation status should I count as not working?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
         self.assertIn("- Employed", response_text)
         self.assertIn("- Student", response_text)
         self.assertNotIn("Available categories:", response_text)
@@ -959,6 +961,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
         self.assertIn("- Never", response_text)
         self.assertIn("- Occasionally", response_text)
         self.assertIn("- Regularly", response_text)
@@ -1001,6 +1004,7 @@ I need clarification on your question. Could you please specify which category o
         self.assertNotIn("The user is asking", response_text)
         self.assertNotIn("Looking at the sococc field", response_text)
         self.assertIn("Could you please specify which category or combination of categories you'd like me to count?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
         self.assertIn("- Employed", response_text)
         self.assertIn("- Retired", response_text)
         self.assertIn("- Unemployed", response_text)
@@ -1052,6 +1056,7 @@ I need clarification on your question. Could you please specify which category o
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Which category do you mean by 'alcoholics'?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
         self.assertIn("- Regularly", response_text)
         self.assertIn("- Occasionally", response_text)
         self.assertIn("- Never", response_text)
@@ -1061,6 +1066,41 @@ I need clarification on your question. Could you please specify which category o
         self.assertNotIn("user_message", response_text)
         self.assertNotIn("- alcoholics", response_text)
         self.assertNotIn("- Alcoholic", response_text)
+
+    def test_after_model_callback_prefers_embedded_clarification_json_over_fallback_regex(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = """The user is asking about \"females who are alcoholics\". Let me map this to the schema:
+
+1. \"females\" → gender = \"Female\"
+2. \"alcoholics\" → This is tricky. Looking at the socalc field, the stored values are: \"Never\", \"Occasionally\", \"Regularly\", \"Unknown\"
+
+\"Alcoholic\" is not a direct match to any of these stored values. The closest interpretation would be \"Regularly\" (regular alcohol consumption), but this is an assumption.
+
+I should ask for clarification about what the user means by \"alcoholics\" since the schema doesn't have a direct \"alcoholic\" category.
+{"response_type":"clarification","user_message":"I need clarification on what you mean by 'alcoholics'. The socalc field (alcohol consumption status) has these stored values: 'Never', 'Occasionally', 'Regularly', 'Unknown'. Which category should I use for 'alcoholics'?\\n\\nOptions:\\n- 'Regularly' (regular alcohol consumption)\\n- 'Occasionally' (occasional alcohol consumption)\\n- Or do you have a different interpretation in mind?","options":["Regularly","Occasionally","Other interpretation"]}
+"""
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("I need clarification on what you mean by 'alcoholics'.", response_text)
+        self.assertIn("Which category should I use for 'alcoholics'?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Other interpretation", response_text)
+        self.assertNotIn("\\n\\nOptions:", response_text)
+        self.assertNotIn("Options:", response_text)
+        self.assertFalse(response_text.startswith("ionally'"))
 
     def test_after_model_callback_drops_subject_echo_from_fallback_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
@@ -1083,6 +1123,7 @@ I need clarification on your question. Could you please specify which category o
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
+        self.assertIn("Choose one or more options, or describe your own rule.", response_text)
         self.assertIn("- Never", response_text)
         self.assertIn("- Occasionally", response_text)
         self.assertIn("- Regularly", response_text)

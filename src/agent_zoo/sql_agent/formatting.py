@@ -19,6 +19,8 @@ _CLARIFICATION_METADATA_KEYS = {
     "user_message",
 }
 
+_CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
+
 
 def _normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
@@ -87,11 +89,61 @@ def _extract_jsonish_options(raw_text: str) -> list[str]:
     return options
 
 
+def _extract_embedded_clarification_json(raw_text: str) -> str | None:
+    marker_index = raw_text.find('"response_type"')
+    if marker_index == -1:
+        return None
+
+    start_index = raw_text.rfind("{", 0, marker_index)
+    if start_index == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    is_escaped = False
+    for index in range(start_index, len(raw_text)):
+        character = raw_text[index]
+
+        if is_escaped:
+            is_escaped = False
+            continue
+        if character == "\\" and in_string:
+            is_escaped = True
+            continue
+        if character == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if character == "{":
+            depth += 1
+            continue
+        if character == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_text[start_index : index + 1]
+
+    return None
+
+
+def _strip_inline_options_from_user_message(user_message: str, options: list[str]) -> str:
+    normalized_message = _normalize_whitespace(user_message)
+    if not normalized_message or not options:
+        return normalized_message
+
+    stripped_message = re.sub(
+        r"\b(?:available\s+)?options\s*:\s*.*$",
+        "",
+        normalized_message,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped_message or normalized_message
+
+
 def build_clarification_response(
     user_message: str | None,
     options: list[str] | None = None,
 ) -> dict[str, Any]:
-    normalized_message = _normalize_whitespace(user_message or "")
     cleaned_options = [
         option
         for option in (
@@ -100,6 +152,10 @@ def build_clarification_response(
         )
         if option is not None
     ]
+    normalized_message = _strip_inline_options_from_user_message(
+        user_message or "",
+        cleaned_options,
+    )
     response = {
         "options": _dedupe_preserve_order(cleaned_options)[:10],
     }
@@ -257,6 +313,12 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     if clarification is not None:
         return clarification
 
+    embedded_clarification_json = _extract_embedded_clarification_json(raw_text)
+    if embedded_clarification_json is not None:
+        clarification = parse_clarification_response(embedded_clarification_json)
+        if clarification is not None:
+            return clarification
+
     jsonish_options = [
         option for option in (_clean_option_text(value) for value in _extract_jsonish_options(raw_text))
         if option is not None
@@ -282,9 +344,23 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     return build_clarification_response(user_message, options)
 
 
+def _augment_clarification_user_message(user_message: str, options: list[Any]) -> str:
+    normalized_message = _normalize_whitespace(user_message)
+    if not normalized_message or not options:
+        return normalized_message
+    if _CLARIFICATION_REPLY_GUIDANCE.casefold() in normalized_message.casefold():
+        return normalized_message
+
+    suffix = "" if normalized_message.endswith((".", "?", "!")) else "."
+    return f"{normalized_message}{suffix} {_CLARIFICATION_REPLY_GUIDANCE}"
+
+
 def format_clarification_response(clarification: dict[str, Any]) -> str:
-    user_message = _normalize_whitespace(str(clarification.get("user_message") or ""))
     options = clarification.get("options") or []
+    user_message = _augment_clarification_user_message(
+        str(clarification.get("user_message") or ""),
+        options,
+    )
     parts: list[str] = []
     if user_message:
         parts.append(user_message)
