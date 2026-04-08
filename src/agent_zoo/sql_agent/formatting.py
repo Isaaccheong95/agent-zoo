@@ -12,6 +12,17 @@ import re
 from typing import Any
 
 
+_CLARIFICATION_METADATA_KEYS = {
+    "clarification",
+    "options",
+    "response_type",
+    "user_message",
+}
+
+_CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
+_CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
+
+
 def _normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -40,10 +51,12 @@ def _unwrap_json_code_fence(value: str) -> str:
 
 
 def _clean_option_text(value: str) -> str | None:
-    candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", value).strip()
+    candidate = re.sub(r"^\s*(?:[-*•]|\d+\s*[.)-])\s*", "", value).strip()
     candidate = candidate.strip("`\"'")
     candidate = _normalize_whitespace(candidate)
     if not candidate:
+        return None
+    if candidate.casefold() in _CLARIFICATION_METADATA_KEYS:
         return None
 
     if " - " in candidate:
@@ -66,11 +79,84 @@ def _clean_option_text(value: str) -> str | None:
     return candidate
 
 
+def _extract_jsonish_options(raw_text: str) -> list[str]:
+    options: list[str] = []
+    for match in re.finditer(r'"options"\s*:\s*\[(?P<values>[^\]]*)\]', raw_text, re.DOTALL):
+        values = match.group("values")
+        options.extend(
+            quoted_match.group(1)
+            for quoted_match in re.finditer(r'"([^"\n]{1,60})"', values)
+        )
+    return options
+
+
+def _is_quoted_option_source_line(line: str) -> bool:
+    normalized_line = _normalize_whitespace(line)
+    if not normalized_line:
+        return False
+    if re.search(r"\bchoose\s+from\b", normalized_line, flags=re.IGNORECASE):
+        return True
+    if ":" not in normalized_line:
+        return False
+    label_text = normalized_line.split(":", 1)[0]
+    return bool(re.search(r"\b(?:categories|options|values)\b", label_text, flags=re.IGNORECASE))
+
+
+def _extract_embedded_clarification_json(raw_text: str) -> str | None:
+    marker_index = raw_text.find('"response_type"')
+    if marker_index == -1:
+        return None
+
+    start_index = raw_text.rfind("{", 0, marker_index)
+    if start_index == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    is_escaped = False
+    for index in range(start_index, len(raw_text)):
+        character = raw_text[index]
+
+        if is_escaped:
+            is_escaped = False
+            continue
+        if character == "\\" and in_string:
+            is_escaped = True
+            continue
+        if character == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if character == "{":
+            depth += 1
+            continue
+        if character == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_text[start_index : index + 1]
+
+    return None
+
+
+def _strip_inline_options_from_user_message(user_message: str, options: list[str]) -> str:
+    normalized_message = _normalize_whitespace(user_message)
+    if not normalized_message or not options:
+        return normalized_message
+
+    stripped_message = re.sub(
+        r"\b(?:available\s+)?options\s*:\s*.*$",
+        "",
+        normalized_message,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped_message or normalized_message
+
+
 def build_clarification_response(
     user_message: str | None,
     options: list[str] | None = None,
 ) -> dict[str, Any]:
-    normalized_message = _normalize_whitespace(user_message or "")
     cleaned_options = [
         option
         for option in (
@@ -79,6 +165,10 @@ def build_clarification_response(
         )
         if option is not None
     ]
+    normalized_message = _strip_inline_options_from_user_message(
+        user_message or "",
+        cleaned_options,
+    )
     response = {
         "options": _dedupe_preserve_order(cleaned_options)[:10],
     }
@@ -121,8 +211,14 @@ def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
 
 
 def _extract_quoted_options(raw_text: str) -> list[str]:
+    jsonish_options = _extract_jsonish_options(raw_text)
+    if jsonish_options:
+        return jsonish_options
+
     options: list[str] = []
     for line in raw_text.splitlines():
+        if not _is_quoted_option_source_line(line):
+            continue
         quoted_values = [match.group(1) for match in re.finditer(r'"([^"\n]{1,60})"', line)]
         if len(quoted_values) >= 2:
             options.extend(quoted_values)
@@ -136,7 +232,7 @@ def _extract_line_options(raw_text: str) -> list[str]:
         if not line:
             continue
 
-        match = re.match(r"^(?:[-*•]|\d+[.)])\s*(.+)$", line)
+        match = re.match(r"^(?:[-*•]|\d+\s*[.)-])\s*(.+)$", line)
         if match:
             options.append(match.group(1))
             continue
@@ -154,6 +250,17 @@ def _extract_line_options(raw_text: str) -> list[str]:
 
 
 def _extract_user_message(raw_text: str, options: list[str]) -> str | None:
+    quoted_message_match = re.search(r'"user_message"\s*:\s*"(?P<message>[^"\n]{1,240})"', raw_text)
+    if quoted_message_match:
+        return _normalize_whitespace(quoted_message_match.group("message"))
+
+    truncated_message_match = re.search(
+        r'(?P<message>[^"\n]{3,240}\?)"\s*,\s*"options"\s*:',
+        raw_text,
+    )
+    if truncated_message_match:
+        return _normalize_whitespace(truncated_message_match.group("message"))
+
     normalized_text = _normalize_whitespace(raw_text)
     if not normalized_text:
         return None
@@ -192,36 +299,95 @@ def _extract_user_message(raw_text: str, options: list[str]) -> str | None:
     return None
 
 
+def _prune_subject_echo_options(user_message: str | None, options: list[str]) -> list[str]:
+    if not user_message or len(options) < 2:
+        return options
+
+    subject_match = re.search(
+        r"\bwhich\s+category\b.*\b(?:for|by)\s+[\"'](?P<subject>[^\"'\n]{1,60})[\"']\s*\??$",
+        user_message,
+        flags=re.IGNORECASE,
+    )
+    if subject_match is None:
+        return options
+
+    subject = _normalize_whitespace(subject_match.group("subject"))
+    if not subject:
+        return options
+
+    pruned_options = [
+        option
+        for option in options
+        if option.casefold() != subject.casefold()
+    ]
+    return pruned_options or options
+
+
 def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     clarification = parse_clarification_response(raw_text)
     if clarification is not None:
         return clarification
 
-    options = _dedupe_preserve_order(
-        [
-            option
-            for option in [
-                *(_clean_option_text(value) for value in _extract_quoted_options(raw_text)),
-                *(_clean_option_text(value) for value in _extract_line_options(raw_text)),
+    embedded_clarification_json = _extract_embedded_clarification_json(raw_text)
+    if embedded_clarification_json is not None:
+        clarification = parse_clarification_response(embedded_clarification_json)
+        if clarification is not None:
+            return clarification
+
+    jsonish_options = [
+        option for option in (_clean_option_text(value) for value in _extract_jsonish_options(raw_text))
+        if option is not None
+    ]
+    if jsonish_options:
+        options = _dedupe_preserve_order(jsonish_options)[:10]
+    else:
+        options = _dedupe_preserve_order(
+            [
+                option
+                for option in [
+                    *(_clean_option_text(value) for value in _extract_quoted_options(raw_text)),
+                    *(_clean_option_text(value) for value in _extract_line_options(raw_text)),
+                ]
+                if option is not None
             ]
-            if option is not None
-        ]
-    )[:10]
+        )[:10]
 
     user_message = _extract_user_message(raw_text, options)
+    options = _prune_subject_echo_options(user_message, options)
     if user_message is None and not options:
         return None
     return build_clarification_response(user_message, options)
 
 
+def _augment_clarification_user_message(user_message: str, options: list[Any]) -> str:
+    normalized_message = _normalize_whitespace(user_message)
+    if not normalized_message or not options:
+        return normalized_message
+
+    additions: list[str] = []
+    normalized_casefold = normalized_message.casefold()
+    if _CLARIFICATION_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+        additions.append(_CLARIFICATION_REPLY_GUIDANCE)
+    if _CLARIFICATION_NUMBER_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+        additions.append(_CLARIFICATION_NUMBER_REPLY_GUIDANCE)
+    if not additions:
+        return normalized_message
+
+    suffix = "" if normalized_message.endswith((".", "?", "!")) else "."
+    return f"{normalized_message}{suffix} {' '.join(additions)}"
+
+
 def format_clarification_response(clarification: dict[str, Any]) -> str:
-    user_message = _normalize_whitespace(str(clarification.get("user_message") or ""))
     options = clarification.get("options") or []
+    user_message = _augment_clarification_user_message(
+        str(clarification.get("user_message") or ""),
+        options,
+    )
     parts: list[str] = []
     if user_message:
         parts.append(user_message)
     if options:
-        parts.append("\n".join(f"- {option}" for option in options))
+        parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     return "\n\n".join(parts).strip()
 
 def format_result_payload(tool_result: dict) -> str:

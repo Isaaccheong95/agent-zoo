@@ -16,7 +16,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import DEFAULT_PREVIEW_ROWS, resolve_repo_path
+from .config import (
+    DEFAULT_MAX_CATEGORICAL_VALUES,
+    DEFAULT_PREVIEW_ROWS,
+    resolve_repo_path,
+)
 
 
 INTERNAL_TABLE_PREFIXES = ("sqlite_", "__")
@@ -47,6 +51,22 @@ OBJECT_CANONICAL_CTE_NAME = "__az_object_canonical"
 OBJECT_SOURCE_ORDINAL_COLUMN = "__az_source_ordinal"
 OBJECT_ROW_NUMBER_COLUMN = "__az_object_row_number"
 UNORDERABLE_DECLARED_TYPE_TOKENS = ("BLOB",)
+CATEGORICAL_VALUE_GUIDANCE_EXCLUDED_NAME_PATTERNS = (
+    re.compile(r"(^|_)(id|uuid)($|_)"),
+    re.compile(r"(^|_)(date|time|timestamp)($|_)"),
+    re.compile(r"(^|_)(created|updated|deleted)($|_)"),
+)
+CATEGORICAL_VALUE_GUIDANCE_EXCLUDED_NAME_TOKENS = (
+    "name",
+    "description",
+    "comment",
+    "note",
+    "text",
+    "address",
+    "email",
+    "phone",
+    "payload",
+)
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -206,6 +226,78 @@ def _normalize_declared_type(value: str | None) -> str:
 def _is_orderable_declared_type(value: str | None) -> bool:
     normalized = _normalize_declared_type(value)
     return not any(token in normalized for token in UNORDERABLE_DECLARED_TYPE_TOKENS)
+
+
+def _should_collect_categorical_values(column_name: str, declared_type: str | None) -> bool:
+    normalized_name = _normalize_whitespace(str(column_name or "")).lower()
+    if not normalized_name:
+        return False
+    if not _is_orderable_declared_type(declared_type):
+        return False
+    if any(pattern.search(normalized_name) for pattern in CATEGORICAL_VALUE_GUIDANCE_EXCLUDED_NAME_PATTERNS):
+        return False
+    return not any(token in normalized_name for token in CATEGORICAL_VALUE_GUIDANCE_EXCLUDED_NAME_TOKENS)
+
+
+def _categorical_value_expression(column_name: str) -> str:
+    quoted_column = _quote_identifier(column_name)
+    return f"NULLIF(TRIM(CAST({quoted_column} AS TEXT)), '')"
+
+
+def _collect_categorical_values(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    declared_type: str | None,
+    max_values: int,
+) -> list[str]:
+    if not _should_collect_categorical_values(column_name, declared_type):
+        return []
+
+    max_values = max(2, int(max_values))
+    value_expression = _categorical_value_expression(column_name)
+    quoted_table_name = _quote_identifier(table_name)
+    stats_sql = (
+        f"SELECT COUNT({value_expression}) AS non_null_count, "
+        f"COUNT(DISTINCT {value_expression}) AS distinct_count "
+        f"FROM {quoted_table_name}"
+    )
+    stats_row = connection.execute(stats_sql).fetchone()
+    if stats_row is None:
+        return []
+
+    non_null_count = int(stats_row["non_null_count"] or 0)
+    distinct_count = int(stats_row["distinct_count"] or 0)
+    if non_null_count < 2 or distinct_count < 2:
+        return []
+    if distinct_count > max_values or distinct_count >= non_null_count:
+        return []
+
+    value_sql = (
+        f"SELECT DISTINCT {value_expression} AS value "
+        f"FROM {quoted_table_name} "
+        f"WHERE {value_expression} IS NOT NULL "
+        f"LIMIT ?"
+    )
+    values = [
+        str(row["value"])
+        for row in connection.execute(value_sql, (max_values,))
+        if row["value"] is not None
+    ]
+    return sorted(values, key=str.casefold)
+
+
+def _format_categorical_value_guidance(guidance_entries: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for entry in guidance_entries:
+        values = entry.get("values") or []
+        if not values:
+            continue
+        values_text = ", ".join(f'"{value}"' for value in values)
+        lines.append(
+            f'- {entry["table"]}.{entry["column"]}: Stored SQLite values seen in the dataset: {values_text}'
+        )
+    return "\n".join(lines)
 
 
 def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
@@ -482,6 +574,8 @@ def get_schema_summary(
     *,
     table_names: Iterable[str] | None = None,
     max_tables: int | None = None,
+    include_categorical_value_guidance: bool = False,
+    max_categorical_values: int = DEFAULT_MAX_CATEGORICAL_VALUES,
 ) -> dict[str, Any]:
     try:
         path = _ensure_database_exists(db_path)
@@ -497,19 +591,36 @@ def get_schema_summary(
                 selected_tables = selected_tables[:max_tables]
 
             tables: list[dict[str, Any]] = []
+            categorical_value_guidance: list[dict[str, Any]] = []
             for table_name in selected_tables:
                 pragma_sql = f"PRAGMA table_info({_quote_identifier(table_name)})"
                 columns = []
                 for column in connection.execute(pragma_sql):
-                    columns.append(
-                        {
-                            "name": column["name"],
-                            "type": column["type"] or "TEXT",
-                            "not_null": bool(column["notnull"]),
-                            "default_value": column["dflt_value"],
-                            "primary_key": bool(column["pk"]),
-                        }
-                    )
+                    column_definition = {
+                        "name": column["name"],
+                        "type": column["type"] or "TEXT",
+                        "not_null": bool(column["notnull"]),
+                        "default_value": column["dflt_value"],
+                        "primary_key": bool(column["pk"]),
+                    }
+                    if include_categorical_value_guidance:
+                        categorical_values = _collect_categorical_values(
+                            connection,
+                            table_name,
+                            column_definition["name"],
+                            column_definition["type"],
+                            max_categorical_values,
+                        )
+                        if categorical_values:
+                            column_definition["categorical_values"] = categorical_values
+                            categorical_value_guidance.append(
+                                {
+                                    "table": table_name,
+                                    "column": column_definition["name"],
+                                    "values": categorical_values,
+                                }
+                            )
+                    columns.append(column_definition)
                 tables.append({"name": table_name, "columns": columns})
 
         if not tables:
@@ -528,12 +639,18 @@ def get_schema_summary(
                 formatted_tables.append(f'{table["name"]}({", ".join(formatted_columns)})')
             schema_text = "\n".join(formatted_tables)
 
+        categorical_value_guidance_text = _format_categorical_value_guidance(
+            categorical_value_guidance
+        )
+
         return {
             "status": "success",
             "db_path": str(path),
             "schema_text": schema_text,
             "tables": tables,
             "table_count": len(tables),
+            "categorical_value_guidance": categorical_value_guidance,
+            "categorical_value_guidance_text": categorical_value_guidance_text,
         }
     except (FileNotFoundError, sqlite3.Error) as exc:
         return {
@@ -542,6 +659,8 @@ def get_schema_summary(
             "schema_text": "",
             "tables": [],
             "table_count": 0,
+            "categorical_value_guidance": [],
+            "categorical_value_guidance_text": "",
             "error": str(exc),
         }
 

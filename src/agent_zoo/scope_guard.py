@@ -9,12 +9,124 @@ callback.
 
 from __future__ import annotations
 
+import json
+import re
+from typing import Any
+
 
 DEFAULT_REFUSAL_MESSAGE = (
     "I'm a dataset SQL agent. I can only help with questions about the current "
     "dataset, its schema, filters, SQL queries, and aggregated results derived "
     "from it. I can't answer general non-dataset questions."
 )
+
+
+def _print_classifier_debug(debug_label: str | None, stage: str, payload: str) -> None:
+    if not debug_label:
+        return
+    print(f"[debug][{debug_label}][{stage}]\n{payload}")
+
+
+def _run_litellm_classifier(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    *,
+    max_tokens: int,
+    debug_label: str | None = None,
+    uppercase: bool = True,
+) -> str | None:
+    _print_classifier_debug(debug_label, "system-prompt", system_prompt)
+    _print_classifier_debug(debug_label, "user-prompt", user_text)
+    try:
+        import litellm
+
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    except Exception as exc:
+        _print_classifier_debug(debug_label, "error", repr(exc))
+        return None
+
+    verdict = (response.choices[0].message.content or "").strip()
+    if uppercase:
+        verdict = verdict.upper()
+    _print_classifier_debug(debug_label, "llm-response", verdict or "<empty>")
+    return verdict
+
+
+def _normalize_resolution_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _parse_classifier_json(raw_text: str) -> dict[str, Any] | None:
+    candidate = raw_text.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate)
+    start_index = candidate.find("{")
+    end_index = candidate.rfind("}")
+    if start_index == -1 or end_index <= start_index:
+        return None
+    try:
+        parsed = json.loads(candidate[start_index : end_index + 1])
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_selected_options(selected_options: Any, options: list[str]) -> list[str]:
+    if not isinstance(selected_options, list):
+        return []
+
+    option_lookup: dict[str, str] = {}
+    for option in options:
+        normalized_option = _normalize_resolution_text(option)
+        if normalized_option and normalized_option not in option_lookup:
+            option_lookup[normalized_option] = option
+
+    normalized_matches: list[str] = []
+    seen_options: set[str] = set()
+    for selected_option in selected_options:
+        if not isinstance(selected_option, str):
+            continue
+        canonical_option = option_lookup.get(_normalize_resolution_text(selected_option))
+        if canonical_option and canonical_option not in seen_options:
+            seen_options.add(canonical_option)
+            normalized_matches.append(canonical_option)
+    return normalized_matches
+
+
+def _normalize_selected_identifier(selected_identifier: Any, identifiers: list[str]) -> str:
+    if not isinstance(selected_identifier, str):
+        return ""
+
+    identifier_lookup: dict[str, str] = {}
+    for identifier in identifiers:
+        normalized_identifier = _normalize_resolution_text(identifier)
+        if normalized_identifier and normalized_identifier not in identifier_lookup:
+            identifier_lookup[normalized_identifier] = identifier
+
+    return identifier_lookup.get(_normalize_resolution_text(selected_identifier), "")
+
+
+def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
+    return {
+        "resolution_type": "custom_rule",
+        "selected_options": [],
+        "custom_rule": user_reply.strip(),
+    }
 
 
 def build_llm_scope_gate(
@@ -50,30 +162,316 @@ def build_llm_scope_gate(
     def classify(user_text: str) -> tuple[bool, str | None]:
         if not user_text or not user_text.strip():
             return True, None
-        try:
-            import litellm
-
-            response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                temperature=0.0,
-                max_tokens=300,  # give room for final IN_SCOPE/OUT_OF_SCOPE token
-                extra_body={
-                    # common for vLLM / HF chat-template based servers
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    # common for some Qwen/Ollama-style backends
-                    # "think": False,
-                },
-            )
-            verdict = (response.choices[0].message.content or "").strip().upper()
-
-        except Exception:
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            user_text,
+            max_tokens=300,
+        )
+        if verdict is None:
             return True, None  # Fail open on classifier error
         if "OUT_OF_SCOPE" in verdict:
             return False, refusal_message
         return True, None
 
     return classify
+
+
+def build_llm_clarification_resolver(model: str, *, debug: bool = False):
+    """Return a classifier that resolves a clarification reply into structured data.
+
+    The resolver returns one of three normalized outcomes:
+    - selected_options: the reply chooses one or more listed clarification options
+    - custom_rule: the reply stays on topic but provides its own interpretation
+    - topic_change: the reply starts a different request entirely
+
+    It fails open to a custom_rule containing the raw reply so clarification
+    context is preserved on classifier or parsing errors.
+    """
+
+    system_prompt = (
+        "You are a strict clarification-turn resolver for a dataset SQL agent.\n"
+        "You will receive the current dataset question/topic, the pending clarification question, "
+        "the available clarification options, and the latest user reply.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"selected_options|custom_rule|topic_change","selected_options":["..."],"custom_rule":"..."}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='selected_options' when the latest reply selects one or more listed options, "
+        "even if the wording is abbreviated, misspelled, indirect, or refers to multiple options together.\n"
+        "- Use resolution_type='custom_rule' when the latest reply is still about the same dataset request but gives "
+        "its own rule or interpretation instead of selecting exact listed options.\n"
+        "- Use resolution_type='topic_change' only when the latest reply starts a different request or is unrelated "
+        "to the pending clarification.\n"
+        "- When resolution_type='selected_options', include only options from the provided list in selected_options and "
+        "set custom_rule to an empty string.\n"
+        "- When resolution_type='custom_rule', set selected_options to an empty list and place the resolved rule in custom_rule.\n"
+        "- When resolution_type='topic_change', set selected_options to an empty list and custom_rule to an empty string.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def resolve(
+        topic_context: str,
+        clarification_question: str,
+        options: list[str],
+        user_reply: str,
+    ) -> dict[str, Any]:
+        if not user_reply or not user_reply.strip():
+            return _fallback_clarification_resolution(user_reply)
+
+        normalized_topic_context = (topic_context or "").strip() or "[unknown]"
+        normalized_clarification_question = (clarification_question or "").strip() or "[unknown]"
+        options_text = "\n".join(
+            f"- {option}"
+            for option in options
+            if isinstance(option, str) and option.strip()
+        )
+        classifier_input = (
+            "Current dataset question/topic:\n"
+            f"{normalized_topic_context}\n\n"
+            "Pending clarification question:\n"
+            f"{normalized_clarification_question}\n\n"
+            "Available clarification options:\n"
+            f"{options_text or '[none]'}\n\n"
+            "Latest user reply:\n"
+            f"{user_reply.strip()}"
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=500,
+            debug_label="clarification-resolver" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return _fallback_clarification_resolution(user_reply)
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "clarification-resolver",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return _fallback_clarification_resolution(user_reply)
+
+        selected_options = _normalize_selected_options(parsed_response.get("selected_options"), options)
+        custom_rule = parsed_response.get("custom_rule")
+        normalized_custom_rule = custom_rule.strip() if isinstance(custom_rule, str) else ""
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+
+        if resolution_type == "topic_change":
+            return {
+                "resolution_type": "topic_change",
+                "selected_options": [],
+                "custom_rule": "",
+            }
+        if resolution_type == "selected_options" and selected_options:
+            return {
+                "resolution_type": "selected_options",
+                "selected_options": selected_options,
+                "custom_rule": "",
+            }
+        if resolution_type == "custom_rule" and normalized_custom_rule:
+            return {
+                "resolution_type": "custom_rule",
+                "selected_options": [],
+                "custom_rule": normalized_custom_rule,
+            }
+        if selected_options:
+            return {
+                "resolution_type": "selected_options",
+                "selected_options": selected_options,
+                "custom_rule": "",
+            }
+        if normalized_custom_rule:
+            return {
+                "resolution_type": "custom_rule",
+                "selected_options": [],
+                "custom_rule": normalized_custom_rule,
+            }
+        return _fallback_clarification_resolution(user_reply)
+
+    return resolve
+
+
+def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
+    """Return a classifier that resolves post-result follow-ups against the last query frame.
+
+    The resolver decides whether the latest user reply refines the previous dataset query,
+    needs a clarification on one of its categorical filters, or starts a new topic.
+    """
+
+    system_prompt = (
+        "You are a strict post-result refinement resolver for a dataset SQL agent.\n"
+        "You will receive the previous dataset question, the previous SQL query, any categorical filters used in that query, "
+        "and the latest user reply.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"refine_query|needs_clarification|topic_change","target_column":"...","selected_values":["..."],"refinement_request":"..."}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='refine_query' when the latest reply is still about refining or modifying the previous dataset query.\n"
+        "- Use resolution_type='needs_clarification' when the latest reply is still about the previous dataset query but wants to change a categorical filter without specifying an exact final set of dataset values.\n"
+        "- Use resolution_type='topic_change' only when the latest reply starts a different request or is unrelated to the previous dataset query.\n"
+        "- target_column must be one of the provided categorical filter columns or an empty string.\n"
+        "- selected_values must contain only exact dataset values available for target_column and should represent the full updated set of values to use when resolution_type='refine_query'.\n"
+        "- When resolution_type='needs_clarification', selected_values must be empty.\n"
+        "- When resolution_type='topic_change', target_column must be empty, selected_values must be empty, and refinement_request must be empty.\n"
+        "- Use refinement_request for the same-query change when the user is refining the previous query but not by selecting exact categorical values.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def resolve(last_query_frame: dict[str, Any], user_reply: str) -> dict[str, Any]:
+        if not isinstance(last_query_frame, dict) or not user_reply or not user_reply.strip():
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        previous_question = str(last_query_frame.get("question") or "").strip() or "[unknown]"
+        previous_sql = str(last_query_frame.get("sql") or "").strip() or "[unknown]"
+        categorical_filters = [
+            entry
+            for entry in (last_query_frame.get("categorical_filters") or [])
+            if isinstance(entry, dict)
+        ]
+        candidate_columns = [
+            str(entry.get("column") or "").strip()
+            for entry in categorical_filters
+            if str(entry.get("column") or "").strip()
+        ]
+
+        filter_lines = []
+        for entry in categorical_filters:
+            column_name = str(entry.get("column") or "").strip()
+            if not column_name:
+                continue
+            selected_values = ", ".join(entry.get("selected_values") or []) or "[none]"
+            available_values = ", ".join(entry.get("available_values") or []) or "[none]"
+            filter_lines.append(
+                f"- {column_name}: selected values = {selected_values}; available dataset values = {available_values}"
+            )
+        filter_text = "\n".join(filter_lines) if filter_lines else "[none]"
+
+        classifier_input = (
+            "Previous dataset question:\n"
+            f"{previous_question}\n\n"
+            "Previous SQL query:\n"
+            f"{previous_sql}\n\n"
+            "Categorical filters from the previous query:\n"
+            f"{filter_text}\n\n"
+            "Latest user reply:\n"
+            f"{user_reply.strip()}"
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=500,
+            debug_label="result-refinement-resolver" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "result-refinement-resolver",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        target_column = _normalize_selected_identifier(parsed_response.get("target_column"), candidate_columns)
+
+        allowed_values: list[str] = []
+        if target_column:
+            for entry in categorical_filters:
+                if str(entry.get("column") or "").strip() == target_column:
+                    allowed_values = [
+                        value
+                        for value in entry.get("available_values") or []
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    break
+
+        selected_values = _normalize_selected_options(parsed_response.get("selected_values"), allowed_values)
+        refinement_request = parsed_response.get("refinement_request")
+        normalized_refinement_request = refinement_request.strip() if isinstance(refinement_request, str) else ""
+
+        if resolution_type == "topic_change":
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if resolution_type == "needs_clarification" and target_column:
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": target_column,
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if resolution_type == "refine_query":
+            if target_column and selected_values:
+                return {
+                    "resolution_type": "refine_query",
+                    "target_column": target_column,
+                    "selected_values": selected_values,
+                    "refinement_request": "",
+                }
+            if normalized_refinement_request:
+                return {
+                    "resolution_type": "refine_query",
+                    "target_column": target_column,
+                    "selected_values": selected_values,
+                    "refinement_request": normalized_refinement_request,
+                }
+
+        if target_column and selected_values:
+            return {
+                "resolution_type": "refine_query",
+                "target_column": target_column,
+                "selected_values": selected_values,
+                "refinement_request": "",
+            }
+        if target_column:
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": target_column,
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if normalized_refinement_request:
+            return {
+                "resolution_type": "refine_query",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": normalized_refinement_request,
+            }
+        return {
+            "resolution_type": "topic_change",
+            "target_column": "",
+            "selected_values": [],
+            "refinement_request": "",
+        }
+
+    return resolve

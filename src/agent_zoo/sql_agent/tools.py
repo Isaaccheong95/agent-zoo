@@ -26,12 +26,17 @@ def build_sql_tools(settings: SQLAgentSettings) -> list[Callable]:
             A dictionary containing the schema text and structured table metadata.
         """
 
-        return get_schema_summary(db_path or settings.db_path)
+        return get_schema_summary(
+            db_path or settings.db_path,
+            include_categorical_value_guidance=settings.include_categorical_value_guidance,
+            max_categorical_values=settings.max_categorical_values,
+        )
 
     def execute_sqlite_read_only(
         sql: str,
         db_path: str | None = None,
         preview_rows: int | None = None,
+        is_final: bool = True,
     ) -> dict:
         """Validate and execute a read-only SQLite query.
 
@@ -39,6 +44,8 @@ def build_sql_tools(settings: SQLAgentSettings) -> list[Callable]:
             sql: The SQLite SELECT or WITH query to execute.
             db_path: Optional SQLite database path. If omitted, the configured default path is used.
             preview_rows: Optional preview limit. If omitted, the configured default is used.
+            is_final: Whether this query should be treated as the final user-facing answer.
+                Set this to False for exploratory queries that inform a later final query.
 
         Returns:
             A dictionary containing the SQL, rows, columns, row count, and any safe error message.

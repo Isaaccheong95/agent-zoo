@@ -27,6 +27,8 @@ DEFAULT_PREVIEW_ROWS = 20
 DEFAULT_COUNT_AGGREGATES_ONLY = True
 DEFAULT_MINIMUM_AGGREGATE_COUNT = 5
 DEFAULT_CAPTURE_INTERNAL_ROWS = False
+DEFAULT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE = True
+DEFAULT_MAX_CATEGORICAL_VALUES = 12
 
 
 def _normalize_optional_column_name(value: str | None) -> str | None:
@@ -78,6 +80,8 @@ class SQLAgentSettings:
     count_aggregates_only: bool = DEFAULT_COUNT_AGGREGATES_ONLY
     minimum_aggregate_count: int = DEFAULT_MINIMUM_AGGREGATE_COUNT
     capture_internal_rows: bool = DEFAULT_CAPTURE_INTERNAL_ROWS
+    include_categorical_value_guidance: bool = DEFAULT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE
+    max_categorical_values: int = DEFAULT_MAX_CATEGORICAL_VALUES
     object_id_column: str | None = None
     object_order_column: str | None = None
     app_name: str = "sql_agent"
@@ -125,6 +129,16 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     if raw_capture_internal_rows is None:
         raw_capture_internal_rows = os.getenv("SQL_AGENT_CAPTURE_INTERNAL_ROWS")
 
+    raw_include_categorical_value_guidance = overrides.get("include_categorical_value_guidance")
+    if raw_include_categorical_value_guidance is None:
+        raw_include_categorical_value_guidance = os.getenv(
+            "SQL_AGENT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE"
+        )
+
+    raw_max_categorical_values = overrides.get("max_categorical_values")
+    if raw_max_categorical_values is None:
+        raw_max_categorical_values = os.getenv("SQL_AGENT_MAX_CATEGORICAL_VALUES")
+
     raw_object_id_column = overrides.get("object_id_column")
     if raw_object_id_column is None:
         raw_object_id_column = os.getenv("SQL_AGENT_OBJECT_ID_COLUMN")
@@ -141,6 +155,10 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
     minimum_aggregate_count = DEFAULT_MINIMUM_AGGREGATE_COUNT
     if raw_minimum_aggregate_count not in (None, ""):
         minimum_aggregate_count = max(1, int(raw_minimum_aggregate_count))
+
+    max_categorical_values = DEFAULT_MAX_CATEGORICAL_VALUES
+    if raw_max_categorical_values not in (None, ""):
+        max_categorical_values = max(2, int(raw_max_categorical_values))
 
     object_id_column = _normalize_optional_column_name(raw_object_id_column)
     object_order_column = _normalize_optional_column_name(raw_object_order_column)
@@ -169,6 +187,11 @@ def load_settings(overrides: dict[str, Any] | None = None) -> SQLAgentSettings:
             raw_capture_internal_rows,
             default=DEFAULT_CAPTURE_INTERNAL_ROWS,
         ),
+        include_categorical_value_guidance=_parse_bool(
+            raw_include_categorical_value_guidance,
+            default=DEFAULT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE,
+        ),
+        max_categorical_values=max_categorical_values,
         object_id_column=object_id_column,
         object_order_column=object_order_column,
     )
