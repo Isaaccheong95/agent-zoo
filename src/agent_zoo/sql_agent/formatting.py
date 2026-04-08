@@ -20,6 +20,7 @@ _CLARIFICATION_METADATA_KEYS = {
 }
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
+_CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -50,7 +51,7 @@ def _unwrap_json_code_fence(value: str) -> str:
 
 
 def _clean_option_text(value: str) -> str | None:
-    candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", value).strip()
+    candidate = re.sub(r"^\s*(?:[-*•]|\d+\s*[.)-])\s*", "", value).strip()
     candidate = candidate.strip("`\"'")
     candidate = _normalize_whitespace(candidate)
     if not candidate:
@@ -231,7 +232,7 @@ def _extract_line_options(raw_text: str) -> list[str]:
         if not line:
             continue
 
-        match = re.match(r"^(?:[-*•]|\d+[.)])\s*(.+)$", line)
+        match = re.match(r"^(?:[-*•]|\d+\s*[.)-])\s*(.+)$", line)
         if match:
             options.append(match.group(1))
             continue
@@ -362,11 +363,18 @@ def _augment_clarification_user_message(user_message: str, options: list[Any]) -
     normalized_message = _normalize_whitespace(user_message)
     if not normalized_message or not options:
         return normalized_message
-    if _CLARIFICATION_REPLY_GUIDANCE.casefold() in normalized_message.casefold():
+
+    additions: list[str] = []
+    normalized_casefold = normalized_message.casefold()
+    if _CLARIFICATION_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+        additions.append(_CLARIFICATION_REPLY_GUIDANCE)
+    if _CLARIFICATION_NUMBER_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+        additions.append(_CLARIFICATION_NUMBER_REPLY_GUIDANCE)
+    if not additions:
         return normalized_message
 
     suffix = "" if normalized_message.endswith((".", "?", "!")) else "."
-    return f"{normalized_message}{suffix} {_CLARIFICATION_REPLY_GUIDANCE}"
+    return f"{normalized_message}{suffix} {' '.join(additions)}"
 
 
 def format_clarification_response(clarification: dict[str, Any]) -> str:
@@ -379,7 +387,7 @@ def format_clarification_response(clarification: dict[str, Any]) -> str:
     if user_message:
         parts.append(user_message)
     if options:
-        parts.append("\n".join(f"- {option}" for option in options))
+        parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     return "\n\n".join(parts).strip()
 
 def format_result_payload(tool_result: dict) -> str:

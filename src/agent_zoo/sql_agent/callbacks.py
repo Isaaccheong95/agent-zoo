@@ -293,12 +293,59 @@ def _extract_matching_clarification_options(
         return []
 
     matches: list[str] = []
+    seen_matches: set[str] = set()
     for option in options:
         normalized_option = _normalize_match_text(option)
         if not normalized_option:
             continue
         if re.search(rf"(?<!\w){re.escape(normalized_option)}(?!\w)", normalized_user_text):
+            seen_matches.add(option)
             matches.append(option)
+
+    if options and re.search(r"\d", user_text):
+        allowed_words = {
+            "all",
+            "and",
+            "both",
+            "choose",
+            "for",
+            "go",
+            "i",
+            "include",
+            "just",
+            "number",
+            "numbers",
+            "only",
+            "option",
+            "options",
+            "or",
+            "pick",
+            "please",
+            "select",
+            "too",
+            "use",
+            "value",
+            "values",
+            "want",
+            "with",
+        }
+        reply_words = re.findall(r"[a-z]+", user_text.casefold())
+        if all(word in allowed_words for word in reply_words):
+            selected_indexes: list[int] = []
+            seen_indexes: set[int] = set()
+            for raw_number in re.findall(r"\d+", user_text):
+                index = int(raw_number)
+                if index < 1 or index > len(options):
+                    selected_indexes = []
+                    break
+                if index not in seen_indexes:
+                    seen_indexes.add(index)
+                    selected_indexes.append(index)
+            for index in selected_indexes:
+                option = options[index - 1]
+                if option not in seen_matches:
+                    seen_matches.add(option)
+                    matches.append(option)
     return matches
 
 

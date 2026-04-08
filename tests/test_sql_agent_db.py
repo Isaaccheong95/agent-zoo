@@ -1169,8 +1169,9 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("Which occupation status should I count as not working?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Employed", response_text)
-        self.assertIn("- Student", response_text)
+        self.assertIn("You can reply with option numbers like 2 or 2 and 3.", response_text)
+        self.assertIn("1. Employed", response_text)
+        self.assertIn("5. Student", response_text)
         self.assertNotIn("Available categories:", response_text)
         self.assertEqual(
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
@@ -1210,11 +1211,11 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertNotIn("- how many females are alcoholics", response_text)
+        self.assertIn("1. Never", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Regularly", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+how many females are alcoholics\b")
         self.assertEqual(
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
             ["Never", "Occasionally", "Regularly", "Unknown"],
@@ -1253,12 +1254,12 @@ I need clarification on your question. Could you please specify which category o
         self.assertNotIn("Looking at the sococc field", response_text)
         self.assertIn("Could you please specify which category or combination of categories you'd like me to count?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Employed", response_text)
-        self.assertIn("- Retired", response_text)
-        self.assertIn("- Unemployed", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertIn("- Student", response_text)
-        self.assertNotIn("- sococc", response_text)
+        self.assertIn("1. Employed", response_text)
+        self.assertIn("2. Retired", response_text)
+        self.assertIn("3. Unemployed", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertIn("5. Student", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+sococc\b")
 
     def test_after_model_callback_ignores_non_clarification_plain_text(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
@@ -1305,15 +1306,15 @@ I need clarification on your question. Could you please specify which category o
         response_text = result.content.parts[0].text
         self.assertIn("Which category do you mean by 'alcoholics'?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Unknown", response_text)
+        self.assertIn("1. Regularly", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Never", response_text)
+        self.assertIn("4. Unknown", response_text)
         self.assertNotIn("response_type", response_text)
         self.assertNotIn("clarification", response_text)
         self.assertNotIn("user_message", response_text)
-        self.assertNotIn("- alcoholics", response_text)
-        self.assertNotIn("- Alcoholic", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+alcoholics\b")
+        self.assertNotRegex(response_text, r"\d+\.\s+Alcoholic\b")
 
     def test_after_model_callback_prefers_embedded_clarification_json_over_fallback_regex(self) -> None:
         with patch(
@@ -1353,11 +1354,11 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         self.assertIn("I need clarification on what you mean by 'alcoholics'.", response_text)
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertNotIn("- Other interpretation", response_text)
+        self.assertIn("1. Never", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Regularly", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+Other interpretation\b")
         self.assertNotIn("\\n\\nOptions:", response_text)
         self.assertNotIn("Options:", response_text)
         self.assertFalse(response_text.startswith("ionally'"))
@@ -1384,11 +1385,11 @@ I should ask for clarification about what the user means by \"alcoholics\" since
         response_text = result.content.parts[0].text
         self.assertIn("Which category should I use for 'alcoholics'?", response_text)
         self.assertIn("Choose one or more options, or describe your own rule.", response_text)
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertNotIn("- alcoholics", response_text)
+        self.assertIn("1. Never", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Regularly", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+alcoholics\b")
 
     def test_after_model_callback_ignores_quoted_prose_outside_option_sections(self) -> None:
         with patch(
@@ -1423,12 +1424,12 @@ Could you please specify which category you'd like me to use?"""
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Could you please specify which category you'd like me to use?", response_text)
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertNotIn("- alcoholics", response_text)
-        self.assertNotIn("- Alcoholic", response_text)
+        self.assertIn("1. Never", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Regularly", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+alcoholics\b")
+        self.assertNotRegex(response_text, r"\d+\.\s+Alcoholic\b")
 
     def test_after_model_callback_clamps_options_to_exact_dataset_categories(self) -> None:
         with patch(
@@ -1470,13 +1471,13 @@ Which category or combination should I use for \"alcoholic\"?
 
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
-        self.assertIn("- Never", response_text)
-        self.assertIn("- Occasionally", response_text)
-        self.assertIn("- Regularly", response_text)
-        self.assertIn("- Unknown", response_text)
-        self.assertNotIn("- Both combined", response_text)
-        self.assertNotIn("- Both Regularly and Occasionally", response_text)
-        self.assertNotIn("- Something else", response_text)
+        self.assertIn("1. Never", response_text)
+        self.assertIn("2. Occasionally", response_text)
+        self.assertIn("3. Regularly", response_text)
+        self.assertIn("4. Unknown", response_text)
+        self.assertNotRegex(response_text, r"\d+\.\s+Both combined\b")
+        self.assertNotRegex(response_text, r"\d+\.\s+Both Regularly and Occasionally\b")
+        self.assertNotRegex(response_text, r"\d+\.\s+Something else\b")
 
     def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
         scope_gate_calls: list[str] = []
@@ -1520,6 +1521,57 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
         self.assertIn("User clarification reply: occasionally and regularly", rewritten_text)
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+    def test_combined_before_model_callback_rewrites_numeric_pending_clarification_followups(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": user_reply}
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        for reply_text, matched_text in [
+            ("2", "Occasionally"),
+            ("2 and 3", "Occasionally, Regularly"),
+            ("2,3", "Occasionally, Regularly"),
+        ]:
+            with self.subTest(reply_text=reply_text):
+                state = {
+                    SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                        "topic_context": "how many females are alcoholics",
+                        "user_message": "Which category should I use for 'alcoholics'?",
+                        "options": ["Never", "Occasionally", "Regularly", "Unknown"],
+                    }
+                }
+                llm_request = SimpleNamespace(
+                    contents=[types.Content(role="user", parts=[types.Part(text=reply_text)])]
+                )
+                scope_gate_calls.clear()
+                resolver_calls.clear()
+
+                result = callback(
+                    callback_context=SimpleNamespace(state=state),
+                    llm_request=llm_request,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(scope_gate_calls, [])
+                self.assertEqual(resolver_calls, [])
+                rewritten_text = llm_request.contents[-1].parts[0].text
+                self.assertIn("The user is replying to the previous clarification", rewritten_text)
+                self.assertIn(f"Matched options from the reply: {matched_text}", rewritten_text)
+                self.assertIn(f"User clarification reply: {reply_text}", rewritten_text)
+                self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
     def test_combined_before_model_callback_skips_scope_gate_for_selection_like_followup(self) -> None:
         scope_gate_calls: list[str] = []
@@ -1784,11 +1836,12 @@ Which category or combination should I use for \"alcoholic\"?
         response_text = result.content.parts[0].text
         self.assertIn("I previously used sococc = Unemployed.", response_text)
         self.assertIn("Which values from sococc should I include now?", response_text)
-        self.assertIn("- Employed", response_text)
-        self.assertIn("- Retired", response_text)
-        self.assertIn("- Student", response_text)
-        self.assertIn("- Unemployed", response_text)
-        self.assertIn("- Unknown", response_text)
+        self.assertIn("You can reply with option numbers like 2 or 2 and 3.", response_text)
+        self.assertIn("1. Employed", response_text)
+        self.assertIn("2. Retired", response_text)
+        self.assertIn("3. Student", response_text)
+        self.assertIn("4. Unemployed", response_text)
+        self.assertIn("5. Unknown", response_text)
         self.assertEqual(
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
             ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
