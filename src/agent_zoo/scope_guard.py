@@ -108,6 +108,19 @@ def _normalize_selected_options(selected_options: Any, options: list[str]) -> li
     return normalized_matches
 
 
+def _normalize_selected_identifier(selected_identifier: Any, identifiers: list[str]) -> str:
+    if not isinstance(selected_identifier, str):
+        return ""
+
+    identifier_lookup: dict[str, str] = {}
+    for identifier in identifiers:
+        normalized_identifier = _normalize_resolution_text(identifier)
+        if normalized_identifier and normalized_identifier not in identifier_lookup:
+            identifier_lookup[normalized_identifier] = identifier
+
+    return identifier_lookup.get(_normalize_resolution_text(selected_identifier), "")
+
+
 def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
     return {
         "resolution_type": "custom_rule",
@@ -280,5 +293,185 @@ def build_llm_clarification_resolver(model: str, *, debug: bool = False):
                 "custom_rule": normalized_custom_rule,
             }
         return _fallback_clarification_resolution(user_reply)
+
+    return resolve
+
+
+def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
+    """Return a classifier that resolves post-result follow-ups against the last query frame.
+
+    The resolver decides whether the latest user reply refines the previous dataset query,
+    needs a clarification on one of its categorical filters, or starts a new topic.
+    """
+
+    system_prompt = (
+        "You are a strict post-result refinement resolver for a dataset SQL agent.\n"
+        "You will receive the previous dataset question, the previous SQL query, any categorical filters used in that query, "
+        "and the latest user reply.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"refine_query|needs_clarification|topic_change","target_column":"...","selected_values":["..."],"refinement_request":"..."}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='refine_query' when the latest reply is still about refining or modifying the previous dataset query.\n"
+        "- Use resolution_type='needs_clarification' when the latest reply is still about the previous dataset query but wants to change a categorical filter without specifying an exact final set of dataset values.\n"
+        "- Use resolution_type='topic_change' only when the latest reply starts a different request or is unrelated to the previous dataset query.\n"
+        "- target_column must be one of the provided categorical filter columns or an empty string.\n"
+        "- selected_values must contain only exact dataset values available for target_column and should represent the full updated set of values to use when resolution_type='refine_query'.\n"
+        "- When resolution_type='needs_clarification', selected_values must be empty.\n"
+        "- When resolution_type='topic_change', target_column must be empty, selected_values must be empty, and refinement_request must be empty.\n"
+        "- Use refinement_request for the same-query change when the user is refining the previous query but not by selecting exact categorical values.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def resolve(last_query_frame: dict[str, Any], user_reply: str) -> dict[str, Any]:
+        if not isinstance(last_query_frame, dict) or not user_reply or not user_reply.strip():
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        previous_question = str(last_query_frame.get("question") or "").strip() or "[unknown]"
+        previous_sql = str(last_query_frame.get("sql") or "").strip() or "[unknown]"
+        categorical_filters = [
+            entry
+            for entry in (last_query_frame.get("categorical_filters") or [])
+            if isinstance(entry, dict)
+        ]
+        candidate_columns = [
+            str(entry.get("column") or "").strip()
+            for entry in categorical_filters
+            if str(entry.get("column") or "").strip()
+        ]
+
+        filter_lines = []
+        for entry in categorical_filters:
+            column_name = str(entry.get("column") or "").strip()
+            if not column_name:
+                continue
+            selected_values = ", ".join(entry.get("selected_values") or []) or "[none]"
+            available_values = ", ".join(entry.get("available_values") or []) or "[none]"
+            filter_lines.append(
+                f"- {column_name}: selected values = {selected_values}; available dataset values = {available_values}"
+            )
+        filter_text = "\n".join(filter_lines) if filter_lines else "[none]"
+
+        classifier_input = (
+            "Previous dataset question:\n"
+            f"{previous_question}\n\n"
+            "Previous SQL query:\n"
+            f"{previous_sql}\n\n"
+            "Categorical filters from the previous query:\n"
+            f"{filter_text}\n\n"
+            "Latest user reply:\n"
+            f"{user_reply.strip()}"
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=500,
+            debug_label="result-refinement-resolver" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "result-refinement-resolver",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        target_column = _normalize_selected_identifier(parsed_response.get("target_column"), candidate_columns)
+
+        allowed_values: list[str] = []
+        if target_column:
+            for entry in categorical_filters:
+                if str(entry.get("column") or "").strip() == target_column:
+                    allowed_values = [
+                        value
+                        for value in entry.get("available_values") or []
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    break
+
+        selected_values = _normalize_selected_options(parsed_response.get("selected_values"), allowed_values)
+        refinement_request = parsed_response.get("refinement_request")
+        normalized_refinement_request = refinement_request.strip() if isinstance(refinement_request, str) else ""
+
+        if resolution_type == "topic_change":
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if resolution_type == "needs_clarification" and target_column:
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": target_column,
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if resolution_type == "refine_query":
+            if target_column and selected_values:
+                return {
+                    "resolution_type": "refine_query",
+                    "target_column": target_column,
+                    "selected_values": selected_values,
+                    "refinement_request": "",
+                }
+            if normalized_refinement_request:
+                return {
+                    "resolution_type": "refine_query",
+                    "target_column": target_column,
+                    "selected_values": selected_values,
+                    "refinement_request": normalized_refinement_request,
+                }
+
+        if target_column and selected_values:
+            return {
+                "resolution_type": "refine_query",
+                "target_column": target_column,
+                "selected_values": selected_values,
+                "refinement_request": "",
+            }
+        if target_column:
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": target_column,
+                "selected_values": [],
+                "refinement_request": "",
+            }
+        if normalized_refinement_request:
+            return {
+                "resolution_type": "refine_query",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": normalized_refinement_request,
+            }
+        return {
+            "resolution_type": "topic_change",
+            "target_column": "",
+            "selected_values": [],
+            "refinement_request": "",
+        }
 
     return resolve

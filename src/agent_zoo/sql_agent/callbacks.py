@@ -17,6 +17,7 @@ from google.genai import types
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import (
+    build_clarification_response,
     format_clarification_response,
     format_structured_response,
     normalize_clarification_response,
@@ -25,12 +26,14 @@ try:
     from ..scope_guard import (
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_result_refinement_resolver,
         build_llm_scope_gate,
     )
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
     from scope_guard import (  # type: ignore[no-redef]
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_result_refinement_resolver,
         build_llm_scope_gate,
     )
 
@@ -40,6 +43,8 @@ SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
 SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
 SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
+SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
+SQL_LAST_QUERY_FRAME_STATE_KEY = "sql_last_query_frame"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -113,6 +118,15 @@ def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
     return pending
 
 
+def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
+    if state is None or not hasattr(state, "get"):
+        return None
+    query_frame = state.get(SQL_LAST_QUERY_FRAME_STATE_KEY)
+    if not isinstance(query_frame, dict):
+        return None
+    return query_frame
+
+
 def _request_ends_with_tool_response(llm_request) -> bool:
     contents = getattr(llm_request, "contents", None) or []
     if not contents:
@@ -140,6 +154,115 @@ def _extract_llm_response_text(llm_response: LlmResponse) -> str:
 
 def _normalize_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _normalize_allowed_values(values: list[str], allowed_values: list[str]) -> list[str]:
+    value_lookup: dict[str, str] = {}
+    for allowed_value in allowed_values:
+        normalized_allowed_value = _normalize_match_text(allowed_value)
+        if normalized_allowed_value and normalized_allowed_value not in value_lookup:
+            value_lookup[normalized_allowed_value] = allowed_value
+
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+    for value in values:
+        canonical_value = value_lookup.get(_normalize_match_text(value))
+        if canonical_value and canonical_value not in seen_values:
+            seen_values.add(canonical_value)
+            normalized_values.append(canonical_value)
+    return normalized_values
+
+
+def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
+    return [
+        match.group(1).replace("''", "'")
+        for match in re.finditer(r"'((?:''|[^'])*)'", sql_fragment)
+    ]
+
+
+def _extract_categorical_filters_from_sql(
+    sql: str,
+    categorical_value_guidance: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    filters: list[dict[str, Any]] = []
+    for entry in categorical_value_guidance:
+        column_name = str(entry.get("column") or "").strip()
+        available_values = [
+            value.strip()
+            for value in entry.get("values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not column_name or not available_values:
+            continue
+
+        quoted_or_bare_column = rf'(?<!\w)(?:"{re.escape(column_name)}"|{re.escape(column_name)})(?!\w)'
+        selected_values: list[str] = []
+
+        in_match = re.search(
+            rf"{quoted_or_bare_column}\s+IN\s*\((?P<values>[^)]*)\)",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if in_match is not None:
+            selected_values = _normalize_allowed_values(
+                _extract_sql_string_literals(in_match.group("values")),
+                available_values,
+            )
+
+        if not selected_values:
+            equality_values = [
+                match.group(1).replace("''", "'")
+                for match in re.finditer(
+                    rf"{quoted_or_bare_column}\s*=\s*'((?:''|[^'])*)'",
+                    sql,
+                    flags=re.IGNORECASE,
+                )
+            ]
+            selected_values = _normalize_allowed_values(equality_values, available_values)
+
+        if not selected_values:
+            continue
+
+        filters.append(
+            {
+                "column": column_name,
+                "selected_values": selected_values,
+                "available_values": available_values,
+            }
+        )
+
+    return filters
+
+
+def _build_last_query_frame(
+    state: Any,
+    args: dict[str, Any],
+    tool_response: dict[str, Any],
+    categorical_value_guidance: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if state is None or not hasattr(state, "get"):
+        return None
+
+    active_query_topic = state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+    if not isinstance(active_query_topic, str) or not active_query_topic.strip():
+        active_query_topic = state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+    if not isinstance(active_query_topic, str) or not active_query_topic.strip():
+        return None
+
+    raw_sql = args.get("sql") if isinstance(args, dict) else None
+    if not isinstance(raw_sql, str) or not raw_sql.strip():
+        raw_sql = tool_response.get("sql")
+    if not isinstance(raw_sql, str) or not raw_sql.strip():
+        return None
+
+    query_frame = {
+        "question": active_query_topic.strip(),
+        "sql": raw_sql.strip(),
+    }
+    categorical_filters = _extract_categorical_filters_from_sql(raw_sql, categorical_value_guidance)
+    if categorical_filters:
+        query_frame["categorical_filters"] = categorical_filters
+    return query_frame
 
 
 def _coerce_bool_argument(value: Any, *, default: bool) -> bool:
@@ -293,6 +416,57 @@ def _resolve_pending_clarification_reply(
     )
 
 
+def _build_result_refinement_clarification(
+    last_query_frame: dict[str, Any],
+    target_column: str,
+) -> dict[str, Any] | None:
+    if not target_column:
+        return None
+
+    filter_entry = next(
+        (
+            entry
+            for entry in (last_query_frame.get("categorical_filters") or [])
+            if isinstance(entry, dict) and str(entry.get("column") or "").strip() == target_column
+        ),
+        None,
+    )
+    if filter_entry is None:
+        return None
+
+    available_values = [
+        value
+        for value in filter_entry.get("available_values") or []
+        if isinstance(value, str) and value.strip()
+    ]
+    if not available_values:
+        return None
+
+    selected_values = [
+        value
+        for value in filter_entry.get("selected_values") or []
+        if isinstance(value, str) and value.strip()
+    ]
+    previous_question = str(last_query_frame.get("question") or "").strip()
+
+    message_parts = []
+    if previous_question:
+        message_parts.append(f"Your previous question was: {previous_question}.")
+    if selected_values:
+        message_parts.append(
+            f"I previously used {target_column} = {', '.join(selected_values)}."
+        )
+    message_parts.append(f"Which values from {target_column} should I include now?")
+
+    clarification = build_clarification_response(
+        " ".join(message_parts),
+        available_values,
+    )
+    if previous_question:
+        clarification["topic_context"] = previous_question
+    return clarification
+
+
 def _replace_last_user_text(llm_request, replacement_text: str) -> bool:
     contents = getattr(llm_request, "contents", None) or []
     for index in range(len(contents) - 1, -1, -1):
@@ -305,6 +479,65 @@ def _replace_last_user_text(llm_request, replacement_text: str) -> bool:
         )
         return True
     return False
+
+
+def _apply_last_query_refinement_followup(
+    llm_request,
+    last_query_frame: dict[str, Any],
+    user_text: str,
+    *,
+    target_column: str | None = None,
+    selected_values: list[str] | None = None,
+    refinement_request: str | None = None,
+) -> bool:
+    previous_question = str(last_query_frame.get("question") or "").strip()
+    previous_sql = str(last_query_frame.get("sql") or "").strip()
+    if not previous_question and not previous_sql:
+        return False
+
+    rewritten_sections = [
+        "The user is refining the previous dataset request rather than starting a new question.",
+    ]
+    if previous_question:
+        rewritten_sections.append(f"Previous dataset question: {previous_question}")
+    if previous_sql:
+        rewritten_sections.append(f"Previous SQL:\n{previous_sql}")
+
+    categorical_filters = [
+        entry
+        for entry in (last_query_frame.get("categorical_filters") or [])
+        if isinstance(entry, dict)
+    ]
+    if categorical_filters:
+        filter_lines = []
+        for entry in categorical_filters:
+            column_name = str(entry.get("column") or "").strip()
+            if not column_name:
+                continue
+            selected_text = ", ".join(entry.get("selected_values") or []) or "[none]"
+            available_text = ", ".join(entry.get("available_values") or []) or "[none]"
+            filter_lines.append(
+                f"- {column_name}: selected values = {selected_text}; available dataset values = {available_text}"
+            )
+        if filter_lines:
+            rewritten_sections.append(
+                "Categorical filters from the previous query:\n" + "\n".join(filter_lines)
+            )
+
+    if target_column and selected_values:
+        rewritten_sections.append(
+            f"Use this updated value set for {target_column}: {', '.join(selected_values)}"
+        )
+
+    normalized_refinement_request = refinement_request.strip() if isinstance(refinement_request, str) else ""
+    rewritten_sections.append(
+        f"Latest same-query refinement request: {normalized_refinement_request or user_text}"
+    )
+    rewritten_sections.append(
+        "Apply the refinement to the previous dataset question and continue from there."
+    )
+
+    return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
 
 
 def _apply_pending_clarification_followup(llm_request, clarification: dict[str, Any]) -> bool:
@@ -892,6 +1125,12 @@ def build_remember_query_result_callback(
     settings: SQLAgentSettings | None = None,
 ):
     active_settings = settings or load_settings()
+    schema_summary = get_schema_summary(
+        active_settings.db_path,
+        include_categorical_value_guidance=active_settings.include_categorical_value_guidance,
+        max_categorical_values=active_settings.max_categorical_values,
+    )
+    categorical_value_guidance = schema_summary.get("categorical_value_guidance") or []
 
     def remember_query_result(tool, args: dict, tool_context, tool_response: dict, **kwargs) -> dict | None:
         tool_name = getattr(tool, "name", "")
@@ -907,6 +1146,21 @@ def build_remember_query_result_callback(
 
         if not is_final:
             return None
+
+        if tool_response.get("status") == "success":
+            last_query_frame = _build_last_query_frame(
+                tool_context.state,
+                args,
+                tool_response,
+                categorical_value_guidance,
+            )
+            if last_query_frame is not None:
+                tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY] = last_query_frame
+                _print_clarification_debug(
+                    active_settings,
+                    "after-tool-last-query-frame",
+                    last_query_frame,
+                )
 
         public_result = _build_public_query_result(
             tool_response,
@@ -1114,10 +1368,18 @@ def build_combined_before_model_callback(
     """Chain LLM scope gate → finalize-after-query into a single before_model_callback."""
     active_settings = settings or load_settings()
 
-    schema_summary = get_schema_summary(active_settings.db_path)
+    schema_summary = get_schema_summary(
+        active_settings.db_path,
+        include_categorical_value_guidance=active_settings.include_categorical_value_guidance,
+        max_categorical_values=active_settings.max_categorical_values,
+    )
     schema_text = schema_summary.get("schema_text") or ""
     classifier = build_llm_scope_gate(active_settings.model, schema_text)
     clarification_resolver = build_llm_clarification_resolver(
+        active_settings.model,
+        debug=active_settings.debug,
+    )
+    result_refinement_resolver = build_llm_result_refinement_resolver(
         active_settings.model,
         debug=active_settings.debug,
     )
@@ -1130,7 +1392,9 @@ def build_combined_before_model_callback(
             _clear_private_result_state(callback_context.state)
             user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
             if user_text:
-                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = _extract_topic_context_text(user_text)
+                topic_text = _extract_topic_context_text(user_text)
+                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
+                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_text
                 _print_clarification_debug(active_settings, "before-model-user-prompt", user_text)
             pending_clarification = _get_pending_clarification(callback_context.state)
             clarification_followup = False
@@ -1159,6 +1423,9 @@ def build_combined_before_model_callback(
                         pending_clarification,
                     )
                     if clarification_followup:
+                        topic_context = pending_clarification.get("topic_context")
+                        if isinstance(topic_context, str) and topic_context.strip():
+                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
                         _print_clarification_debug(
                             active_settings,
                             "before-model-followup-rewritten",
@@ -1197,6 +1464,9 @@ def build_combined_before_model_callback(
                             custom_rule=clarification_resolution.get("custom_rule"),
                         )
                         if clarification_followup:
+                            topic_context = pending_clarification.get("topic_context")
+                            if isinstance(topic_context, str) and topic_context.strip():
+                                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
                             _print_clarification_debug(
                                 active_settings,
                                 "before-model-followup-rewritten",
@@ -1210,6 +1480,72 @@ def build_combined_before_model_callback(
                     "continuing clarification flow without scope gate",
                 )
                 return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+            last_query_frame = _get_last_query_frame(callback_context.state)
+            if last_query_frame is not None:
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-last-query-frame",
+                    last_query_frame,
+                )
+                refinement_resolution = result_refinement_resolver(last_query_frame, user_text)
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-result-refinement-resolution",
+                    refinement_resolution,
+                )
+                refinement_type = refinement_resolution.get("resolution_type")
+                if refinement_type == "needs_clarification":
+                    clarification = _build_result_refinement_clarification(
+                        last_query_frame,
+                        str(refinement_resolution.get("target_column") or "").strip(),
+                    )
+                    if clarification is not None:
+                        callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+                        topic_context = clarification.get("topic_context")
+                        if isinstance(topic_context, str) and topic_context.strip():
+                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-result-refinement-clarification",
+                            clarification,
+                        )
+                        formatted_response = format_clarification_response(clarification)
+                        if formatted_response:
+                            return LlmResponse(
+                                content=types.Content(
+                                    role="model",
+                                    parts=[types.Part(text=formatted_response)],
+                                )
+                            )
+                elif refinement_type == "refine_query":
+                    refinement_followup = _apply_last_query_refinement_followup(
+                        llm_request,
+                        last_query_frame,
+                        user_text,
+                        target_column=str(refinement_resolution.get("target_column") or "").strip() or None,
+                        selected_values=[
+                            value
+                            for value in refinement_resolution.get("selected_values") or []
+                            if isinstance(value, str) and value.strip()
+                        ],
+                        refinement_request=str(refinement_resolution.get("refinement_request") or "").strip(),
+                    )
+                    if refinement_followup:
+                        previous_question = str(last_query_frame.get("question") or "").strip()
+                        if previous_question:
+                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_question
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-followup-rewritten",
+                            _extract_last_user_text(llm_request),
+                        )
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-branch",
+                            "continuing result refinement flow without scope gate",
+                        )
+                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
         result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
         if result is not None:
