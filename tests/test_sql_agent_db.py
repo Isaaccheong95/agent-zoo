@@ -903,6 +903,45 @@ I need clarification on your question. Could you please specify which category o
 
         self.assertIsNone(result)
 
+    def test_after_model_callback_recovers_from_truncated_clarification_json(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        raw_response = """Which category do you mean by 'alcoholics'?\",\"options\":[\"Regularly (regular alcohol consumption)\",\"Occasionally (occasional drinking)\",\"Never (no alcohol)\",\"Unknown (missing data)\"]}
+
+- alcoholics
+- Never
+- Occasionally
+- Regularly
+- Unknown
+- Alcoholic
+- response_type
+- clarification
+- user_message
+- ,
+"""
+
+        result = callback(
+            callback_context=SimpleNamespace(state={}),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=raw_response)],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Which category do you mean by 'alcoholics'?", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Never", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("response_type", response_text)
+        self.assertNotIn("clarification", response_text)
+        self.assertNotIn("user_message", response_text)
+        self.assertNotIn("- alcoholics", response_text)
+        self.assertNotIn("- Alcoholic", response_text)
+
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
         event = SimpleNamespace(

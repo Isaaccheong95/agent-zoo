@@ -12,6 +12,14 @@ import re
 from typing import Any
 
 
+_CLARIFICATION_METADATA_KEYS = {
+    "clarification",
+    "options",
+    "response_type",
+    "user_message",
+}
+
+
 def _normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -45,6 +53,8 @@ def _clean_option_text(value: str) -> str | None:
     candidate = _normalize_whitespace(candidate)
     if not candidate:
         return None
+    if candidate.casefold() in _CLARIFICATION_METADATA_KEYS:
+        return None
 
     if " - " in candidate:
         candidate = candidate.split(" - ", 1)[0].strip()
@@ -64,6 +74,17 @@ def _clean_option_text(value: str) -> str | None:
     if len(candidate.split()) > 6 or len(candidate) > 60:
         return None
     return candidate
+
+
+def _extract_jsonish_options(raw_text: str) -> list[str]:
+    options: list[str] = []
+    for match in re.finditer(r'"options"\s*:\s*\[(?P<values>[^\]]*)\]', raw_text, re.DOTALL):
+        values = match.group("values")
+        options.extend(
+            quoted_match.group(1)
+            for quoted_match in re.finditer(r'"([^"\n]{1,60})"', values)
+        )
+    return options
 
 
 def build_clarification_response(
@@ -121,6 +142,10 @@ def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
 
 
 def _extract_quoted_options(raw_text: str) -> list[str]:
+    jsonish_options = _extract_jsonish_options(raw_text)
+    if jsonish_options:
+        return jsonish_options
+
     options: list[str] = []
     for line in raw_text.splitlines():
         quoted_values = [match.group(1) for match in re.finditer(r'"([^"\n]{1,60})"', line)]
@@ -154,6 +179,17 @@ def _extract_line_options(raw_text: str) -> list[str]:
 
 
 def _extract_user_message(raw_text: str, options: list[str]) -> str | None:
+    quoted_message_match = re.search(r'"user_message"\s*:\s*"(?P<message>[^"\n]{1,240})"', raw_text)
+    if quoted_message_match:
+        return _normalize_whitespace(quoted_message_match.group("message"))
+
+    truncated_message_match = re.search(
+        r'(?P<message>[^"\n]{3,240}\?)"\s*,\s*"options"\s*:',
+        raw_text,
+    )
+    if truncated_message_match:
+        return _normalize_whitespace(truncated_message_match.group("message"))
+
     normalized_text = _normalize_whitespace(raw_text)
     if not normalized_text:
         return None
@@ -197,16 +233,23 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     if clarification is not None:
         return clarification
 
-    options = _dedupe_preserve_order(
-        [
-            option
-            for option in [
-                *(_clean_option_text(value) for value in _extract_quoted_options(raw_text)),
-                *(_clean_option_text(value) for value in _extract_line_options(raw_text)),
+    jsonish_options = [
+        option for option in (_clean_option_text(value) for value in _extract_jsonish_options(raw_text))
+        if option is not None
+    ]
+    if jsonish_options:
+        options = _dedupe_preserve_order(jsonish_options)[:10]
+    else:
+        options = _dedupe_preserve_order(
+            [
+                option
+                for option in [
+                    *(_clean_option_text(value) for value in _extract_quoted_options(raw_text)),
+                    *(_clean_option_text(value) for value in _extract_line_options(raw_text)),
+                ]
+                if option is not None
             ]
-            if option is not None
-        ]
-    )[:10]
+        )[:10]
 
     user_message = _extract_user_message(raw_text, options)
     if user_message is None and not options:
