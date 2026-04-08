@@ -905,6 +905,44 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             "how many females are alcoholics",
         )
 
+    def test_after_model_callback_prunes_topic_context_echo_from_options(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many females are alcoholics",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"Which category should I use for \'alcoholics\'?",'
+                                '"options":["how many females are alcoholics","Never",'
+                                '"Occasionally","Regularly","Unknown"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Which category should I use for 'alcoholics'?", response_text)
+        self.assertIn("- Never", response_text)
+        self.assertIn("- Occasionally", response_text)
+        self.assertIn("- Regularly", response_text)
+        self.assertIn("- Unknown", response_text)
+        self.assertNotIn("- how many females are alcoholics", response_text)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
+            ["Never", "Occasionally", "Regularly", "Unknown"],
+        )
+
     def test_after_model_callback_strips_reasoning_from_clarification_path(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
         raw_response = """The user is asking about patients who are \"not working\". Looking at the sococc field (occupation status), I need to identify which categories represent people who are not working.

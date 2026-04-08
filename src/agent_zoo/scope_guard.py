@@ -17,13 +17,22 @@ DEFAULT_REFUSAL_MESSAGE = (
 )
 
 
+def _print_classifier_debug(debug_label: str | None, stage: str, payload: str) -> None:
+    if not debug_label:
+        return
+    print(f"[debug][{debug_label}][{stage}]\n{payload}")
+
+
 def _run_litellm_classifier(
     model: str,
     system_prompt: str,
     user_text: str,
     *,
     max_tokens: int,
+    debug_label: str | None = None,
 ) -> str | None:
+    _print_classifier_debug(debug_label, "system-prompt", system_prompt)
+    _print_classifier_debug(debug_label, "user-prompt", user_text)
     try:
         import litellm
 
@@ -39,10 +48,13 @@ def _run_litellm_classifier(
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         )
-    except Exception:
+    except Exception as exc:
+        _print_classifier_debug(debug_label, "error", repr(exc))
         return None
 
-    return (response.choices[0].message.content or "").strip().upper()
+    verdict = (response.choices[0].message.content or "").strip().upper()
+    _print_classifier_debug(debug_label, "llm-response", verdict or "<empty>")
+    return verdict
 
 
 def build_llm_scope_gate(
@@ -93,7 +105,7 @@ def build_llm_scope_gate(
     return classify
 
 
-def build_llm_clarification_topic_gate(model: str):
+def build_llm_clarification_topic_gate(model: str, *, debug: bool = False):
     """Return a classifier that decides whether a clarification reply changed topic.
 
     The classifier returns True only when the latest user reply appears to start a
@@ -144,6 +156,7 @@ def build_llm_clarification_topic_gate(model: str):
             system_prompt,
             classifier_input,
             max_tokens=40,
+            debug_label="clarification-topic-gate" if debug else None,
         )
         if verdict is None:
             return False
