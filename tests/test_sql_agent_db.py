@@ -36,6 +36,7 @@ from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
 from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
+from agent_zoo.sql_agent.tools import build_sql_tools
 from agent_zoo.scope_guard import build_llm_clarification_resolver, build_llm_scope_gate
 
 
@@ -146,6 +147,31 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("people(id INTEGER PRIMARY KEY", summary["schema_text"])
         self.assertNotIn("__shadow", summary["schema_text"])
 
+    def test_get_schema_summary_includes_categorical_value_guidance(self) -> None:
+        summary = get_schema_summary(
+            self.db_path,
+            include_categorical_value_guidance=True,
+        )
+
+        self.assertEqual(summary["status"], "success")
+        guidance = {
+            (entry["table"], entry["column"]): entry["values"]
+            for entry in summary["categorical_value_guidance"]
+        }
+        self.assertEqual(guidance[("people", "sex")], ["female", "male"])
+        self.assertEqual(guidance[("visits", "city")], ["Paris", "Singapore", "Tokyo"])
+        self.assertNotIn(("people", "id"), guidance)
+        self.assertNotIn(("people", "name"), guidance)
+        self.assertIn(
+            'people.sex: Stored SQLite values seen in the dataset: "female", "male"',
+            summary["categorical_value_guidance_text"],
+        )
+
+        people_table = next(table for table in summary["tables"] if table["name"] == "people")
+        people_columns = {column["name"]: column for column in people_table["columns"]}
+        self.assertEqual(people_columns["sex"]["categorical_values"], ["female", "male"])
+        self.assertNotIn("categorical_values", people_columns["name"])
+
     def test_validate_sql_read_only_allows_select_and_with(self) -> None:
         select_validation = validate_sql_read_only(
             "SELECT name FROM people WHERE age > 20 ORDER BY name",
@@ -221,6 +247,40 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn('"response_type":"clarification"', instruction)
         self.assertIn("available category values", instruction)
         self.assertIn("choose one or more options or describe their own rule", instruction)
+
+    def test_build_agent_instruction_includes_categorical_value_guidance_and_exploratory_flag(self) -> None:
+        instruction = build_agent_instruction(
+            SQLAgentSettings(
+                db_path=self.db_path,
+                model="test-model",
+            )
+        )
+
+        self.assertIn("Relevant Categorical Value Guidance", instruction)
+        self.assertIn('people.sex: Stored SQLite values seen in the dataset: "female", "male"', instruction)
+        self.assertIn("is_final=False", instruction)
+        self.assertIn("Do not stop after an exploratory query", instruction)
+
+    def test_inspect_sqlite_schema_tool_reuses_categorical_value_guidance(self) -> None:
+        inspect_tool = next(
+            tool
+            for tool in build_sql_tools(
+                SQLAgentSettings(
+                    db_path=self.db_path,
+                    model="test-model",
+                )
+            )
+            if tool.__name__ == "inspect_sqlite_schema"
+        )
+
+        summary = inspect_tool()
+        guidance = {
+            (entry["table"], entry["column"]): entry["values"]
+            for entry in summary["categorical_value_guidance"]
+        }
+
+        self.assertEqual(guidance[("people", "sex")], ["female", "male"])
+        self.assertEqual(guidance[("visits", "city")], ["Paris", "Singapore", "Tokyo"])
 
     def test_scope_gate_prompt_keeps_schema_adjacent_requests_in_scope(self) -> None:
         captured: dict[str, str] = {}
@@ -460,12 +520,25 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         settings: SQLAgentSettings,
         tool_response: dict,
         state,
+        args: dict | None = None,
     ):
         callback = build_remember_query_result_callback(settings)
         tool = SimpleNamespace(name="execute_sqlite_read_only")
         tool_context = SimpleNamespace(state=state)
-        callback(tool, {}, tool_context, tool_response)
+        callback(tool, args or {}, tool_context, tool_response)
         return tool_context.state
+
+    def _invoke_after_tool_with_args(
+        self,
+        settings: SQLAgentSettings,
+        tool_response: dict,
+        args: dict | None = None,
+    ) -> tuple[dict, dict | None]:
+        callback = build_remember_query_result_callback(settings)
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={})
+        returned_result = callback(tool, args or {}, tool_context, tool_response)
+        return tool_context.state, returned_result
 
     def test_load_settings_defaults_and_env_overrides(self) -> None:
         settings = load_settings(
@@ -478,6 +551,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertTrue(settings.count_aggregates_only)
         self.assertEqual(settings.minimum_aggregate_count, 5)
         self.assertFalse(settings.capture_internal_rows)
+        self.assertTrue(settings.include_categorical_value_guidance)
+        self.assertEqual(settings.max_categorical_values, 12)
 
         with patch.dict(
             os.environ,
@@ -485,6 +560,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 "SQL_AGENT_COUNT_AGGREGATES_ONLY": "false",
                 "SQL_AGENT_MINIMUM_AGGREGATE_COUNT": "7",
                 "SQL_AGENT_CAPTURE_INTERNAL_ROWS": "true",
+                "SQL_AGENT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE": "false",
+                "SQL_AGENT_MAX_CATEGORICAL_VALUES": "7",
                 "OPENAI_API_BASE": "http://127.0.0.1:9000/v1",
             },
             clear=False,
@@ -499,6 +576,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertFalse(overridden.count_aggregates_only)
         self.assertEqual(overridden.minimum_aggregate_count, 7)
         self.assertTrue(overridden.capture_internal_rows)
+        self.assertFalse(overridden.include_categorical_value_guidance)
+        self.assertEqual(overridden.max_categorical_values, 7)
         self.assertEqual(overridden.openai_api_base, "http://127.0.0.1:9000/v1")
 
     def test_load_settings_supports_object_level_configuration(self) -> None:
@@ -602,6 +681,32 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(returned_result, tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY])
         self.assertEqual(returned_result["status"], "error")
         self.assertTrue(returned_result["privacy_blocked"])
+
+    def test_exploratory_query_skips_public_state_and_finalization(self) -> None:
+        state, returned_result = self._invoke_after_tool_with_args(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [
+                    {"sex": "female"},
+                    {"sex": "male"},
+                ],
+                columns=["sex"],
+                row_count=2,
+                sql="SELECT DISTINCT sex FROM people",
+            ),
+            args={"is_final": False},
+        )
+
+        self.assertIsNone(returned_result)
+        self.assertNotIn(SQL_PUBLIC_RESULT_STATE_KEY, state)
+
+        finalize = build_finalize_after_query_before_model_callback(self._settings())
+        final_response = finalize(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=SimpleNamespace(),
+        )
+
+        self.assertIsNone(final_response)
 
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(

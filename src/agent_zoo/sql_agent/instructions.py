@@ -23,8 +23,10 @@ Your job is only to choose the right tool calls.
 
 Workflow:
 1. If you are not fully sure about table or column names, call `inspect_sqlite_schema`.
-2. Then call `execute_sqlite_read_only` with one SQLite `SELECT` or `WITH` query.
-3. After `execute_sqlite_read_only` returns, stop. Do not call more tools for the same question.
+2. If the schema snapshot already includes matching categorical value guidance, use those exact stored values directly.
+3. Use `execute_sqlite_read_only` for schema-grounded SQLite `SELECT` or `WITH` queries.
+4. Use `execute_sqlite_read_only(..., is_final=False)` only for narrow exploratory queries that help map ambiguous user wording to actual stored values or columns.
+5. After the final `execute_sqlite_read_only` call (the default `is_final=True`) returns, stop. Do not call more tools for the same question.
 
 Rules:
 - Use only tables and columns that appear in the schema.
@@ -45,6 +47,9 @@ Rules:
 - If the user uses approximate, colloquial, or partially incorrect dataset terminology, keep the request in scope and ask a short clarification that names the closest schema column(s) instead of refusing.
 - If the request is ambiguous or cannot be grounded in the schema, ask for clarification instead of guessing.
 - If more than one nearby schema concept could fit, ask which one the user means before querying.
+- If the schema snapshot includes relevant categorical value guidance, prefer those exact stored SQLite values before issuing exploratory SQL.
+- If you need exploratory SQL, keep it narrow, set `is_final=False`, use the result to resolve the ambiguity, and then issue one final answering query with the default `is_final=True`.
+- Do not stop after an exploratory query.
 - When clarification is needed before querying, do not call any tools yet.
 - When clarification is needed before querying, respond with exactly one JSON object and no surrounding prose using this schema: {"response_type":"clarification","user_message":"...","options":["..."]}.
 - `user_message` must be a short user-facing clarification question. When `options` are present, tell the user they may choose one or more options or describe their own rule.
@@ -67,12 +72,28 @@ def _load_instruction_text(instruction_file: Path | None) -> str:
 
 def build_agent_instruction(settings: SQLAgentSettings) -> str:
     base_instruction = _load_instruction_text(settings.instruction_file)
-    schema_summary = get_schema_summary(settings.db_path)
+    schema_summary = get_schema_summary(
+        settings.db_path,
+        include_categorical_value_guidance=settings.include_categorical_value_guidance,
+        max_categorical_values=settings.max_categorical_values,
+    )
 
     if schema_summary["status"] == "success":
         schema_text = schema_summary["schema_text"]
+        categorical_value_guidance_text = schema_summary.get("categorical_value_guidance_text") or ""
     else:
         schema_text = f"Schema unavailable: {schema_summary.get('error', 'Unknown error')}"
+        categorical_value_guidance_text = ""
+
+    categorical_value_guidance_section = ""
+    if categorical_value_guidance_text:
+        categorical_value_guidance_section = f"""
+
+## Relevant Categorical Value Guidance
+```text
+{categorical_value_guidance_text}
+```
+"""
 
     runtime_context = f"""
 
@@ -82,6 +103,8 @@ def build_agent_instruction(settings: SQLAgentSettings) -> str:
 - Count aggregates only: {settings.count_aggregates_only}
 - Minimum aggregate count: {settings.minimum_aggregate_count}
 - Capture internal rows: {settings.capture_internal_rows}
+- Include categorical value guidance: {settings.include_categorical_value_guidance}
+- Max categorical values per column: {settings.max_categorical_values}
 - Object ID column: {settings.object_id_column or "Not configured"}
 - Object order column: {settings.object_order_column or "Not configured"}
 
@@ -89,6 +112,7 @@ def build_agent_instruction(settings: SQLAgentSettings) -> str:
 ```text
 {schema_text}
 ```
+{categorical_value_guidance_section}
 """.strip()
 
     return f"{base_instruction}\n\n{runtime_context}"

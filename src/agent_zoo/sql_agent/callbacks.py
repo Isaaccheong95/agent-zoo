@@ -142,6 +142,25 @@ def _normalize_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def _coerce_bool_argument(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        return normalized not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _tool_call_is_final(args: dict[str, Any] | None) -> bool:
+    if not isinstance(args, dict):
+        return True
+    return _coerce_bool_argument(args.get("is_final"), default=True)
+
+
 def _extract_matching_clarification_options(
     user_text: str,
     options: list[str],
@@ -817,16 +836,21 @@ def build_remember_query_result_callback(
         if tool_name != "execute_sqlite_read_only":
             return None
 
+        is_final = _tool_call_is_final(args)
         _clear_private_result_state(tool_context.state)
+
+        if active_settings.capture_internal_rows and tool_response.get("status") == "success":
+            tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
+            tool_context.state[SQL_INTERNAL_RESULT_REF_STATE_KEY] = SQL_INTERNAL_QUERY_RESULT_STATE_KEY
+
+        if not is_final:
+            return None
+
         public_result = _build_public_query_result(
             tool_response,
             active_settings,
         )
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
-
-        if active_settings.capture_internal_rows and tool_response.get("status") == "success":
-            tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
-            tool_context.state[SQL_INTERNAL_RESULT_REF_STATE_KEY] = SQL_INTERNAL_QUERY_RESULT_STATE_KEY
 
         if active_settings.count_aggregates_only:
             return public_result
