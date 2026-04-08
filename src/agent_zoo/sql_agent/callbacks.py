@@ -22,15 +22,24 @@ from .formatting import (
     normalize_clarification_response,
 )
 try:
-    from ..scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate
+    from ..scope_guard import (
+        DEFAULT_REFUSAL_MESSAGE,
+        build_llm_clarification_topic_gate,
+        build_llm_scope_gate,
+    )
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
-    from scope_guard import DEFAULT_REFUSAL_MESSAGE, build_llm_scope_gate  # type: ignore[no-redef]
+    from scope_guard import (  # type: ignore[no-redef]
+        DEFAULT_REFUSAL_MESSAGE,
+        build_llm_clarification_topic_gate,
+        build_llm_scope_gate,
+    )
 
 
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
 SQL_PENDING_CLARIFICATION_STATE_KEY = "temp:sql_pending_clarification"
+SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -142,30 +151,26 @@ def _extract_matching_clarification_options(
     return matches
 
 
-def _looks_like_new_query(user_text: str) -> bool:
-    normalized_user_text = user_text.strip().casefold()
-    if not normalized_user_text:
+def _pending_clarification_reply_is_topic_change(
+    classifier,
+    clarification: dict[str, Any],
+    user_text: str,
+) -> bool:
+    if not user_text or not user_text.strip():
         return False
-    if "?" in normalized_user_text:
-        return True
-    return normalized_user_text.startswith(
-        (
-            "how ",
-            "what ",
-            "which ",
-            "show ",
-            "count ",
-            "list ",
-            "find ",
-            "give ",
-            "calculate ",
-            "compute ",
-            "filter ",
-            "sql ",
-            "who ",
-            "where ",
-            "when ",
-        )
+
+    topic_context = clarification.get("topic_context")
+    clarification_question = clarification.get("user_message")
+    options = clarification.get("options") or []
+    return classifier(
+        topic_context if isinstance(topic_context, str) else "",
+        clarification_question if isinstance(clarification_question, str) else "",
+        [
+            option
+            for option in options
+            if isinstance(option, str) and option.strip()
+        ],
+        user_text,
     )
 
 
@@ -194,9 +199,6 @@ def _apply_pending_clarification_followup(llm_request, clarification: dict[str, 
         if isinstance(option, str) and option.strip()
     ]
     matched_options = _extract_matching_clarification_options(user_text, options)
-    word_count = len(re.findall(r"\w+", user_text))
-    if not matched_options and (word_count > 8 or _looks_like_new_query(user_text)):
-        return False
 
     rewritten_sections = [
         "The user is replying to the previous clarification for the same dataset request.",
@@ -815,7 +817,11 @@ def build_normalize_clarification_after_model_callback(
             return None
 
         if callback_context is not None:
-            callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+            pending_clarification = dict(clarification)
+            topic_context = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+            if isinstance(topic_context, str) and topic_context.strip():
+                pending_clarification["topic_context"] = topic_context.strip()
+            callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = pending_clarification
 
         formatted_response = format_clarification_response(clarification)
         if not formatted_response:
@@ -906,6 +912,7 @@ def build_combined_before_model_callback(
     schema_summary = get_schema_summary(active_settings.db_path)
     schema_text = schema_summary.get("schema_text") or ""
     classifier = build_llm_scope_gate(active_settings.model, schema_text)
+    clarification_topic_classifier = build_llm_clarification_topic_gate(active_settings.model)
 
     scope_gate = build_scope_gate_callback(classifier)
     finalize = build_finalize_after_query_before_model_callback(active_settings)
@@ -913,14 +920,40 @@ def build_combined_before_model_callback(
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
+            user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+            if user_text:
+                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = user_text
             pending_clarification = _get_pending_clarification(callback_context.state)
             clarification_followup = False
             if pending_clarification is not None:
-                clarification_followup = _apply_pending_clarification_followup(
-                    llm_request,
-                    pending_clarification,
+                pending_options = [
+                    option
+                    for option in pending_clarification.get("options") or []
+                    if isinstance(option, str) and option.strip()
+                ]
+                has_option_match = bool(
+                    _extract_matching_clarification_options(user_text, pending_options)
                 )
-                _clear_pending_clarification_state(callback_context.state)
+                if has_option_match:
+                    clarification_followup = _apply_pending_clarification_followup(
+                        llm_request,
+                        pending_clarification,
+                    )
+                    if clarification_followup:
+                        _clear_pending_clarification_state(callback_context.state)
+                elif _pending_clarification_reply_is_topic_change(
+                    clarification_topic_classifier,
+                    pending_clarification,
+                    user_text,
+                ):
+                    _clear_pending_clarification_state(callback_context.state)
+                else:
+                    clarification_followup = _apply_pending_clarification_followup(
+                        llm_request,
+                        pending_clarification,
+                    )
+                    if clarification_followup:
+                        _clear_pending_clarification_state(callback_context.state)
             if clarification_followup:
                 return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 

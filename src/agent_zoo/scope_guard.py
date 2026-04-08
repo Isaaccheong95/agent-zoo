@@ -17,6 +17,34 @@ DEFAULT_REFUSAL_MESSAGE = (
 )
 
 
+def _run_litellm_classifier(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    *,
+    max_tokens: int,
+) -> str | None:
+    try:
+        import litellm
+
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    except Exception:
+        return None
+
+    return (response.choices[0].message.content or "").strip().upper()
+
+
 def build_llm_scope_gate(
     model: str,
     schema_text: str,
@@ -50,30 +78,75 @@ def build_llm_scope_gate(
     def classify(user_text: str) -> tuple[bool, str | None]:
         if not user_text or not user_text.strip():
             return True, None
-        try:
-            import litellm
-
-            response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                temperature=0.0,
-                max_tokens=300,  # give room for final IN_SCOPE/OUT_OF_SCOPE token
-                extra_body={
-                    # common for vLLM / HF chat-template based servers
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    # common for some Qwen/Ollama-style backends
-                    # "think": False,
-                },
-            )
-            verdict = (response.choices[0].message.content or "").strip().upper()
-
-        except Exception:
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            user_text,
+            max_tokens=300,
+        )
+        if verdict is None:
             return True, None  # Fail open on classifier error
         if "OUT_OF_SCOPE" in verdict:
             return False, refusal_message
         return True, None
+
+    return classify
+
+
+def build_llm_clarification_topic_gate(model: str):
+    """Return a classifier that decides whether a clarification reply changed topic.
+
+    The classifier returns True only when the latest user reply appears to start a
+    new request/topic instead of answering the pending clarification.
+    It fails open to False so clarification context is preserved on classifier
+    errors.
+    """
+
+    system_prompt = (
+        "You are a strict clarification-turn classifier for a dataset SQL agent.\n"
+        "You will receive the current dataset question/topic, the pending clarification question, "
+        "the available clarification options, and the latest user reply.\n\n"
+        "Reply with exactly one token:\n"
+        "  CLARIFICATION_REPLY - the latest user reply is still answering or refining the same dataset request, "
+        "even if it is brief, indirect, approximate, numeric, or refers to the options implicitly.\n"
+        "  TOPIC_CHANGE - the latest user reply starts a different request, changes to another topic, or is unrelated "
+        "to the pending clarification.\n\n"
+        "Output only CLARIFICATION_REPLY or TOPIC_CHANGE. No other text."
+    )
+
+    def classify(
+        topic_context: str,
+        clarification_question: str,
+        options: list[str],
+        user_reply: str,
+    ) -> bool:
+        if not user_reply or not user_reply.strip():
+            return False
+
+        options_text = "\n".join(
+            f"- {option}"
+            for option in options
+            if isinstance(option, str) and option.strip()
+        )
+        classifier_input = (
+            "Current dataset question/topic:\n"
+            f"{(topic_context or "").strip() or '[unknown]'}\n\n"
+            "Pending clarification question:\n"
+            f"{(clarification_question or "").strip() or '[unknown]'}\n\n"
+            "Available clarification options:\n"
+            f"{options_text or '[none]'}\n\n"
+            "Latest user reply:\n"
+            f"{user_reply.strip()}"
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=40,
+        )
+        if verdict is None:
+            return False
+        return "TOPIC_CHANGE" in verdict
 
     return classify
