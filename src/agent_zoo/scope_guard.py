@@ -227,7 +227,7 @@ def build_llm_clarification_resolver(model: str, *, debug: bool = False):
             model,
             system_prompt,
             classifier_input,
-            max_tokens=200,
+            max_tokens=500,
             debug_label="clarification-resolver" if debug else None,
             uppercase=False,
         )
