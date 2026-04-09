@@ -7,6 +7,7 @@ be run as a standalone script.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from typing import Any
@@ -21,6 +22,20 @@ _CLARIFICATION_METADATA_KEYS = {
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
 _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
+
+
+@dataclass(slots=True)
+class SQLResultViewModel:
+    """Deterministic contract for rendering final SQL result responses."""
+
+    status: str
+    sql: str
+    result_payload: str
+    query_summary_section: str
+    public_result_kind: str | None
+    matched_row_count: int | float | None
+    query_summary_context: dict[str, Any] | None
+    note: str | None = None
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -569,26 +584,64 @@ def _format_query_summary_section(tool_result: dict) -> str:
     return "What I matched:\n" + "\n".join(f"- {bullet}" for bullet in bullets)
 
 
-def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
+def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewModel:
     sql = tool_result.get("sql") or "Not executed"
     result_payload = format_result_payload(tool_result)
     query_summary_section = _format_query_summary_section(tool_result)
+    public_result_kind = tool_result.get("public_result_kind")
+    if not isinstance(public_result_kind, str):
+        public_result_kind = None
 
-    code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
-    result_block = f"```{code_block}\n{result_payload}\n```".strip()
-
-    output = "\n\n".join(
-        [
-            "Generated SQL:\n" f"```sql\n{sql}\n```",
-            query_summary_section,
-            "Result:\n" f"{result_block}",
-        ]
-    )
-
-    if tool_result.get("public_result_kind") == "detail_count_fallback":
-        output += (
-            "\n\nNote: Individual row-level data cannot be returned due to privacy guardrails. "
+    note = None
+    if public_result_kind == "detail_count_fallback":
+        note = (
+            "Note: Individual row-level data cannot be returned due to privacy guardrails. "
             "Only the number of matching records is shown."
         )
 
+    return SQLResultViewModel(
+        status=str(tool_result.get("status") or "error"),
+        sql=sql,
+        result_payload=result_payload,
+        query_summary_section=query_summary_section,
+        public_result_kind=public_result_kind,
+        matched_row_count=_get_matching_row_count(tool_result),
+        query_summary_context=(
+            tool_result.get("query_summary_context")
+            if isinstance(tool_result.get("query_summary_context"), dict)
+            else None
+        ),
+        note=note,
+    )
+
+
+def render_sql_result_view_model(view_model: SQLResultViewModel) -> str:
+    code_block = (
+        "json"
+        if view_model.result_payload.startswith("[") or view_model.result_payload.startswith("{")
+        else ""
+    )
+    result_block = f"```{code_block}\n{view_model.result_payload}\n```".strip()
+
+    output = "\n\n".join(
+        [
+            "Generated SQL:\n" f"```sql\n{view_model.sql}\n```",
+            view_model.query_summary_section,
+            "Result:\n" f"{result_block}",
+        ]
+    )
+    if view_model.note:
+        output += f"\n\n{view_model.note}"
     return output
+
+
+def format_public_query_result(tool_result: dict[str, Any]) -> str:
+    """Format a callback-owned public SQL result using the stable view model."""
+
+    return render_sql_result_view_model(build_sql_result_view_model(tool_result))
+
+
+def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
+    # explanation is retained for backward compatibility with existing call sites.
+    _ = explanation
+    return format_public_query_result(tool_result)

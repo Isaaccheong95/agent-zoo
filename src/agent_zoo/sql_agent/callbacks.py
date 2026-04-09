@@ -19,7 +19,7 @@ from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import (
     build_clarification_response,
     format_clarification_response,
-    format_structured_response,
+    format_public_query_result,
     normalize_clarification_response,
 )
 try:
@@ -39,6 +39,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
 
 
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
+SQL_PUBLIC_RESULT_RENDERED_STATE_KEY = "temp:sql_public_result_rendered"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
 SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
@@ -93,6 +94,7 @@ def _is_safe_aggregate_column(column_name: str) -> bool:
 def _clear_private_result_state(state: Any) -> None:
     for key in (
         SQL_PUBLIC_RESULT_STATE_KEY,
+        SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
         SQL_INTERNAL_RESULT_REF_STATE_KEY,
         SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     ):
@@ -125,6 +127,18 @@ def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
     if not isinstance(query_frame, dict):
         return None
     return query_frame
+
+
+def _mark_public_query_result_rendered(state: Any) -> None:
+    if state is None:
+        return
+    state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY] = True
+
+
+def _public_query_result_was_rendered(state: Any) -> bool:
+    if state is None or not hasattr(state, "get"):
+        return False
+    return bool(state.get(SQL_PUBLIC_RESULT_RENDERED_STATE_KEY))
 
 
 def _request_ends_with_tool_response(llm_request) -> bool:
@@ -1291,6 +1305,17 @@ def build_remember_query_result_callback(
     return remember_query_result
 
 
+def _render_public_query_result(public_query_result: dict[str, Any]) -> str:
+    return format_public_query_result(public_query_result)
+
+
+def _build_public_query_result_content(public_query_result: dict[str, Any]) -> types.Content:
+    return types.Content(
+        role="model",
+        parts=[types.Part(text=_render_public_query_result(public_query_result))],
+    )
+
+
 def build_format_final_agent_response_callback(
     settings: SQLAgentSettings | None = None,
 ):
@@ -1299,14 +1324,15 @@ def build_format_final_agent_response_callback(
         if context is None:
             return None
 
+        if _public_query_result_was_rendered(context.state):
+            return None
+
         public_query_result = context.state.get(SQL_PUBLIC_RESULT_STATE_KEY)
         if not isinstance(public_query_result, dict):
             return None
 
-        return types.Content(
-            role="model",
-            parts=[types.Part(text=format_structured_response(public_query_result))],
-        )
+        _mark_public_query_result_rendered(context.state)
+        return _build_public_query_result_content(public_query_result)
 
     return format_final_agent_response
 
@@ -1391,12 +1417,8 @@ def build_finalize_after_query_before_model_callback(
         if not isinstance(public_query_result, dict):
             return None
 
-        return LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[types.Part(text=format_structured_response(public_query_result))],
-            )
-        )
+        _mark_public_query_result_rendered(context.state)
+        return LlmResponse(content=_build_public_query_result_content(public_query_result))
 
     return finalize_after_query
 

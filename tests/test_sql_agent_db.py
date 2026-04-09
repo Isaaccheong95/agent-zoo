@@ -28,6 +28,7 @@ from agent_zoo.sql_agent.callbacks import (
     SQL_LAST_QUERY_FRAME_STATE_KEY,
     SQL_PENDING_CLARIFICATION_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
+    SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
     build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
@@ -36,6 +37,10 @@ from agent_zoo.sql_agent.callbacks import (
 )
 from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
+from agent_zoo.sql_agent.formatting import (
+    build_sql_result_view_model,
+    render_sql_result_view_model,
+)
 from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
 from agent_zoo.sql_agent.tools import build_sql_tools
@@ -1237,29 +1242,28 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
         callback = build_finalize_after_query_before_model_callback(settings)
+        state = {
+            SQL_PUBLIC_RESULT_STATE_KEY: {
+                "status": "success",
+                "db_path": "fixture.sqlite",
+                "sql": "SELECT COUNT(*) AS matching_count FROM people",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 4}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "matched_row_count": 4,
+                "public_result_kind": "count_aggregate",
+                "query_summary_context": {
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    ]
+                },
+            }
+        }
         result = callback(
-            callback_context=SimpleNamespace(
-                state={
-                    SQL_PUBLIC_RESULT_STATE_KEY: {
-                        "status": "success",
-                        "db_path": "fixture.sqlite",
-                        "sql": "SELECT COUNT(*) AS matching_count FROM people",
-                        "columns": ["matching_count"],
-                        "rows": [{"matching_count": 4}],
-                        "row_count": 1,
-                        "preview_row_count": 1,
-                        "truncated": False,
-                        "error": None,
-                        "matched_row_count": 4,
-                        "public_result_kind": "count_aggregate",
-                        "query_summary_context": {
-                            "categorical_filters": [
-                                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
-                            ]
-                        },
-                    }
-                }
-            ),
+            callback_context=SimpleNamespace(state=state),
             llm_request=SimpleNamespace(),
         )
 
@@ -1272,6 +1276,107 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIn("```", response_text)
         self.assertIn("4", response_text)
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
+        self.assertTrue(state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY])
+
+    def test_after_agent_callback_is_fallback_once_before_model_has_rendered(self) -> None:
+        settings = self._settings()
+        finalize = build_finalize_after_query_before_model_callback(settings)
+        after_agent = build_format_final_agent_response_callback(settings)
+        state = {
+            SQL_PUBLIC_RESULT_STATE_KEY: {
+                "status": "success",
+                "db_path": "fixture.sqlite",
+                "sql": "SELECT COUNT(*) AS matching_count FROM people",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 4}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "matched_row_count": 4,
+                "public_result_kind": "count_aggregate",
+                "query_summary_context": {
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    ]
+                },
+            }
+        }
+
+        result = finalize(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=SimpleNamespace(),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY])
+        self.assertIsNone(after_agent(SimpleNamespace(state=state)))
+
+    def test_build_sql_result_view_model_keeps_critical_fields(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND age > 46",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "detail_count_fallback",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+                "comparison_filters": [
+                    {"column": "age", "operator": ">", "value": "46"},
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+
+        self.assertEqual(model.status, "success")
+        self.assertEqual(model.sql, tool_result["sql"])
+        self.assertEqual(model.public_result_kind, "detail_count_fallback")
+        self.assertEqual(model.matched_row_count, 12)
+        self.assertEqual(model.query_summary_context, tool_result["query_summary_context"])
+        self.assertIn("privacy guardrails", model.note or "")
+
+    def test_render_sql_result_view_model_matches_existing_formatter_output(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female'",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "count_aggregate",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+        rendered = render_sql_result_view_model(model)
+
+        callback = build_format_final_agent_response_callback(self._settings())
+        content = callback(SimpleNamespace(state={SQL_PUBLIC_RESULT_STATE_KEY: tool_result}))
+        self.assertIsNotNone(content)
+        self.assertEqual(rendered, content.parts[0].text)
 
     def test_after_model_callback_formats_structured_clarification_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
