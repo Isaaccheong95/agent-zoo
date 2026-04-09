@@ -121,6 +121,67 @@ def _normalize_selected_identifier(selected_identifier: Any, identifiers: list[s
     return identifier_lookup.get(_normalize_resolution_text(selected_identifier), "")
 
 
+def _normalize_selected_identifiers(selected_identifiers: Any, identifiers: list[str]) -> list[str]:
+    if not isinstance(selected_identifiers, list):
+        return []
+
+    identifier_lookup: dict[str, str] = {}
+    for identifier in identifiers:
+        normalized_identifier = _normalize_resolution_text(identifier)
+        if normalized_identifier and normalized_identifier not in identifier_lookup:
+            identifier_lookup[normalized_identifier] = identifier
+
+    normalized_matches: list[str] = []
+    seen_identifiers: set[str] = set()
+    for selected_identifier in selected_identifiers:
+        if not isinstance(selected_identifier, str):
+            continue
+        canonical_identifier = identifier_lookup.get(
+            _normalize_resolution_text(selected_identifier)
+        )
+        if canonical_identifier and canonical_identifier not in seen_identifiers:
+            seen_identifiers.add(canonical_identifier)
+            normalized_matches.append(canonical_identifier)
+    return normalized_matches
+
+
+def _normalize_grounded_filters(
+    grounded_filters: Any,
+    candidate_columns: list[str],
+    candidate_values_by_column: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    if not isinstance(grounded_filters, list):
+        return {}
+
+    normalized_filters: dict[str, list[str]] = {}
+    for entry in grounded_filters:
+        if not isinstance(entry, dict):
+            continue
+
+        column_name = _normalize_selected_identifier(entry.get("column"), candidate_columns)
+        if not column_name:
+            continue
+
+        allowed_values = [
+            value
+            for value in candidate_values_by_column.get(column_name) or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not allowed_values:
+            continue
+
+        selected_values = _normalize_selected_options(entry.get("selected_values"), allowed_values)
+        if not selected_values or len(selected_values) >= len(allowed_values):
+            continue
+
+        existing_values = normalized_filters.setdefault(column_name, [])
+        for value in selected_values:
+            if value not in existing_values:
+                existing_values.append(value)
+
+    return normalized_filters
+
+
 def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
     return {
         "resolution_type": "custom_rule",
@@ -472,6 +533,139 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
             "target_column": "",
             "selected_values": [],
             "refinement_request": "",
+        }
+
+    return resolve
+
+
+def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
+    """Return a resolver for fresh-turn schema interpretation ambiguity.
+
+    The resolver decides whether a user request already grounds any exact
+    categorical filters from dataset-backed candidates and whether unresolved
+    field ambiguity remains that requires a pre-query clarification.
+    """
+
+    system_prompt = (
+        "You are a strict schema-grounding resolver for a dataset SQL agent.\n"
+        "You will receive the latest user request, the available schema columns, and dataset-backed categorical grounding candidates.\n"
+        "Your job is to do two things before any SQL is generated:\n"
+        "1. Identify any exact categorical dataset values that are already clearly grounded by the user's wording.\n"
+        "2. Decide whether unresolved field-level ambiguity remains between multiple plausible schema columns.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"proceed|needs_clarification","grounded_filters":[{"column":"...","selected_values":["..."]}],"candidate_columns":["..."]}\n\n'
+        "Rules:\n"
+        "- grounded_filters must use only exact column identifiers and exact dataset values from the provided grounding candidates.\n"
+        "- Ground a categorical filter only when the user's wording clearly implies that exact value. If support is weak or multiple values are similarly plausible, do not ground it.\n"
+        "- Do not ground a column to all of its available values. That is equivalent to no filter.\n"
+        "- candidate_columns must represent only unresolved field interpretations after applying any grounded_filters. Do not include fields already grounded to a specific value or filter.\n"
+        "- Use resolution_type='needs_clarification' only when two or more provided schema columns remain plausible interpretations of the user's wording and the request does not clearly choose one.\n"
+        "- Use resolution_type='proceed' when the request is already specific enough, when no nearby competing schema interpretation exists, or when any ambiguity is only about values within a single chosen column.\n"
+        "- candidate_columns must contain only exact identifiers from the provided schema column list and must be ordered best-first.\n"
+        "- When resolution_type='needs_clarification', include 2 to 4 candidate_columns.\n"
+        "- When resolution_type='proceed', candidate_columns must be empty.\n"
+        "- Prefer clarification over guessing. If you are not confident, leave the concept unresolved instead of grounding it.\n"
+        "- This resolver is only for schema interpretation ambiguity, not for value-level ambiguity inside one chosen column.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def resolve(
+        user_text: str,
+        schema_context: str,
+        grounding_candidates: list[dict[str, Any]],
+        candidate_columns: list[str],
+    ) -> dict[str, Any]:
+        if not user_text or not user_text.strip() or not schema_context.strip() or not candidate_columns:
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {},
+                "candidate_columns": [],
+            }
+
+        candidate_value_map: dict[str, list[str]] = {}
+        grounding_candidate_lines: list[str] = []
+        for entry in grounding_candidates or []:
+            if not isinstance(entry, dict):
+                continue
+            column_name = _normalize_selected_identifier(entry.get("column"), candidate_columns)
+            candidate_value = str(entry.get("candidate_value") or "").strip()
+            if not column_name or not candidate_value:
+                continue
+            column_values = candidate_value_map.setdefault(column_name, [])
+            if candidate_value not in column_values:
+                column_values.append(candidate_value)
+            grounding_candidate_lines.append(json.dumps(entry, sort_keys=True))
+
+        classifier_input = (
+            "Schema column identifiers you may return:\n"
+            + "\n".join(f"- {identifier}" for identifier in candidate_columns)
+            + "\n\nCategorical grounding candidates:\n"
+            + ("\n".join(f"- {line}" for line in grounding_candidate_lines) or "[none]")
+            + "\n\n"
+            + "Schema columns and previews:\n"
+            + schema_context.strip()
+            + "\n\nLatest user request:\n"
+            + user_text.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=500,
+            debug_label="schema-grounding-resolver" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {},
+                "candidate_columns": [],
+            }
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-resolver",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {},
+                "candidate_columns": [],
+            }
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        normalized_grounded_filters = _normalize_grounded_filters(
+            parsed_response.get("grounded_filters"),
+            candidate_columns,
+            candidate_value_map,
+        )
+        normalized_candidate_columns = _normalize_selected_identifiers(
+            parsed_response.get("candidate_columns"),
+            candidate_columns,
+        )
+        if normalized_grounded_filters:
+            grounded_columns = set(normalized_grounded_filters)
+            normalized_candidate_columns = [
+                identifier
+                for identifier in normalized_candidate_columns
+                if identifier not in grounded_columns
+            ]
+
+        if resolution_type == "needs_clarification" and len(normalized_candidate_columns) >= 2:
+            return {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": normalized_grounded_filters,
+                "candidate_columns": normalized_candidate_columns[:4],
+            }
+
+        return {
+            "resolution_type": "proceed",
+            "grounded_filters": normalized_grounded_filters,
+            "candidate_columns": [],
         }
 
     return resolve

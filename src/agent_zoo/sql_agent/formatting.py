@@ -14,11 +14,16 @@ from typing import Any
 
 
 _CLARIFICATION_METADATA_KEYS = {
+    "clarification_kind",
     "clarification",
     "options",
     "response_type",
     "user_message",
 }
+
+CLARIFICATION_KIND_CATEGORICAL_VALUES = "categorical_values"
+CLARIFICATION_KIND_GENERIC = "generic"
+CLARIFICATION_KIND_INTERPRETATION = "interpretation"
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
 _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
@@ -69,7 +74,21 @@ def _unwrap_json_code_fence(value: str) -> str:
     return "\n".join(lines[1:-1]).strip()
 
 
-def _clean_option_text(value: str) -> str | None:
+def _normalize_clarification_kind(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    normalized_value = _normalize_whitespace(value).lower()
+    if normalized_value in {
+        CLARIFICATION_KIND_CATEGORICAL_VALUES,
+        CLARIFICATION_KIND_GENERIC,
+        CLARIFICATION_KIND_INTERPRETATION,
+    }:
+        return normalized_value
+    return None
+
+
+def _clean_option_text(value: str, *, clarification_kind: str | None = None) -> str | None:
     candidate = re.sub(r"^\s*(?:[-*•]|\d+\s*[.)-])\s*", "", value).strip()
     candidate = candidate.strip("`\"'")
     candidate = _normalize_whitespace(candidate)
@@ -77,6 +96,15 @@ def _clean_option_text(value: str) -> str | None:
         return None
     if candidate.casefold() in _CLARIFICATION_METADATA_KEYS:
         return None
+
+    if clarification_kind == CLARIFICATION_KIND_INTERPRETATION:
+        if any(char in candidate for char in "{}[]"):
+            return None
+        if candidate.endswith(("?", ".", ":", ";")):
+            return None
+        if len(candidate.split()) > 12 or len(candidate) > 120:
+            return None
+        return candidate
 
     if " - " in candidate:
         candidate = candidate.split(" - ", 1)[0].strip()
@@ -96,6 +124,36 @@ def _clean_option_text(value: str) -> str | None:
     if len(candidate.split()) > 6 or len(candidate) > 60:
         return None
     return candidate
+
+
+def _looks_like_interpretation_clarification(
+    user_message: str | None,
+    options: list[str] | None = None,
+    raw_text: str | None = None,
+) -> bool:
+    normalized_message = _normalize_whitespace(user_message or "")
+    if normalized_message and re.search(r"\bdo\s+you\s+mean\b", normalized_message, flags=re.IGNORECASE):
+        return True
+    if normalized_message and re.search(
+        r"\bwhich\s+(?:column|field|interpretation|meaning|concept|measure|dimension)\b",
+        normalized_message,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    raw_candidates = [
+        value
+        for value in (options or [])
+        if isinstance(value, str) and value.strip()
+    ]
+    if any(re.search(r"\([A-Za-z_][A-Za-z0-9_]*\)", value) for value in raw_candidates):
+        return True
+
+    normalized_raw_text = _normalize_whitespace(raw_text or "")
+    if normalized_raw_text and re.search(r"\bdo\s+you\s+mean\b", normalized_raw_text, flags=re.IGNORECASE):
+        return True
+
+    return False
 
 
 def _extract_jsonish_options(raw_text: str) -> list[str]:
@@ -175,11 +233,14 @@ def _strip_inline_options_from_user_message(user_message: str, options: list[str
 def build_clarification_response(
     user_message: str | None,
     options: list[str] | None = None,
+    *,
+    clarification_kind: str | None = None,
 ) -> dict[str, Any]:
+    normalized_kind = _normalize_clarification_kind(clarification_kind)
     cleaned_options = [
         option
         for option in (
-            _clean_option_text(value)
+            _clean_option_text(value, clarification_kind=normalized_kind)
             for value in (options or [])
         )
         if option is not None
@@ -193,11 +254,16 @@ def build_clarification_response(
     }
     if normalized_message:
         response["user_message"] = normalized_message
+    if normalized_kind:
+        response["clarification_kind"] = normalized_kind
     return response
 
 
 def build_fallback_clarification_response() -> dict[str, Any]:
-    return build_clarification_response(_FALLBACK_CLARIFICATION_MESSAGE)
+    return build_clarification_response(
+        _FALLBACK_CLARIFICATION_MESSAGE,
+        clarification_kind=CLARIFICATION_KIND_GENERIC,
+    )
 
 
 def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
@@ -230,7 +296,15 @@ def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
                 return None
             options.append(option)
 
-    return build_clarification_response(user_message, options)
+    inferred_kind = _normalize_clarification_kind(payload.get("clarification_kind"))
+    if inferred_kind is None and _looks_like_interpretation_clarification(user_message, options, candidate):
+        inferred_kind = CLARIFICATION_KIND_INTERPRETATION
+
+    return build_clarification_response(
+        user_message,
+        options,
+        clarification_kind=inferred_kind,
+    )
 
 
 def _extract_quoted_options(raw_text: str) -> list[str]:
@@ -405,19 +479,24 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
         if clarification is not None:
             return clarification
 
+    jsonish_option_candidates = _extract_jsonish_options(raw_text)
     jsonish_options = [
-        option for option in (_clean_option_text(value) for value in _extract_jsonish_options(raw_text))
+        option for option in (_clean_option_text(value) for value in jsonish_option_candidates)
         if option is not None
     ]
     if jsonish_options:
         options = _dedupe_preserve_order(jsonish_options)[:10]
+        raw_option_candidates = jsonish_option_candidates
     else:
+        raw_option_candidates = [
+            *_extract_quoted_options(raw_text),
+            *_extract_line_options(raw_text),
+        ]
         options = _dedupe_preserve_order(
             [
                 option
                 for option in [
-                    *(_clean_option_text(value) for value in _extract_quoted_options(raw_text)),
-                    *(_clean_option_text(value) for value in _extract_line_options(raw_text)),
+                    *(_clean_option_text(value) for value in raw_option_candidates),
                 ]
                 if option is not None
             ]
@@ -427,7 +506,17 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     options = _prune_subject_echo_options(user_message, options)
     if user_message is None and not options:
         return None
-    return build_clarification_response(user_message, options)
+
+    inferred_kind = (
+        CLARIFICATION_KIND_INTERPRETATION
+        if _looks_like_interpretation_clarification(user_message, raw_option_candidates, raw_text)
+        else None
+    )
+    return build_clarification_response(
+        user_message,
+        raw_option_candidates if inferred_kind == CLARIFICATION_KIND_INTERPRETATION else options,
+        clarification_kind=inferred_kind,
+    )
 
 
 def _augment_clarification_user_message(user_message: str, options: list[Any]) -> str:
