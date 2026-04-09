@@ -516,6 +516,7 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
         "Reply with exactly one JSON object using this schema:\n"
         '{"resolution_type":"proceed|needs_clarification","candidate_columns":["..."]}\n\n'
         "Rules:\n"
+        "- candidate_columns must represent only unresolved field interpretations. Do not include fields that are already clearly grounded from the user's wording to a specific value or filter.\n"
         "- Use resolution_type='needs_clarification' only when two or more provided schema columns are plausible interpretations of the user's wording and the request does not clearly choose one.\n"
         "- Use resolution_type='proceed' when the request is already specific enough, when no nearby competing schema interpretation exists, or when any ambiguity is only about values within a single column.\n"
         "- candidate_columns must contain only exact identifiers from the provided schema column list and must be ordered best-first.\n"

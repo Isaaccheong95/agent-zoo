@@ -2189,6 +2189,64 @@ Which category or combination should I use for \"alcoholic\"?
                 self.assertIn(f"User clarification reply: {reply_text}", rewritten_text)
                 self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
+    def test_combined_before_model_callback_rewrites_wrapped_numeric_interpretation_followup(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {"resolution_type": "topic_change", "selected_options": [], "custom_rule": ""}
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "topic_context": "how many guys drink",
+                "user_message": "I found more than one nearby schema field for this request. Which one do you mean?",
+                "options": ["Gender", "Smoking status", "Alcohol consumption status"],
+                "clarification_kind": "interpretation",
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "The SQLite database is a snapshot of the current filtered cohort from the web app.\n"
+                                "Use only the table `filtered_dataset`.\n\n"
+                                "User question:\n"
+                                "3"
+                            )
+                        )
+                    ],
+                )
+            ]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(resolver_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Clarification question: I found more than one nearby schema field for this request. Which one do you mean?", rewritten_text)
+        self.assertIn("Matched options from the reply: Alcohol consumption status", rewritten_text)
+        self.assertIn("User clarification reply: 3", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
     def test_combined_before_model_callback_skips_scope_gate_for_selection_like_followup(self) -> None:
         scope_gate_calls: list[str] = []
         resolver_calls: list[tuple[str, str, list[str], str]] = []
@@ -2401,6 +2459,77 @@ Which category or combination should I use for \"alcoholic\"?
         rewritten_text = llm_request.contents[-1].parts[0].text
         self.assertIn("Resolved custom rule from the reply: match any drinking category", rewritten_text)
         self.assertIn("User clarification reply: match any drinking category", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+    def test_combined_before_model_callback_uses_effective_wrapped_reply_for_custom_rule(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {
+                "resolution_type": "custom_rule",
+                "selected_options": [],
+                "custom_rule": user_reply,
+            }
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "topic_context": "how many guys drink",
+                "user_message": "I found more than one nearby schema field for this request. Which one do you mean?",
+                "options": ["Smoking status", "Alcohol consumption status"],
+                "clarification_kind": "interpretation",
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "The SQLite database is a snapshot of the current filtered cohort from the web app.\n"
+                                "Use only the table `filtered_dataset`.\n\n"
+                                "User question:\n"
+                                "only alcohol"
+                            )
+                        )
+                    ],
+                )
+            ]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(
+            resolver_calls,
+            [
+                (
+                    "how many guys drink",
+                    "I found more than one nearby schema field for this request. Which one do you mean?",
+                    ["Smoking status", "Alcohol consumption status"],
+                    "only alcohol",
+                )
+            ],
+        )
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Resolved custom rule from the reply: only alcohol", rewritten_text)
+        self.assertIn("User clarification reply: only alcohol", rewritten_text)
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
     def test_combined_before_model_callback_turns_result_refinement_into_clarification(self) -> None:
@@ -2644,6 +2773,7 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIsNotNone(result)
         self.assertEqual(scope_gate_calls, ["how many females drink"])
         self.assertEqual(len(schema_grounding_calls), 1)
+        self.assertEqual(schema_grounding_calls[0][2], ["socalc", "socsmk"])
         response_text = result.content.parts[0].text
         self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
         self.assertIn("1. Alcohol consumption", response_text)
@@ -2663,6 +2793,112 @@ Which category or combination should I use for \"alcoholic\"?
             {
                 "Alcohol consumption": "socalc",
                 "Smoking status": "socsmk",
+            },
+        )
+
+    def test_combined_before_model_callback_uses_request_glossary_and_excludes_grounded_gender(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_schema_grounding_resolver(user_text: str, schema_context: str, candidate_columns: list[str]) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, candidate_columns))
+            return {
+                "resolution_type": "needs_clarification",
+                "candidate_columns": ["socsmk", "socalc"],
+            }
+
+        wrapped_prompt = (
+            "The SQLite database is a snapshot of the current filtered cohort from the web app.\n"
+            "Use only the table `filtered_dataset`.\n\n"
+            "Field glossary:\n"
+            "- gender: Sex of patient (categorical)\n"
+            "- socsmk: Smoking status (categorical)\n"
+            "- socalc: Alcohol consumption status (categorical)\n\n"
+            "When the question uses clinician-facing labels, map them to the matching SQLite column names.\n"
+            "Use actual schema column names in the SQL you generate.\n\n"
+            "User question:\n"
+            "how many guys drink"
+        )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socsmk TEXT, socalc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text=wrapped_prompt)])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(scope_gate_calls, ["how many guys drink"])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        self.assertEqual(schema_grounding_calls[0][0], "how many guys drink")
+        self.assertEqual(schema_grounding_calls[0][2], ["socsmk", "socalc"])
+        self.assertIn("Already grounded categorical filters from the user wording", schema_grounding_calls[0][1])
+        self.assertIn("- gender = Male", schema_grounding_calls[0][1])
+        response_text = result.content.parts[0].text
+        self.assertIn("1. Smoking status", response_text)
+        self.assertIn("2. Alcohol consumption status", response_text)
+        self.assertNotIn("1. gender", response_text)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["grounded_filters"],
+            {"gender": ["Male"]},
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["option_columns"],
+            {
+                "Smoking status": "socsmk",
+                "Alcohol consumption status": "socalc",
             },
         )
 

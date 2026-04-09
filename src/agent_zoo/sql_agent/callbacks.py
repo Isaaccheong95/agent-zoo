@@ -62,6 +62,10 @@ SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "max",
     "maximum",
 )
+OBVIOUS_CATEGORICAL_VALUE_ALIASES = {
+    "female": {"female", "females", "girl", "girls", "lady", "ladies", "woman", "women"},
+    "male": {"boy", "boys", "guy", "guys", "male", "males", "man", "men"},
+}
 
 
 def _print_clarification_debug(settings: SQLAgentSettings, stage: str, payload: Any) -> None:
@@ -211,6 +215,146 @@ def _normalize_allowed_values(values: list[str], allowed_values: list[str]) -> l
             seen_values.add(canonical_value)
             normalized_values.append(canonical_value)
     return normalized_values
+
+
+def _extract_request_field_glossary(user_text: str) -> dict[str, str]:
+    glossary: dict[str, str] = {}
+    in_field_glossary = False
+
+    for raw_line in user_text.splitlines():
+        line = raw_line.strip()
+        if not in_field_glossary:
+            if line.casefold() == "field glossary:":
+                in_field_glossary = True
+            continue
+
+        if not line:
+            if glossary:
+                break
+            continue
+
+        bullet_match = re.match(r"^(?:[-*•])\s*(.+)$", line)
+        if bullet_match is None:
+            if glossary:
+                break
+            continue
+
+        entry_text = bullet_match.group(1).strip()
+        column_name = ""
+        label_text = ""
+        if ":" in entry_text:
+            raw_column_name, raw_label_text = entry_text.split(":", 1)
+            column_name = raw_column_name.strip()
+            label_text = raw_label_text.strip()
+        else:
+            name_match = re.match(r"^(?P<column>[A-Za-z_][A-Za-z0-9_]*)", entry_text)
+            if name_match is not None:
+                column_name = name_match.group("column").strip()
+                label_text = column_name
+
+        if not column_name:
+            continue
+
+        normalized_label = re.sub(
+            r"\s*\((?:categorical|date|numeric|other)\)\s*$",
+            "",
+            label_text,
+            flags=re.IGNORECASE,
+        ).strip()
+        glossary[column_name.casefold()] = normalized_label or column_name
+
+    return glossary
+
+
+def _extract_user_turn_texts(llm_request) -> tuple[str, str]:
+    raw_user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+    effective_user_text = _extract_topic_context_text(raw_user_text)
+    return raw_user_text, effective_user_text or raw_user_text.strip()
+
+
+def _iter_schema_grounding_columns(schema_summary: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    tables = schema_summary.get("tables") or []
+    if not isinstance(tables, list):
+        return []
+
+    name_counts: dict[str, int] = {}
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+            normalized_column_name = column_name.casefold()
+            name_counts[normalized_column_name] = name_counts.get(normalized_column_name, 0) + 1
+
+    schema_columns: list[tuple[str, str, dict[str, Any]]] = []
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        table_name = str(table.get("name") or "").strip()
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+
+            identifier = column_name
+            if name_counts.get(column_name.casefold(), 0) > 1 and table_name:
+                identifier = f"{table_name}.{column_name}"
+            schema_columns.append((identifier, column_name, column))
+
+    return schema_columns
+
+
+def _build_obvious_grounded_filters(
+    user_text: str,
+    schema_summary: dict[str, Any],
+) -> dict[str, list[str]]:
+    normalized_user_text = _normalize_match_text(user_text)
+    if not normalized_user_text:
+        return {}
+
+    grounded_filters: dict[str, list[str]] = {}
+    for identifier, _column_name, column in _iter_schema_grounding_columns(schema_summary):
+        categorical_values = [
+            value.strip()
+            for value in column.get("categorical_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if len(categorical_values) < 2:
+            continue
+
+        matched_values: list[str] = []
+        seen_values: set[str] = set()
+        for categorical_value in categorical_values:
+            normalized_value = _normalize_match_text(categorical_value)
+            if normalized_value and re.search(
+                rf"(?<!\w){re.escape(normalized_value)}(?!\w)",
+                normalized_user_text,
+            ):
+                if categorical_value not in seen_values:
+                    seen_values.add(categorical_value)
+                    matched_values.append(categorical_value)
+                continue
+
+            for alias in OBVIOUS_CATEGORICAL_VALUE_ALIASES.get(normalized_value, set()):
+                normalized_alias = _normalize_match_text(alias)
+                if not normalized_alias:
+                    continue
+                if re.search(rf"(?<!\w){re.escape(normalized_alias)}(?!\w)", normalized_user_text):
+                    if categorical_value not in seen_values:
+                        seen_values.add(categorical_value)
+                        matched_values.append(categorical_value)
+                    break
+
+        if 0 < len(matched_values) < len(categorical_values):
+            grounded_filters[identifier] = matched_values
+
+    return grounded_filters
 
 
 def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
@@ -556,81 +700,87 @@ def _match_clarification_values_to_schema_guidance(
     return normalized_clarification
 
 
-def _build_schema_grounding_catalog(schema_summary: dict[str, Any]) -> dict[str, Any]:
-    tables = schema_summary.get("tables") or []
-    if not isinstance(tables, list):
+def _build_schema_grounding_catalog(
+    schema_summary: dict[str, Any],
+    *,
+    request_field_glossary: dict[str, str] | None = None,
+    grounded_filters: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    schema_columns = _iter_schema_grounding_columns(schema_summary)
+    if not schema_columns:
         return {
             "context_text": "",
             "candidate_columns": [],
             "option_labels": {},
         }
 
-    name_counts: dict[str, int] = {}
-    for table in tables:
-        if not isinstance(table, dict):
-            continue
-        for column in table.get("columns") or []:
-            if not isinstance(column, dict):
-                continue
-            column_name = str(column.get("name") or "").strip()
-            if not column_name:
-                continue
-            normalized_column_name = column_name.casefold()
-            name_counts[normalized_column_name] = name_counts.get(normalized_column_name, 0) + 1
-
     context_lines: list[str] = []
+    active_glossary = request_field_glossary or {}
+    active_grounded_filters = grounded_filters or {}
+    if active_grounded_filters:
+        context_lines.append("Already grounded categorical filters from the user wording:")
+        for identifier, selected_values in active_grounded_filters.items():
+            normalized_values = [
+                value.strip()
+                for value in selected_values
+                if isinstance(value, str) and value.strip()
+            ]
+            if not normalized_values:
+                continue
+            context_lines.append(f"- {identifier} = {', '.join(normalized_values)}")
+
     candidate_columns: list[str] = []
     option_labels: dict[str, str] = {}
     used_option_label_keys: set[str] = set()
-    for table in tables:
-        if not isinstance(table, dict):
+    for identifier, column_name, column in schema_columns:
+        if identifier in active_grounded_filters:
             continue
-        table_name = str(table.get("name") or "").strip()
-        for column in table.get("columns") or []:
-            if not isinstance(column, dict):
-                continue
-            column_name = str(column.get("name") or "").strip()
-            if not column_name:
-                continue
 
-            identifier = column_name
-            if name_counts.get(column_name.casefold(), 0) > 1 and table_name:
-                identifier = f"{table_name}.{column_name}"
+        candidate_columns.append(identifier)
+        declared_type = str(column.get("type") or "TEXT").strip() or "TEXT"
+        categorical_values = [
+            value.strip()
+            for value in column.get("categorical_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        request_field_label = _humanize_schema_label(
+            active_glossary.get(column_name.casefold())
+            or active_glossary.get(identifier.casefold())
+            or ""
+        )
+        source_header = _humanize_schema_label(str(column.get("source_header") or ""))
+        line = f"- {identifier} ({declared_type})"
+        line_details: list[str] = []
+        if request_field_label:
+            line_details.append(f"field label = {request_field_label}")
+        elif source_header:
+            line_details.append(f"dataset label = {source_header}")
+        if categorical_values:
+            preview_values = categorical_values[:4]
+            preview_text = ", ".join(preview_values)
+            if len(categorical_values) > len(preview_values):
+                preview_text += ", ..."
+            line_details.append(f"categorical values = {preview_text}")
+        if line_details:
+            line += ": " + "; ".join(line_details)
 
-            candidate_columns.append(identifier)
-            declared_type = str(column.get("type") or "TEXT").strip() or "TEXT"
-            categorical_values = [
-                value.strip()
-                for value in column.get("categorical_values") or []
-                if isinstance(value, str) and value.strip()
-            ]
-            source_header = _humanize_schema_label(str(column.get("source_header") or ""))
-            line = f"- {identifier} ({declared_type})"
-            line_details: list[str] = []
-            if source_header:
-                line_details.append(f"dataset label = {source_header}")
-            if categorical_values:
-                preview_values = categorical_values[:4]
-                preview_text = ", ".join(preview_values)
-                if len(categorical_values) > len(preview_values):
-                    preview_text += ", ..."
-                line_details.append(f"categorical values = {preview_text}")
-            if line_details:
-                line += ": " + "; ".join(line_details)
+        option_label = ""
+        if request_field_label:
+            option_label = request_field_label
+            if option_label.casefold() in used_option_label_keys:
+                option_label = f"{request_field_label} ({identifier})"
+        elif source_header:
+            option_label = source_header
+            if option_label.casefold() in used_option_label_keys:
+                option_label = f"{source_header} ({identifier})"
+        elif categorical_values:
+            option_label = f"{identifier} (values: {preview_text})"
+        else:
+            option_label = identifier
 
-            option_label = ""
-            if source_header:
-                option_label = source_header
-                if option_label.casefold() in used_option_label_keys:
-                    option_label = f"{source_header} ({identifier})"
-            elif categorical_values:
-                option_label = f"{identifier} (values: {preview_text})"
-            else:
-                option_label = identifier
-
-            option_labels[identifier] = option_label
-            used_option_label_keys.add(option_label.casefold())
-            context_lines.append(line)
+        option_labels[identifier] = option_label
+        used_option_label_keys.add(option_label.casefold())
+        context_lines.append(line)
 
     return {
         "context_text": "\n".join(context_lines),
@@ -643,6 +793,8 @@ def _build_schema_grounding_clarification(
     topic_context: str,
     candidate_columns: list[str],
     schema_grounding_catalog: dict[str, Any],
+    *,
+    grounded_filters: dict[str, list[str]] | None = None,
 ) -> dict[str, Any] | None:
     option_labels = schema_grounding_catalog.get("option_labels") or {}
     selected_options: list[str] = []
@@ -667,6 +819,15 @@ def _build_schema_grounding_clarification(
     if topic_context:
         clarification["topic_context"] = topic_context
     clarification["option_columns"] = option_columns
+    if grounded_filters:
+        clarification["grounded_filters"] = {
+            identifier: [
+                value
+                for value in selected_values
+                if isinstance(value, str) and value.strip()
+            ]
+            for identifier, selected_values in grounded_filters.items()
+        }
     return clarification
 
 
@@ -823,7 +984,7 @@ def _apply_last_query_refinement_followup(
 
 
 def _apply_pending_clarification_followup(llm_request, clarification: dict[str, Any]) -> bool:
-    user_text = _extract_last_user_text(llm_request)
+    _raw_user_text, user_text = _extract_user_turn_texts(llm_request)
     if not user_text:
         return False
 
@@ -859,6 +1020,23 @@ def _apply_pending_clarification_followup_with_resolution(
         rewritten_sections.append(
             "Available options:\n" + "\n".join(f"- {option}" for option in options)
         )
+    grounded_filters = clarification.get("grounded_filters")
+    if isinstance(grounded_filters, dict):
+        grounded_lines = []
+        for column_name, selected_values in grounded_filters.items():
+            normalized_values = [
+                value
+                for value in selected_values or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if not isinstance(column_name, str) or not column_name.strip() or not normalized_values:
+                continue
+            grounded_lines.append(f"- {column_name} = {', '.join(normalized_values)}")
+        if grounded_lines:
+            rewritten_sections.append(
+                "Already grounded categorical filters from the original request:\n"
+                + "\n".join(grounded_lines)
+            )
     if resolved_options:
         rewritten_sections.append(
             "Matched options from the reply: " + ", ".join(resolved_options)
@@ -1659,7 +1837,7 @@ def build_scope_gate_callback(
         if _request_ends_with_tool_response(llm_request):
             return None
 
-        user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+        _raw_user_text, user_text = _extract_user_turn_texts(llm_request)
         if debug:
             print(f"[debug][sql-scope-gate][user-prompt]\n{user_text}")
         allow, refusal = classifier(user_text)
@@ -1705,7 +1883,6 @@ def build_combined_before_model_callback(
         active_settings.model,
         debug=active_settings.debug,
     )
-    schema_grounding_catalog = _build_schema_grounding_catalog(schema_summary)
 
     scope_gate = build_scope_gate_callback(classifier, debug=active_settings.debug)
     finalize = build_finalize_after_query_before_model_callback()
@@ -1713,13 +1890,13 @@ def build_combined_before_model_callback(
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
-            user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+            raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             topic_text = ""
             if user_text:
                 topic_text = _extract_topic_context_text(user_text)
                 callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
                 callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_text
-                _print_clarification_debug(active_settings, "before-model-user-prompt", user_text)
+                _print_clarification_debug(active_settings, "before-model-user-prompt", raw_user_text or user_text)
             pending_clarification = _get_pending_clarification(callback_context.state)
             clarification_followup = False
             if pending_clarification is not None:
@@ -1876,13 +2053,20 @@ def build_combined_before_model_callback(
             return result
 
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
-            user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+            raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             if user_text:
                 topic_text = str(
                     callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
                     or callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
                     or ""
                 ).strip()
+                request_field_glossary = _extract_request_field_glossary(raw_user_text)
+                grounded_filters = _build_obvious_grounded_filters(user_text, schema_summary)
+                schema_grounding_catalog = _build_schema_grounding_catalog(
+                    schema_summary,
+                    request_field_glossary=request_field_glossary,
+                    grounded_filters=grounded_filters,
+                )
                 grounding_resolution = schema_grounding_resolver(
                     user_text,
                     str(schema_grounding_catalog.get("context_text") or ""),
@@ -1906,6 +2090,7 @@ def build_combined_before_model_callback(
                             if isinstance(value, str) and value.strip()
                         ],
                         schema_grounding_catalog,
+                        grounded_filters=grounded_filters,
                     )
                     if clarification is not None:
                         callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
