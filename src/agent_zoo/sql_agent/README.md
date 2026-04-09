@@ -441,14 +441,14 @@ The live agent is not relying only on prompt formatting. It uses ADK callbacks t
 
 For formatting, the important callbacks are:
 
-- `remember_query_result(...)`
-- `normalize_clarification_after_model(...)`
-- `finalize_after_query(...)`
-- `format_final_agent_response(...)`
+- `build_remember_query_result_callback(...)`
+- `build_normalize_clarification_after_model_callback(...)`
+- `build_finalize_after_query_before_model_callback(...)`
+- `build_format_final_agent_response_callback(...)`
 
-#### `remember_query_result(...)`
+#### `build_remember_query_result_callback(...)`
 
-This is registered as `after_tool_callback`.
+This builder returns the callback registered as `after_tool_callback`.
 
 It checks the tool name:
 
@@ -464,25 +464,25 @@ temp:sql_public_result
 
 If a final query frame exists, it also stores deterministic summary context such as matched categorical filters and comparison filters. The callback is not formatting the visible answer yet. It is preparing the structured public contract that later rendering uses.
 
-#### `normalize_clarification_after_model(...)`
+#### `build_normalize_clarification_after_model_callback(...)`
 
-This is registered as `after_model_callback`.
+This builder returns the callback registered as `after_model_callback`.
 
 It inspects plain-text model output that did not contain a function call. If the text looks like a clarification, it normalizes it into a deterministic clarification structure and renders numbered options in Python.
 
 If the text looks clarification-like but cannot be normalized confidently, it now falls back to one fixed clarification prompt instead of trying to infer unstable option lists from loose prose.
 
-#### `finalize_after_query(...)`
+#### `build_finalize_after_query_before_model_callback(...)`
 
-This logic is part of the `before_model_callback` chain.
+This builder returns the finalize step used inside the `before_model_callback` chain.
 
 When a public SQL result is already present in state, it returns an `LlmResponse(...)` built from the deterministic formatter before the next model call happens. That makes this the authoritative path for final SQL result formatting in the normal success flow.
 
 It also marks the result as already rendered in state so later callbacks know they are in fallback territory rather than the main render path.
 
-#### `format_final_agent_response(...)`
+#### `build_format_final_agent_response_callback(...)`
 
-This is registered as `after_agent_callback`.
+This builder returns the callback registered as `after_agent_callback`.
 
 It reads the stored result from session state. If it finds a dictionary that has not already been rendered by the before-model finalize path, it returns a new `types.Content(...)` object built from the deterministic formatter.
 

@@ -796,7 +796,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNone(returned_result)
         self.assertNotIn(SQL_PUBLIC_RESULT_STATE_KEY, state)
 
-        finalize = build_finalize_after_query_before_model_callback(self._settings())
+        finalize = build_finalize_after_query_before_model_callback()
         final_response = finalize(
             callback_context=SimpleNamespace(state=state),
             llm_request=SimpleNamespace(),
@@ -1149,7 +1149,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 row_count=4,
             ),
         )
-        callback = build_format_final_agent_response_callback(settings)
+        callback = build_format_final_agent_response_callback()
         content = callback(SimpleNamespace(state=tool_state))
 
         self.assertIsNotNone(content)
@@ -1162,7 +1162,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertNotIn('"name"', response_text)
 
     def test_formatted_final_response_includes_matched_categories(self) -> None:
-        callback = build_format_final_agent_response_callback(self._settings())
+        callback = build_format_final_agent_response_callback()
         content = callback(
             SimpleNamespace(
                 state={
@@ -1203,7 +1203,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
 
     def test_formatted_final_response_includes_comparison_filters(self) -> None:
-        callback = build_format_final_agent_response_callback(self._settings())
+        callback = build_format_final_agent_response_callback()
         content = callback(
             SimpleNamespace(
                 state={
@@ -1241,7 +1241,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
-        callback = build_finalize_after_query_before_model_callback(settings)
+        callback = build_finalize_after_query_before_model_callback()
         state = {
             SQL_PUBLIC_RESULT_STATE_KEY: {
                 "status": "success",
@@ -1280,8 +1280,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
     def test_after_agent_callback_is_fallback_once_before_model_has_rendered(self) -> None:
         settings = self._settings()
-        finalize = build_finalize_after_query_before_model_callback(settings)
-        after_agent = build_format_final_agent_response_callback(settings)
+        finalize = build_finalize_after_query_before_model_callback()
+        after_agent = build_format_final_agent_response_callback()
         state = {
             SQL_PUBLIC_RESULT_STATE_KEY: {
                 "status": "success",
@@ -1373,7 +1373,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         model = build_sql_result_view_model(tool_result)
         rendered = render_sql_result_view_model(model)
 
-        callback = build_format_final_agent_response_callback(self._settings())
+        callback = build_format_final_agent_response_callback()
         content = callback(SimpleNamespace(state={SQL_PUBLIC_RESULT_STATE_KEY: tool_result}))
         self.assertIsNotNone(content)
         self.assertEqual(rendered, content.parts[0].text)

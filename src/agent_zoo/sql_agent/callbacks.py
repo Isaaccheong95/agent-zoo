@@ -1308,20 +1308,7 @@ def build_remember_query_result_callback(
     return remember_query_result
 
 
-def _render_public_query_result(public_query_result: dict[str, Any]) -> str:
-    return format_public_query_result(public_query_result)
-
-
-def _build_public_query_result_content(public_query_result: dict[str, Any]) -> types.Content:
-    return types.Content(
-        role="model",
-        parts=[types.Part(text=_render_public_query_result(public_query_result))],
-    )
-
-
-def build_format_final_agent_response_callback(
-    settings: SQLAgentSettings | None = None,
-):
+def build_format_final_agent_response_callback():
     def format_final_agent_response(callback_context=None, **kwargs) -> types.Content | None:
         context = callback_context
         if context is None:
@@ -1335,7 +1322,10 @@ def build_format_final_agent_response_callback(
             return None
 
         _mark_public_query_result_rendered(context.state)
-        return _build_public_query_result_content(public_query_result)
+        return types.Content(
+            role="model",
+            parts=[types.Part(text=format_public_query_result(public_query_result))],
+        )
 
     return format_final_agent_response
 
@@ -1422,9 +1412,7 @@ def build_normalize_clarification_after_model_callback(
     return normalize_clarification_after_model
 
 
-def build_finalize_after_query_before_model_callback(
-    settings: SQLAgentSettings | None = None,
-):
+def build_finalize_after_query_before_model_callback():
     def finalize_after_query(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         context = callback_context
         if context is None:
@@ -1435,7 +1423,12 @@ def build_finalize_after_query_before_model_callback(
             return None
 
         _mark_public_query_result_rendered(context.state)
-        return LlmResponse(content=_build_public_query_result_content(public_query_result))
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=format_public_query_result(public_query_result))],
+            )
+        )
 
     return finalize_after_query
 
@@ -1539,7 +1532,7 @@ def build_combined_before_model_callback(
     )
 
     scope_gate = build_scope_gate_callback(classifier, debug=active_settings.debug)
-    finalize = build_finalize_after_query_before_model_callback(active_settings)
+    finalize = build_finalize_after_query_before_model_callback()
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
@@ -1707,8 +1700,3 @@ def build_combined_before_model_callback(
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined
-
-
-remember_query_result = build_remember_query_result_callback()
-normalize_clarification_after_model = build_normalize_clarification_after_model_callback()
-format_final_agent_response = build_format_final_agent_response_callback()
