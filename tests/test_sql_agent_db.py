@@ -853,6 +853,45 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
         self.assertEqual(public_result["query_summary_context"], query_frame)
 
+    def test_remember_query_result_includes_non_categorical_comparison_filters(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Male", "Female"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "how many females are older than 46",
+            }
+        )
+
+        callback(
+            tool,
+            {
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND age > 46",
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [{"matching_count": 12}],
+                columns=["matching_count"],
+                sql="SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND age > 46",
+            ),
+        )
+
+        query_frame = tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]
+        self.assertEqual(
+            query_frame["comparison_filters"],
+            [{"column": "age", "operator": ">", "value": "46"}],
+        )
+
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
             [
@@ -1153,10 +1192,47 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(content)
         response_text = content.parts[0].text
         self.assertIn("What I matched:", response_text)
-        self.assertIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertIn("- gender = Male", response_text)
         self.assertIn("- sococc in Retired, Student, Unemployed", response_text)
+        self.assertNotIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
+
+    def test_formatted_final_response_includes_comparison_filters(self) -> None:
+        callback = build_format_final_agent_response_callback(self._settings())
+        content = callback(
+            SimpleNamespace(
+                state={
+                    SQL_PUBLIC_RESULT_STATE_KEY: {
+                        "status": "success",
+                        "db_path": "fixture.sqlite",
+                        "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND age > 46",
+                        "columns": ["matching_count"],
+                        "rows": [{"matching_count": 12}],
+                        "row_count": 1,
+                        "preview_row_count": 1,
+                        "truncated": False,
+                        "error": None,
+                        "matched_row_count": 12,
+                        "public_result_kind": "count_aggregate",
+                        "query_summary_context": {
+                            "categorical_filters": [
+                                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                            ],
+                            "comparison_filters": [
+                                {"column": "age", "operator": ">", "value": "46"},
+                            ],
+                        },
+                    }
+                }
+            )
+        )
+
+        self.assertIsNotNone(content)
+        response_text = content.parts[0].text
+        self.assertIn("What I matched:", response_text)
+        self.assertIn("- gender = Female", response_text)
+        self.assertIn("- age > 46", response_text)
+        self.assertNotIn("- Counted matching rows in the current filtered dataset.", response_text)
 
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
@@ -1191,8 +1267,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("SELECT COUNT(*) AS matching_count FROM people", response_text)
         self.assertIn("What I matched:", response_text)
-        self.assertIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertIn("- gender = Female", response_text)
+        self.assertNotIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertIn("```", response_text)
         self.assertIn("4", response_text)
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))

@@ -520,29 +520,51 @@ def _build_query_action_summary(tool_result: dict) -> str:
     return "Selected matching rows from the current filtered dataset."
 
 
-def _format_query_summary_section(tool_result: dict) -> str:
-    bullets = [_build_query_action_summary(tool_result)]
-
+def _build_query_filter_bullets(tool_result: dict) -> list[str]:
     query_summary_context = tool_result.get("query_summary_context")
-    if isinstance(query_summary_context, dict):
-        categorical_filters = [
-            entry
-            for entry in (query_summary_context.get("categorical_filters") or [])
-            if isinstance(entry, dict)
+    if not isinstance(query_summary_context, dict):
+        return []
+
+    bullets: list[str] = []
+    categorical_filters = [
+        entry
+        for entry in (query_summary_context.get("categorical_filters") or [])
+        if isinstance(entry, dict)
+    ]
+    for entry in categorical_filters:
+        column_name = str(entry.get("column") or "").strip()
+        selected_values = [
+            value.strip()
+            for value in entry.get("selected_values") or []
+            if isinstance(value, str) and value.strip()
         ]
-        for entry in categorical_filters:
-            column_name = str(entry.get("column") or "").strip()
-            selected_values = [
-                value.strip()
-                for value in entry.get("selected_values") or []
-                if isinstance(value, str) and value.strip()
-            ]
-            if not column_name or not selected_values:
-                continue
-            if len(selected_values) == 1:
-                bullets.append(f"{column_name} = {selected_values[0]}")
-                continue
-            bullets.append(f"{column_name} in {', '.join(selected_values)}")
+        if not column_name or not selected_values:
+            continue
+        if len(selected_values) == 1:
+            bullets.append(f"{column_name} = {selected_values[0]}")
+            continue
+        bullets.append(f"{column_name} in {', '.join(selected_values)}")
+
+    comparison_filters = [
+        entry
+        for entry in (query_summary_context.get("comparison_filters") or [])
+        if isinstance(entry, dict)
+    ]
+    for entry in comparison_filters:
+        column_name = str(entry.get("column") or "").strip()
+        operator = str(entry.get("operator") or "").strip()
+        value = str(entry.get("value") or "").strip()
+        if not column_name or not operator or not value:
+            continue
+        bullets.append(f"{column_name} {operator} {value}")
+
+    return bullets
+
+
+def _format_query_summary_section(tool_result: dict) -> str:
+    bullets = _build_query_filter_bullets(tool_result)
+    if not bullets:
+        bullets = [_build_query_action_summary(tool_result)]
 
     return "What I matched:\n" + "\n".join(f"- {bullet}" for bullet in bullets)
 
