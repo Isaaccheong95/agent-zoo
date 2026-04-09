@@ -569,6 +569,31 @@ def _iter_user_tables(connection: sqlite3.Connection) -> Iterable[str]:
         yield row["name"]
 
 
+def _load_column_mapping_lookup(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__column_mapping' LIMIT 1"
+    ).fetchone()
+    if table_exists is None:
+        return {}
+
+    lookup: dict[tuple[str, str], str] = {}
+    try:
+        rows = connection.execute(
+            "SELECT table_name, csv_header, sqlite_column FROM __column_mapping"
+        )
+    except sqlite3.Error:
+        return {}
+
+    for row in rows:
+        table_name = _normalize_whitespace(str(row["table_name"] or ""))
+        csv_header = _normalize_whitespace(str(row["csv_header"] or ""))
+        sqlite_column = _normalize_whitespace(str(row["sqlite_column"] or ""))
+        if not table_name or not csv_header or not sqlite_column:
+            continue
+        lookup[(table_name.casefold(), sqlite_column.casefold())] = csv_header
+    return lookup
+
+
 def get_schema_summary(
     db_path: str | Path,
     *,
@@ -581,6 +606,7 @@ def get_schema_summary(
         path = _ensure_database_exists(db_path)
         with closing(_connect_read_only(path)) as connection:
             available_tables = list(_iter_user_tables(connection))
+            column_mapping_lookup = _load_column_mapping_lookup(connection)
             if table_names is not None:
                 allowed = {name for name in table_names}
                 selected_tables = [name for name in available_tables if name in allowed]
@@ -603,6 +629,11 @@ def get_schema_summary(
                         "default_value": column["dflt_value"],
                         "primary_key": bool(column["pk"]),
                     }
+                    source_header = column_mapping_lookup.get(
+                        (table_name.casefold(), column_definition["name"].casefold())
+                    )
+                    if source_header:
+                        column_definition["source_header"] = source_header
                     if include_categorical_value_guidance:
                         categorical_values = _collect_categorical_values(
                             connection,
@@ -613,13 +644,14 @@ def get_schema_summary(
                         )
                         if categorical_values:
                             column_definition["categorical_values"] = categorical_values
-                            categorical_value_guidance.append(
-                                {
-                                    "table": table_name,
-                                    "column": column_definition["name"],
-                                    "values": categorical_values,
-                                }
-                            )
+                            guidance_entry = {
+                                "table": table_name,
+                                "column": column_definition["name"],
+                                "values": categorical_values,
+                            }
+                            if source_header:
+                                guidance_entry["source_header"] = source_header
+                            categorical_value_guidance.append(guidance_entry)
                     columns.append(column_definition)
                 tables.append({"name": table_name, "columns": columns})
 

@@ -75,6 +75,12 @@ def create_fixture_database(db_path: Path) -> None:
             ignored TEXT
         );
 
+        CREATE TABLE __column_mapping (
+            table_name TEXT NOT NULL,
+            csv_header TEXT NOT NULL,
+            sqlite_column TEXT NOT NULL
+        );
+
         INSERT INTO people (name, sex, age) VALUES
             ('Alice', 'female', 30),
             ('Bob', 'male', 44),
@@ -86,6 +92,13 @@ def create_fixture_database(db_path: Path) -> None:
             (2, 'Tokyo'),
             (3, 'Singapore'),
             (4, 'Paris');
+
+        INSERT INTO __column_mapping (table_name, csv_header, sqlite_column) VALUES
+            ('people', 'Name', 'name'),
+            ('people', 'Sex', 'sex'),
+            ('people', 'Age', 'age'),
+            ('visits', 'PersonId', 'person_id'),
+            ('visits', 'City', 'city');
         """
     )
     connection.commit()
@@ -181,8 +194,22 @@ class SQLiteHelpersTestCase(unittest.TestCase):
 
         people_table = next(table for table in summary["tables"] if table["name"] == "people")
         people_columns = {column["name"]: column for column in people_table["columns"]}
+        self.assertEqual(people_columns["sex"]["source_header"], "Sex")
         self.assertEqual(people_columns["sex"]["categorical_values"], ["female", "male"])
         self.assertNotIn("categorical_values", people_columns["name"])
+
+    def test_get_schema_summary_includes_column_glossary_from_mapping_table(self) -> None:
+        summary = get_schema_summary(self.db_path)
+
+        self.assertEqual(summary["status"], "success")
+        people_table = next(table for table in summary["tables"] if table["name"] == "people")
+        visits_table = next(table for table in summary["tables"] if table["name"] == "visits")
+        people_columns = {column["name"]: column for column in people_table["columns"]}
+        visits_columns = {column["name"]: column for column in visits_table["columns"]}
+        self.assertEqual(people_columns["name"]["source_header"], "Name")
+        self.assertEqual(people_columns["sex"]["source_header"], "Sex")
+        self.assertEqual(visits_columns["person_id"]["source_header"], "PersonId")
+        self.assertEqual(visits_columns["city"]["source_header"], "City")
 
     def test_validate_sql_read_only_allows_select_and_with(self) -> None:
         select_validation = validate_sql_read_only(
@@ -2565,15 +2592,22 @@ Which category or combination should I use for \"alcoholic\"?
                     {
                         "name": "filtered_dataset",
                         "columns": [
-                            {"name": "gender", "type": "TEXT", "categorical_values": ["Female", "Male"]},
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Gender",
+                                "categorical_values": ["Female", "Male"],
+                            },
                             {
                                 "name": "socalc",
                                 "type": "TEXT",
+                                "source_header": "Alcohol consumption",
                                 "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
                             },
                             {
                                 "name": "socsmk",
                                 "type": "TEXT",
+                                "source_header": "Smoking status",
                                 "categorical_values": ["No", "Unknown", "Yes"],
                             },
                         ],
@@ -2612,8 +2646,10 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(len(schema_grounding_calls), 1)
         response_text = result.content.parts[0].text
         self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
-        self.assertIn("1. socalc (values: Never, Occasionally, Regularly, Unknown)", response_text)
-        self.assertIn("2. socsmk (values: No, Unknown, Yes)", response_text)
+        self.assertIn("1. Alcohol consumption", response_text)
+        self.assertIn("2. Smoking status", response_text)
+        self.assertNotIn("socalc (values:", response_text)
+        self.assertNotIn("socsmk (values:", response_text)
         self.assertEqual(
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["clarification_kind"],
             "interpretation",
@@ -2625,8 +2661,8 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["option_columns"],
             {
-                "socalc (values: Never, Occasionally, Regularly, Unknown)": "socalc",
-                "socsmk (values: No, Unknown, Yes)": "socsmk",
+                "Alcohol consumption": "socalc",
+                "Smoking status": "socsmk",
             },
         )
 

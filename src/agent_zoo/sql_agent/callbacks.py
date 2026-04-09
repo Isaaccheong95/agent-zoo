@@ -185,6 +185,17 @@ def _normalize_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def _humanize_schema_label(value: str) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    candidate = candidate.replace("_", " ")
+    candidate = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", candidate)
+    candidate = re.sub(r"\bId\b", "ID", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate
+
+
 def _normalize_allowed_values(values: list[str], allowed_values: list[str]) -> list[str]:
     value_lookup: dict[str, str] = {}
     for allowed_value in allowed_values:
@@ -570,6 +581,7 @@ def _build_schema_grounding_catalog(schema_summary: dict[str, Any]) -> dict[str,
     context_lines: list[str] = []
     candidate_columns: list[str] = []
     option_labels: dict[str, str] = {}
+    used_option_label_keys: set[str] = set()
     for table in tables:
         if not isinstance(table, dict):
             continue
@@ -592,16 +604,32 @@ def _build_schema_grounding_catalog(schema_summary: dict[str, Any]) -> dict[str,
                 for value in column.get("categorical_values") or []
                 if isinstance(value, str) and value.strip()
             ]
+            source_header = _humanize_schema_label(str(column.get("source_header") or ""))
             line = f"- {identifier} ({declared_type})"
+            line_details: list[str] = []
+            if source_header:
+                line_details.append(f"dataset label = {source_header}")
             if categorical_values:
                 preview_values = categorical_values[:4]
                 preview_text = ", ".join(preview_values)
                 if len(categorical_values) > len(preview_values):
                     preview_text += ", ..."
-                line += f": categorical values = {preview_text}"
-                option_labels[identifier] = f"{identifier} (values: {preview_text})"
+                line_details.append(f"categorical values = {preview_text}")
+            if line_details:
+                line += ": " + "; ".join(line_details)
+
+            option_label = ""
+            if source_header:
+                option_label = source_header
+                if option_label.casefold() in used_option_label_keys:
+                    option_label = f"{source_header} ({identifier})"
+            elif categorical_values:
+                option_label = f"{identifier} (values: {preview_text})"
             else:
-                option_labels[identifier] = identifier
+                option_label = identifier
+
+            option_labels[identifier] = option_label
+            used_option_label_keys.add(option_label.casefold())
             context_lines.append(line)
 
     return {
