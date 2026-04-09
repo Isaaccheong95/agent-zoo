@@ -33,6 +33,7 @@
 - [Data Contracts](#data-contracts)
   - [Schema tool contract](#schema-tool-contract)
   - [Execution tool contract](#execution-tool-contract)
+  - [Public response contract](#public-response-contract)
 - [Why This Project Uses Callbacks Instead of `output_schema`](#why-this-project-uses-callbacks-instead-of-output_schema)
 - [The Tests](#the-tests)
   - [`tests/test_sql_agent_db.py`](#test_sql_agent_dbpy)
@@ -62,7 +63,7 @@
   - [1. The model still does the semantic SQL generation](#1-the-model-still-does-the-semantic-sql-generation)
   - [2. Schema context is global](#2-schema-context-is-global)
   - [3. Summary text is row-oriented, not business-oriented](#3-summary-text-is-row-oriented-not-business-oriented)
-  - [4. `after_agent_callback` does not suppress earlier streamed text](#4-after_agent_callback-does-not-suppress-earlier-streamed-text)
+  - [4. Callback-driven final formatting does not suppress earlier streamed text](#4-callback-driven-final-formatting-does-not-suppress-earlier-streamed-text)
   - [5. The system currently trusts the model to call the schema tool when needed](#5-the-system-currently-trusts-the-model-to-call-the-schema-tool-when-needed)
 - [Good Next Improvements](#good-next-improvements)
 - [Development Notes](#development-notes)
@@ -120,7 +121,7 @@ This is deliberately not a black box. The SQL is always surfaced, and the pieces
 | `src/agent_zoo/sql_agent/tools.py` | Wraps database helpers as ADK tools |
 | `src/agent_zoo/sql_agent/db.py` | Schema introspection, SQL scanning, validation, and execution |
 | `src/agent_zoo/sql_agent/runtime.py` | Runs the agent with `InMemoryRunner` |
-| `src/agent_zoo/sql_agent/callbacks.py` | Stores tool output and replaces the final response |
+| `src/agent_zoo/sql_agent/callbacks.py` | Stores tool output, handles clarification flow, and finalizes or fallback-renders the final response |
 | `src/agent_zoo/sql_agent/formatting.py` | Formats the final user-facing response |
 | `src/agent_zoo/sql_agent/pipeline.py` | Deterministic offline pipeline helper used by tests |
 | `tests/test_sql_agent_db.py` | Unit tests for schema/validation/execution |
@@ -161,7 +162,10 @@ LLM chooses tools and writes SQL
 after_tool_callback stores last SQL result
     |
     v
-after_agent_callback formats final response
+before_model_callback finalizes SQL result when a public result already exists
+  |
+  v
+after_agent_callback acts as a guarded fallback renderer
     |
     v
 User sees:
@@ -330,6 +334,8 @@ The returned ADK agent is configured with:
 - a dynamically built instruction
 - two tools
 - `temperature=0.0`
+- a `before_model_callback`
+- an `after_model_callback`
 - an `after_tool_callback`
 - an `after_agent_callback`
 
@@ -369,10 +375,8 @@ It has two layers:
 - use `COUNT(*)` for counts
 - use `LIMIT` for large listings
 - avoid exposing reasoning
-- output exactly these top-level sections:
-  - `Generated SQL`
-  - `What I matched`
-  - `Result`
+- emit exactly one JSON object when a clarification is needed before querying
+- stop after the final tool call and let Python render the final SQL answer deterministically
 
 `build_agent_instruction(settings)` also appends:
 
@@ -429,15 +433,17 @@ It uses ADK's `InMemoryRunner`.
 
 `run_interactive_loop(...)` creates one shared runner and one shared session, then reuses them across multiple user turns. That means session state can survive between turns during the same interactive run.
 
-### 7. `callbacks.py` captures the tool result and rewrites the final answer
+### 7. `callbacks.py` captures the tool result and finalizes the answer
 
 This file is one of the most important implementation details.
 
-The live agent is not relying only on prompt formatting. It also uses ADK callbacks to shape the final output.
+The live agent is not relying only on prompt formatting. It uses ADK callbacks to shape clarification output and to render final SQL answers from structured state.
 
-There are two callbacks:
+For formatting, the important callbacks are:
 
 - `remember_query_result(...)`
+- `normalize_clarification_after_model(...)`
+- `finalize_after_query(...)`
 - `format_final_agent_response(...)`
 
 #### `remember_query_result(...)`
@@ -450,39 +456,56 @@ It checks the tool name:
 if tool_name == "execute_sqlite_read_only":
 ```
 
-When that tool runs, the callback stores the tool response into ADK session state under:
+When that tool runs, the callback builds a public result and stores it into ADK session state under:
 
 ```python
-temp:last_execute_sqlite_read_only_result
+temp:sql_public_result
 ```
 
-So the callback is not formatting anything yet. It is just remembering the last structured SQL execution result.
+If a final query frame exists, it also stores deterministic summary context such as matched categorical filters and comparison filters. The callback is not formatting the visible answer yet. It is preparing the structured public contract that later rendering uses.
+
+#### `normalize_clarification_after_model(...)`
+
+This is registered as `after_model_callback`.
+
+It inspects plain-text model output that did not contain a function call. If the text looks like a clarification, it normalizes it into a deterministic clarification structure and renders numbered options in Python.
+
+If the text looks clarification-like but cannot be normalized confidently, it now falls back to one fixed clarification prompt instead of trying to infer unstable option lists from loose prose.
+
+#### `finalize_after_query(...)`
+
+This logic is part of the `before_model_callback` chain.
+
+When a public SQL result is already present in state, it returns an `LlmResponse(...)` built from the deterministic formatter before the next model call happens. That makes this the authoritative path for final SQL result formatting in the normal success flow.
+
+It also marks the result as already rendered in state so later callbacks know they are in fallback territory rather than the main render path.
 
 #### `format_final_agent_response(...)`
 
 This is registered as `after_agent_callback`.
 
-It reads the stored result from session state. If it finds a dictionary, it returns a new `types.Content(...)` object built from `format_structured_response(...)`.
+It reads the stored result from session state. If it finds a dictionary that has not already been rendered by the before-model finalize path, it returns a new `types.Content(...)` object built from the deterministic formatter.
 
-This effectively replaces the model's final answer with a deterministic, structured response built from the tool output.
+In other words, `after_agent_callback` is now a guarded fallback renderer. It preserves the same final answer shape if the normal before-model short-circuit path was not the one that produced the visible response.
 
 That gives the project two benefits:
 
 1. The user always sees the exact SQL that actually ran.
 2. The visible final answer is less dependent on the model's formatting discipline.
 
-#### Important limitation of `after_agent_callback`
+#### Important limitation of callback-driven final formatting
 
-This callback only affects the final response. It cannot unsend earlier streamed text. If the model emits reasoning-like text before the final answer and the UI displays it live, the callback cannot erase that already-streamed content.
+These callbacks only affect the final response they produce. They cannot unsend earlier streamed text. If the model emits reasoning-like text before the final answer and the UI displays it live, callback-based formatting cannot erase that already-streamed content.
 
 That is why:
 
 - the plain CLI runner can still be clean, because it only prints the final captured response unless debug is enabled
 - `adk run` can still show intermediate events, depending on how the ADK CLI renders them
+- the before-model finalize short-circuit helps reduce second-turn formatting drift, but it still cannot erase text that has already been streamed earlier in the run
 
 ### 8. `formatting.py` builds the user-facing output
 
-`src/agent_zoo/sql_agent/formatting.py` converts the raw tool result into the exact response format.
+`src/agent_zoo/sql_agent/formatting.py` converts structured callback state into the exact response format.
 
 #### `format_result_payload(tool_result)`
 
@@ -495,6 +518,24 @@ Behavior:
 
 This is why aggregate queries like `SELECT COUNT(*) ...` display just the number rather than a JSON array.
 
+#### `build_sql_result_view_model(tool_result)`
+
+This function converts the callback-owned public result dictionary into a small deterministic response contract. The current contract includes:
+
+- the executed SQL
+- the rendered result payload
+- the `What I matched` section content
+- the public result kind
+- matched row count when available
+- query summary context when available
+- an optional privacy note
+
+The purpose of this layer is to keep rendering decisions out of the callback code paths.
+
+#### `render_sql_result_view_model(view_model)`
+
+This function renders the final SQL answer from the typed contract.
+
 #### `build_default_explanation(tool_result)`
 
 Behavior:
@@ -504,15 +545,27 @@ Behavior:
 - on truncated results, explain that this is a preview
 - otherwise explain that the query succeeded and how many rows came back
 
-#### `format_structured_response(...)`
+#### `format_public_query_result(...)`
 
-This assembles the final structured answer:
+This is the main callback-facing formatter for final SQL results.
+
+It builds the view model and renders the final structured answer:
 
 1. `Generated SQL`
 2. `What I matched`
 3. `Result`
 
-This formatting function is what the `after_agent_callback` ultimately returns to the user.
+If the public result kind is `detail_count_fallback`, it also appends the privacy note explaining why only the matching count is shown.
+
+#### `format_structured_response(...)`
+
+This now exists as a backward-compatible wrapper around `format_public_query_result(...)`.
+
+#### Clarification fallback behavior
+
+Clarification rendering is also deterministic. If the model returns a proper clarification JSON object, or text that can be normalized confidently into one, Python renders the numbered clarification message.
+
+If the response only looks clarification-like but normalization is low confidence, the system now falls back to a fixed clarification prompt instead of exposing guessed option lists.
 
 ### 9. `pipeline.py` contains a deterministic, non-ADK pipeline
 
@@ -919,6 +972,30 @@ The system uses plain dictionaries for tool results and internal coordination.
 
 On error it returns the same structure with `status="error"` and an `error` message.
 
+### Public response contract
+
+After `after_tool_callback`, the live agent does not render directly from the raw execution-tool dictionary. It first builds a public result contract in callback state.
+
+The public result dictionary can extend the execution-tool result with fields such as:
+
+```python
+{
+  "matched_row_count": 225,
+  "public_result_kind": "count_aggregate" | "safe_aggregate" | "detail_count_fallback",
+  "query_summary_context": {
+    "question": "how many females are older than 46",
+    "categorical_filters": [
+      {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+    ],
+    "comparison_filters": [
+      {"column": "age", "operator": ">", "value": "46"},
+    ],
+  },
+}
+```
+
+That callback-owned dictionary is then adapted into `SQLResultViewModel` inside `formatting.py`, which is the deterministic renderer contract for final SQL answers.
+
 ## Why This Project Uses Callbacks Instead of `output_schema`
 
 The project deliberately formats the final answer with callbacks rather than ADK structured output.
@@ -1046,7 +1123,7 @@ In that case, retry with:
 
 The plain runner captures the final response and prints only that by default.
 
-The ADK CLI may render intermediate streamed events. Since `after_agent_callback` only replaces the final response, it cannot erase already-streamed model text.
+The ADK CLI may render intermediate streamed events. The before-model finalize path can short-circuit later model turns, and the after-agent path can replace the final response as a fallback, but neither can erase model text that has already been streamed.
 
 ### Why aggregate queries say `Found 1 matching row`
 
@@ -1137,9 +1214,9 @@ The full schema snapshot is injected into the instruction. That is fine for smal
 
 As noted above, aggregate queries can produce slightly awkward summaries.
 
-### 4. `after_agent_callback` does not suppress earlier streamed text
+### 4. Callback-driven final formatting does not suppress earlier streamed text
 
-It only replaces the final answer.
+The formatter can control the final visible answer shape, but it still cannot retract earlier streamed text once the UI has shown it.
 
 ### 5. The system currently trusts the model to call the schema tool when needed
 
