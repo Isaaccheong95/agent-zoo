@@ -1513,6 +1513,79 @@ I need clarification on your question. Could you please specify which category o
 
         self.assertIsNone(result)
 
+    def test_after_model_callback_falls_back_for_unparseable_clarification_like_text(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many females are alcoholics",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "I need clarification before querying because the request is ambiguous. "
+                                "Please specify the exact category, value, or rule you want me to use."
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertEqual(
+            response_text,
+            "I need clarification before I can run the query. Please specify the exact category, value, or rule you want me to use.",
+        )
+        self.assertEqual(state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"], [])
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "how many females are alcoholics",
+        )
+
+    def test_after_model_callback_falls_back_for_heading_only_option_extraction(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many males are not working",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "Available categories:\n"
+                                "- Employed\n"
+                                "- Retired\n"
+                                "- Unemployed\n"
+                                "- Student\n"
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertEqual(
+            response_text,
+            "I need clarification before I can run the query. Please specify the exact category, value, or rule you want me to use.",
+        )
+        self.assertEqual(state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"], [])
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "how many males are not working",
+        )
+
     def test_after_model_callback_recovers_from_truncated_clarification_json(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
         raw_response = """Which category do you mean by 'alcoholics'?\",\"options\":[\"Regularly (regular alcohol consumption)\",\"Occasionally (occasional drinking)\",\"Never (no alcohol)\",\"Unknown (missing data)\"]}

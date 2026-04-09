@@ -22,6 +22,10 @@ _CLARIFICATION_METADATA_KEYS = {
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
 _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
+_FALLBACK_CLARIFICATION_MESSAGE = (
+    "I need clarification before I can run the query. "
+    "Please specify the exact category, value, or rule you want me to use."
+)
 
 
 @dataclass(slots=True)
@@ -192,6 +196,10 @@ def build_clarification_response(
     return response
 
 
+def build_fallback_clarification_response() -> dict[str, Any]:
+    return build_clarification_response(_FALLBACK_CLARIFICATION_MESSAGE)
+
+
 def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
     candidate = _unwrap_json_code_fence(raw_text)
     try:
@@ -336,6 +344,54 @@ def _prune_subject_echo_options(user_message: str | None, options: list[str]) ->
         if option.casefold() != subject.casefold()
     ]
     return pruned_options or options
+
+
+def looks_like_clarification_attempt(raw_text: str) -> bool:
+    normalized_text = _normalize_whitespace(raw_text)
+    if not normalized_text:
+        return False
+
+    if re.search(r"\bclarif(?:y|ication)\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bplease\s+specify\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bwhat\s+do\s+you\s+mean\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(
+        r"\bwhich\s+(?:category|categories|value|values|option|options|column|columns|group|groups)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\bchoose\s+(?:from|one|one\s+or\s+more)\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if "?" in normalized_text and re.search(
+        r"\b(?:which|what|specify|choose|mean|should\s+i\s+use)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"^(?:\s*(?:[-*•]|\d+\s*[.)-])\s*.+)$", raw_text, flags=re.MULTILINE) and re.search(
+        r"\b(?:category|categories|option|options|value|values)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def clarification_requires_deterministic_fallback(clarification: dict[str, Any]) -> bool:
+    user_message = _normalize_whitespace(str(clarification.get("user_message") or ""))
+    if not user_message:
+        return True
+
+    if re.match(
+        r"^(?:available\s+)?(?:categories|options|values)\s*:",
+        user_message,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
 
 
 def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:

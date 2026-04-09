@@ -17,9 +17,12 @@ from google.genai import types
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import (
+    build_fallback_clarification_response,
     build_clarification_response,
+    clarification_requires_deterministic_fallback,
     format_clarification_response,
     format_public_query_result,
+    looks_like_clarification_attempt,
     normalize_clarification_response,
 )
 try:
@@ -1363,7 +1366,21 @@ def build_normalize_clarification_after_model_callback(
 
         clarification = normalize_clarification_response(response_text)
         if clarification is None:
-            return None
+            if not looks_like_clarification_attempt(response_text):
+                return None
+            clarification = build_fallback_clarification_response()
+            _print_clarification_debug(
+                active_settings,
+                "after-model-fallback-reason",
+                "normalization_failed",
+            )
+        elif clarification_requires_deterministic_fallback(clarification):
+            clarification = build_fallback_clarification_response()
+            _print_clarification_debug(
+                active_settings,
+                "after-model-fallback-reason",
+                "low_confidence_normalization",
+            )
 
         clarification = _match_clarification_values_to_schema_guidance(
             clarification,
