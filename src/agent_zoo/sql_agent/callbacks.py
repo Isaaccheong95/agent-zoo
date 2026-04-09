@@ -17,6 +17,9 @@ from google.genai import types
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import (
+    CLARIFICATION_KIND_CATEGORICAL_VALUES,
+    CLARIFICATION_KIND_GENERIC,
+    CLARIFICATION_KIND_INTERPRETATION,
     build_fallback_clarification_response,
     build_clarification_response,
     clarification_requires_deterministic_fallback,
@@ -470,8 +473,16 @@ def _match_clarification_values_to_schema_guidance(
     raw_text: str,
     categorical_value_guidance: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if not categorical_value_guidance:
+    clarification_kind = str(clarification.get("clarification_kind") or "").strip().lower()
+    if clarification_kind == CLARIFICATION_KIND_INTERPRETATION:
         return clarification
+
+    if not categorical_value_guidance:
+        if clarification_kind:
+            return clarification
+        normalized_clarification = dict(clarification)
+        normalized_clarification["clarification_kind"] = CLARIFICATION_KIND_GENERIC
+        return normalized_clarification
 
     normalized_raw_text = _normalize_match_text(raw_text)
     normalized_option_keys = {
@@ -520,10 +531,15 @@ def _match_clarification_values_to_schema_guidance(
             ambiguous_best_match = True
 
     if best_values is None or ambiguous_best_match:
-        return clarification
+        if clarification_kind:
+            return clarification
+        normalized_clarification = dict(clarification)
+        normalized_clarification["clarification_kind"] = CLARIFICATION_KIND_GENERIC
+        return normalized_clarification
 
     normalized_clarification = dict(clarification)
     normalized_clarification["options"] = best_values
+    normalized_clarification["clarification_kind"] = CLARIFICATION_KIND_CATEGORICAL_VALUES
     return normalized_clarification
 
 
@@ -599,6 +615,7 @@ def _build_result_refinement_clarification(
     clarification = build_clarification_response(
         " ".join(message_parts),
         available_values,
+        clarification_kind=CLARIFICATION_KIND_CATEGORICAL_VALUES,
     )
     if previous_question:
         clarification["topic_context"] = previous_question

@@ -1531,6 +1531,60 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
             "how many females are alcoholics",
         )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["clarification_kind"],
+            "generic",
+        )
+
+    def test_after_model_callback_preserves_interpretation_clarification_options(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                ],
+            },
+        ):
+            callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many males drink",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"Do you mean alcohol consumption (socalc) or smoking status (socsmk)?",'
+                                '"options":["Alcohol consumption (socalc)","Smoking status (socsmk)"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("Do you mean alcohol consumption (socalc) or smoking status (socsmk)?", response_text)
+        self.assertIn("1. Alcohol consumption (socalc)", response_text)
+        self.assertIn("2. Smoking status (socsmk)", response_text)
+        self.assertNotIn("1. Never", response_text)
+        self.assertNotIn("1. No", response_text)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"],
+            ["Alcohol consumption (socalc)", "Smoking status (socsmk)"],
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["clarification_kind"],
+            "interpretation",
+        )
 
     def test_after_model_callback_prunes_topic_context_echo_from_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
@@ -1882,8 +1936,10 @@ Which category or combination should I use for \"alcoholic\"?
 - Both Regularly and Occasionally
 - Something else"""
 
+        state: dict[str, object] = {}
+
         result = callback(
-            callback_context=SimpleNamespace(state={}),
+            callback_context=SimpleNamespace(state=state),
             llm_response=SimpleNamespace(
                 content=types.Content(
                     role="model",
@@ -1901,6 +1957,53 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertNotRegex(response_text, r"\d+\.\s+Both combined\b")
         self.assertNotRegex(response_text, r"\d+\.\s+Both Regularly and Occasionally\b")
         self.assertNotRegex(response_text, r"\d+\.\s+Something else\b")
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["clarification_kind"],
+            "categorical_values",
+        )
+
+    def test_combined_before_model_callback_rewrites_pending_interpretation_followup(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {"resolution_type": "selected_options", "selected_options": ["Smoking status (socsmk)"], "custom_rule": ""}
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "topic_context": "how many males drink",
+                "user_message": "Do you mean alcohol consumption (socalc) or smoking status (socsmk)?",
+                "options": ["Alcohol consumption (socalc)", "Smoking status (socsmk)"],
+                "clarification_kind": "interpretation",
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="2")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(resolver_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Clarification question: Do you mean alcohol consumption (socalc) or smoking status (socsmk)?", rewritten_text)
+        self.assertIn("Matched options from the reply: Smoking status (socsmk)", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
     def test_combined_before_model_callback_rewrites_pending_clarification_followup(self) -> None:
         scope_gate_calls: list[str] = []
