@@ -1186,6 +1186,7 @@ def build_remember_query_result_callback(
 
         is_final = _tool_call_is_final(args)
         _clear_private_result_state(tool_context.state)
+        last_query_frame: dict[str, Any] | None = None
 
         if active_settings.capture_internal_rows and tool_response.get("status") == "success":
             tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
@@ -1213,6 +1214,8 @@ def build_remember_query_result_callback(
             tool_response,
             active_settings,
         )
+        if last_query_frame is not None:
+            public_result["query_summary_context"] = dict(last_query_frame)
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
 
         if active_settings.count_aggregates_only:

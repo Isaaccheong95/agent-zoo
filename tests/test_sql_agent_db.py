@@ -850,6 +850,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 },
             ],
         )
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["query_summary_context"], query_frame)
 
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
@@ -1108,10 +1110,53 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertIsNotNone(content)
         response_text = content.parts[0].text
+        self.assertIn("What I matched:", response_text)
+        self.assertIn("- Matched rows in the current filtered dataset and returned only the safe count.", response_text)
         self.assertIn("```", response_text)
         self.assertIn("4", response_text)
         self.assertNotIn("Alice", response_text)
         self.assertNotIn('"name"', response_text)
+
+    def test_formatted_final_response_includes_matched_categories(self) -> None:
+        callback = build_format_final_agent_response_callback(self._settings())
+        content = callback(
+            SimpleNamespace(
+                state={
+                    SQL_PUBLIC_RESULT_STATE_KEY: {
+                        "status": "success",
+                        "db_path": "fixture.sqlite",
+                        "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc IN ('Retired', 'Student', 'Unemployed')",
+                        "columns": ["matching_count"],
+                        "rows": [{"matching_count": 33}],
+                        "row_count": 1,
+                        "preview_row_count": 1,
+                        "truncated": False,
+                        "error": None,
+                        "matched_row_count": 33,
+                        "public_result_kind": "count_aggregate",
+                        "query_summary_context": {
+                            "question": "how many males are not working",
+                            "categorical_filters": [
+                                {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                                {
+                                    "column": "sococc",
+                                    "selected_values": ["Retired", "Student", "Unemployed"],
+                                    "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                                },
+                            ],
+                        },
+                    }
+                }
+            )
+        )
+
+        self.assertIsNotNone(content)
+        response_text = content.parts[0].text
+        self.assertIn("What I matched:", response_text)
+        self.assertIn("- Counted matching rows in the current filtered dataset.", response_text)
+        self.assertIn("- gender = Male", response_text)
+        self.assertIn("- sococc in Retired, Student, Unemployed", response_text)
+        self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
 
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
@@ -1130,6 +1175,12 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                         "truncated": False,
                         "error": None,
                         "matched_row_count": 4,
+                        "public_result_kind": "count_aggregate",
+                        "query_summary_context": {
+                            "categorical_filters": [
+                                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                            ]
+                        },
                     }
                 }
             ),
@@ -1137,9 +1188,14 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertIn("SELECT COUNT(*) AS matching_count FROM people", result.content.parts[0].text)
-        self.assertIn("```", result.content.parts[0].text)
-        self.assertIn("4", result.content.parts[0].text)
+        response_text = result.content.parts[0].text
+        self.assertIn("SELECT COUNT(*) AS matching_count FROM people", response_text)
+        self.assertIn("What I matched:", response_text)
+        self.assertIn("- Counted matching rows in the current filtered dataset.", response_text)
+        self.assertIn("- gender = Female", response_text)
+        self.assertIn("```", response_text)
+        self.assertIn("4", response_text)
+        self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
 
     def test_after_model_callback_formats_structured_clarification_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
