@@ -28,6 +28,7 @@ from agent_zoo.sql_agent.callbacks import (
     SQL_LAST_QUERY_FRAME_STATE_KEY,
     SQL_PENDING_CLARIFICATION_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
+    SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
     build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
@@ -36,6 +37,10 @@ from agent_zoo.sql_agent.callbacks import (
 )
 from agent_zoo.sql_agent.config import SQLAgentSettings, load_settings
 from agent_zoo.sql_agent.db import execute_sqlite_query, get_schema_summary, validate_sql_read_only
+from agent_zoo.sql_agent.formatting import (
+    build_sql_result_view_model,
+    render_sql_result_view_model,
+)
 from agent_zoo.sql_agent.instructions import build_agent_instruction
 from agent_zoo.sql_agent.runtime import _print_debug_event
 from agent_zoo.sql_agent.tools import build_sql_tools
@@ -588,6 +593,38 @@ class SQLAgentObjectModeTestCase(unittest.TestCase):
             ],
         )
 
+    def test_object_mode_final_render_shows_original_query_not_canonicalized_sql(self) -> None:
+        simple_sql = "SELECT COUNT(*) AS matching_count FROM records WHERE city = 'Tokyo'"
+        tool_response = execute_sqlite_query(
+            self.db_path,
+            simple_sql,
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+
+        self.assertEqual(tool_response["status"], "success")
+        self.assertIn("__az_object_source", tool_response["sql"])
+
+        callback = build_remember_query_result_callback(self._object_settings(minimum_aggregate_count=1))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={})
+
+        callback(
+            tool,
+            {"sql": simple_sql, "is_final": True},
+            tool_context,
+            tool_response,
+        )
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["display_sql"], simple_sql)
+        self.assertIn("__az_object_source", public_result["sql"])
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn(simple_sql, content.parts[0].text)
+        self.assertNotIn("__az_object_source", content.parts[0].text)
+
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):
     def _settings(self, **overrides) -> SQLAgentSettings:
@@ -791,7 +828,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNone(returned_result)
         self.assertNotIn(SQL_PUBLIC_RESULT_STATE_KEY, state)
 
-        finalize = build_finalize_after_query_before_model_callback(self._settings())
+        finalize = build_finalize_after_query_before_model_callback()
         final_response = finalize(
             callback_context=SimpleNamespace(state=state),
             llm_request=SimpleNamespace(),
@@ -891,6 +928,56 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             query_frame["comparison_filters"],
             [{"column": "age", "operator": ">", "value": "46"}],
         )
+
+    def test_remember_query_result_includes_cast_comparison_filters_in_final_render(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Male", "Female"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                    {"column": "Centre", "values": ["HospitalA", "HospitalB"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "how many females are smokers from hosp A and under 45",
+            }
+        )
+        simple_sql = (
+            "SELECT COUNT(*) AS matching_count FROM filtered_dataset "
+            "WHERE gender = 'Female' AND socsmk = 'Yes' AND Centre = 'HospitalA' "
+            "AND CAST(age AS INTEGER) < 45"
+        )
+
+        callback(
+            tool,
+            {
+                "sql": simple_sql,
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [{"matching_count": 11}],
+                columns=["matching_count"],
+                sql=simple_sql,
+            ),
+        )
+
+        query_frame = tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]
+        self.assertEqual(
+            query_frame["comparison_filters"],
+            [{"column": "age", "operator": "<", "value": "45"}],
+        )
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn("- age < 45", content.parts[0].text)
 
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
@@ -1144,7 +1231,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                 row_count=4,
             ),
         )
-        callback = build_format_final_agent_response_callback(settings)
+        callback = build_format_final_agent_response_callback()
         content = callback(SimpleNamespace(state=tool_state))
 
         self.assertIsNotNone(content)
@@ -1157,7 +1244,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertNotIn('"name"', response_text)
 
     def test_formatted_final_response_includes_matched_categories(self) -> None:
-        callback = build_format_final_agent_response_callback(self._settings())
+        callback = build_format_final_agent_response_callback()
         content = callback(
             SimpleNamespace(
                 state={
@@ -1198,7 +1285,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
 
     def test_formatted_final_response_includes_comparison_filters(self) -> None:
-        callback = build_format_final_agent_response_callback(self._settings())
+        callback = build_format_final_agent_response_callback()
         content = callback(
             SimpleNamespace(
                 state={
@@ -1236,30 +1323,29 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
     def test_before_model_callback_short_circuits_when_public_result_exists(self) -> None:
         settings = self._settings()
-        callback = build_finalize_after_query_before_model_callback(settings)
+        callback = build_finalize_after_query_before_model_callback()
+        state = {
+            SQL_PUBLIC_RESULT_STATE_KEY: {
+                "status": "success",
+                "db_path": "fixture.sqlite",
+                "sql": "SELECT COUNT(*) AS matching_count FROM people",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 4}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "matched_row_count": 4,
+                "public_result_kind": "count_aggregate",
+                "query_summary_context": {
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    ]
+                },
+            }
+        }
         result = callback(
-            callback_context=SimpleNamespace(
-                state={
-                    SQL_PUBLIC_RESULT_STATE_KEY: {
-                        "status": "success",
-                        "db_path": "fixture.sqlite",
-                        "sql": "SELECT COUNT(*) AS matching_count FROM people",
-                        "columns": ["matching_count"],
-                        "rows": [{"matching_count": 4}],
-                        "row_count": 1,
-                        "preview_row_count": 1,
-                        "truncated": False,
-                        "error": None,
-                        "matched_row_count": 4,
-                        "public_result_kind": "count_aggregate",
-                        "query_summary_context": {
-                            "categorical_filters": [
-                                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
-                            ]
-                        },
-                    }
-                }
-            ),
+            callback_context=SimpleNamespace(state=state),
             llm_request=SimpleNamespace(),
         )
 
@@ -1272,6 +1358,138 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIn("```", response_text)
         self.assertIn("4", response_text)
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
+        self.assertTrue(state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY])
+
+    def test_after_agent_callback_is_fallback_once_before_model_has_rendered(self) -> None:
+        settings = self._settings()
+        finalize = build_finalize_after_query_before_model_callback()
+        after_agent = build_format_final_agent_response_callback()
+        state = {
+            SQL_PUBLIC_RESULT_STATE_KEY: {
+                "status": "success",
+                "db_path": "fixture.sqlite",
+                "sql": "SELECT COUNT(*) AS matching_count FROM people",
+                "columns": ["matching_count"],
+                "rows": [{"matching_count": 4}],
+                "row_count": 1,
+                "preview_row_count": 1,
+                "truncated": False,
+                "error": None,
+                "matched_row_count": 4,
+                "public_result_kind": "count_aggregate",
+                "query_summary_context": {
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    ]
+                },
+            }
+        }
+
+        result = finalize(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=SimpleNamespace(),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY])
+        self.assertIsNone(after_agent(SimpleNamespace(state=state)))
+
+    def test_build_sql_result_view_model_keeps_critical_fields(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND age > 46",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "detail_count_fallback",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+                "comparison_filters": [
+                    {"column": "age", "operator": ">", "value": "46"},
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+
+        self.assertEqual(model.status, "success")
+        self.assertEqual(model.sql, tool_result["sql"])
+        self.assertEqual(model.public_result_kind, "detail_count_fallback")
+        self.assertEqual(model.matched_row_count, 12)
+        self.assertEqual(model.query_summary_context, tool_result["query_summary_context"])
+        self.assertIn("privacy guardrails", model.note or "")
+
+    def test_build_sql_result_view_model_prefers_display_sql_when_present(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": (
+                "WITH __az_object_source AS (SELECT * FROM filtered_dataset WHERE gender = 'Female') "
+                "SELECT COUNT(*) AS matching_count FROM __az_object_canonical AS filtered_dataset"
+            ),
+            "display_sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female'",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "count_aggregate",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+
+        self.assertEqual(model.sql, tool_result["display_sql"])
+
+    def test_render_sql_result_view_model_matches_existing_formatter_output(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female'",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "count_aggregate",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+        rendered = render_sql_result_view_model(model)
+
+        callback = build_format_final_agent_response_callback()
+        content = callback(SimpleNamespace(state={SQL_PUBLIC_RESULT_STATE_KEY: tool_result}))
+        self.assertIsNotNone(content)
+        self.assertEqual(rendered, content.parts[0].text)
 
     def test_after_model_callback_formats_structured_clarification_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
@@ -1407,6 +1625,79 @@ I need clarification on your question. Could you please specify which category o
         )
 
         self.assertIsNone(result)
+
+    def test_after_model_callback_falls_back_for_unparseable_clarification_like_text(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many females are alcoholics",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "I need clarification before querying because the request is ambiguous. "
+                                "Please specify the exact category, value, or rule you want me to use."
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertEqual(
+            response_text,
+            "I need clarification before I can run the query. Please specify the exact category, value, or rule you want me to use.",
+        )
+        self.assertEqual(state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"], [])
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "how many females are alcoholics",
+        )
+
+    def test_after_model_callback_falls_back_for_heading_only_option_extraction(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many males are not working",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "Available categories:\n"
+                                "- Employed\n"
+                                "- Retired\n"
+                                "- Unemployed\n"
+                                "- Student\n"
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertEqual(
+            response_text,
+            "I need clarification before I can run the query. Please specify the exact category, value, or rule you want me to use.",
+        )
+        self.assertEqual(state[SQL_PENDING_CLARIFICATION_STATE_KEY]["options"], [])
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "how many males are not working",
+        )
 
     def test_after_model_callback_recovers_from_truncated_clarification_json(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())

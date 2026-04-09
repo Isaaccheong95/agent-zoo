@@ -7,6 +7,7 @@ be run as a standalone script.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from typing import Any
@@ -21,6 +22,24 @@ _CLARIFICATION_METADATA_KEYS = {
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
 _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
+_FALLBACK_CLARIFICATION_MESSAGE = (
+    "I need clarification before I can run the query. "
+    "Please specify the exact category, value, or rule you want me to use."
+)
+
+
+@dataclass(slots=True)
+class SQLResultViewModel:
+    """Deterministic contract for rendering final SQL result responses."""
+
+    status: str
+    sql: str
+    result_payload: str
+    query_summary_section: str
+    public_result_kind: str | None
+    matched_row_count: int | float | None
+    query_summary_context: dict[str, Any] | None
+    note: str | None = None
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -177,6 +196,10 @@ def build_clarification_response(
     return response
 
 
+def build_fallback_clarification_response() -> dict[str, Any]:
+    return build_clarification_response(_FALLBACK_CLARIFICATION_MESSAGE)
+
+
 def parse_clarification_response(raw_text: str) -> dict[str, Any] | None:
     candidate = _unwrap_json_code_fence(raw_text)
     try:
@@ -323,6 +346,54 @@ def _prune_subject_echo_options(user_message: str | None, options: list[str]) ->
     return pruned_options or options
 
 
+def looks_like_clarification_attempt(raw_text: str) -> bool:
+    normalized_text = _normalize_whitespace(raw_text)
+    if not normalized_text:
+        return False
+
+    if re.search(r"\bclarif(?:y|ication)\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bplease\s+specify\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bwhat\s+do\s+you\s+mean\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if re.search(
+        r"\bwhich\s+(?:category|categories|value|values|option|options|column|columns|group|groups)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\bchoose\s+(?:from|one|one\s+or\s+more)\b", normalized_text, flags=re.IGNORECASE):
+        return True
+    if "?" in normalized_text and re.search(
+        r"\b(?:which|what|specify|choose|mean|should\s+i\s+use)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"^(?:\s*(?:[-*•]|\d+\s*[.)-])\s*.+)$", raw_text, flags=re.MULTILINE) and re.search(
+        r"\b(?:category|categories|option|options|value|values)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def clarification_requires_deterministic_fallback(clarification: dict[str, Any]) -> bool:
+    user_message = _normalize_whitespace(str(clarification.get("user_message") or ""))
+    if not user_message:
+        return True
+
+    if re.match(
+        r"^(?:available\s+)?(?:categories|options|values)\s*:",
+        user_message,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
 def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     clarification = parse_clarification_response(raw_text)
     if clarification is not None:
@@ -411,95 +482,6 @@ def _get_matching_row_count(tool_result: dict) -> int | float | None:
     return None
 
 
-def _pluralize(value: int | float, singular: str, plural: str) -> str:
-    return singular if value == 1 else plural
-
-
-def summarize_execution_result(tool_result: dict) -> str:
-    if tool_result["status"] != "success":
-        return tool_result.get("error") or "The query failed."
-
-    public_result_kind = tool_result.get("public_result_kind")
-    matched_row_count = _get_matching_row_count(tool_result)
-    aggregate_columns = tool_result.get("aggregate_columns") or []
-    if public_result_kind == "safe_aggregate":
-        if tool_result.get("row_count", 0) > 1:
-            if matched_row_count is not None:
-                group_count = tool_result["row_count"]
-                return (
-                    "Computed grouped cohort-level aggregates across "
-                    f"{group_count} {_pluralize(group_count, 'group', 'groups')} "
-                    f"covering {matched_row_count} matching rows."
-                )
-            return "Computed grouped cohort-level aggregates."
-        if matched_row_count is not None:
-            return f"Computed cohort-level aggregate values for {matched_row_count} matching rows."
-        if aggregate_columns:
-            return "Computed cohort-level aggregate values."
-        return "Computed a cohort-level aggregate value."
-
-    if matched_row_count is not None:
-        if matched_row_count == 0:
-            return "No matching rows were found."
-        if matched_row_count == 1:
-            return "Found 1 matching row."
-        return f"Found {matched_row_count} matching rows."
-
-    row_count = tool_result["row_count"]
-    if row_count == 0:
-        return "No matching rows were found."
-    if row_count == 1:
-        return "Found 1 matching row."
-    if tool_result["truncated"]:
-        return f"Found {row_count} matching rows. Returning a preview."
-    return f"Found {row_count} matching rows."
-
-
-def build_default_explanation(tool_result: dict) -> str:
-    if tool_result["status"] != "success":
-        return tool_result.get("error") or "The query could not be executed safely."
-
-    public_result_kind = tool_result.get("public_result_kind")
-    matched_row_count = _get_matching_row_count(tool_result)
-    if public_result_kind == "safe_aggregate":
-        if tool_result.get("row_count", 0) > 1 and matched_row_count is not None:
-            return (
-                "The query executed successfully and returned grouped cohort-level "
-                f"aggregate values spanning {matched_row_count} matching row(s)."
-            )
-        if matched_row_count is not None:
-            return (
-                "The query executed successfully and returned cohort-level aggregate "
-                f"values computed over {matched_row_count} matching row(s)."
-            )
-        return "The query executed successfully and returned cohort-level aggregate values."
-
-    if matched_row_count is not None:
-        if matched_row_count == 0:
-            return "The query executed successfully but returned no matching rows."
-        if public_result_kind == "detail_count_fallback":
-            return (
-                "The query matched rows successfully, but detailed row output is "
-                "suppressed in privacy mode, so only the matching count is shown."
-            )
-        if tool_result.get("rows") and len(tool_result["rows"][0]) > 1:
-            return (
-                "The query executed successfully and returned grouped counts covering "
-                f"{matched_row_count} matching row(s)."
-            )
-        return (
-            "The query executed successfully and the public response reports "
-            f"{matched_row_count} matching row(s)."
-        )
-
-    row_count = tool_result.get("row_count", 0)
-    if row_count == 0:
-        return "The query executed successfully but returned no matching rows."
-    if tool_result.get("truncated"):
-        return f"The query executed successfully and returned {row_count} rows, so this response shows a preview."
-    return f"The query executed successfully and returned {row_count} row(s)."
-
-
 def _build_query_action_summary(tool_result: dict) -> str:
     if tool_result.get("status") != "success":
         return "Attempted a read-only query against the current filtered dataset."
@@ -569,26 +551,60 @@ def _format_query_summary_section(tool_result: dict) -> str:
     return "What I matched:\n" + "\n".join(f"- {bullet}" for bullet in bullets)
 
 
-def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
-    sql = tool_result.get("sql") or "Not executed"
+def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewModel:
+    display_sql = tool_result.get("display_sql")
+    if not isinstance(display_sql, str) or not display_sql.strip():
+        display_sql = str(tool_result.get("sql") or "Not executed")
     result_payload = format_result_payload(tool_result)
     query_summary_section = _format_query_summary_section(tool_result)
+    public_result_kind = tool_result.get("public_result_kind")
+    if not isinstance(public_result_kind, str):
+        public_result_kind = None
 
-    code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
-    result_block = f"```{code_block}\n{result_payload}\n```".strip()
-
-    output = "\n\n".join(
-        [
-            "Generated SQL:\n" f"```sql\n{sql}\n```",
-            query_summary_section,
-            "Result:\n" f"{result_block}",
-        ]
-    )
-
-    if tool_result.get("public_result_kind") == "detail_count_fallback":
-        output += (
-            "\n\nNote: Individual row-level data cannot be returned due to privacy guardrails. "
+    note = None
+    if public_result_kind == "detail_count_fallback":
+        note = (
+            "Note: Individual row-level data cannot be returned due to privacy guardrails. "
             "Only the number of matching records is shown."
         )
 
+    return SQLResultViewModel(
+        status=str(tool_result.get("status") or "error"),
+        sql=display_sql,
+        result_payload=result_payload,
+        query_summary_section=query_summary_section,
+        public_result_kind=public_result_kind,
+        matched_row_count=_get_matching_row_count(tool_result),
+        query_summary_context=(
+            tool_result.get("query_summary_context")
+            if isinstance(tool_result.get("query_summary_context"), dict)
+            else None
+        ),
+        note=note,
+    )
+
+
+def render_sql_result_view_model(view_model: SQLResultViewModel) -> str:
+    code_block = (
+        "json"
+        if view_model.result_payload.startswith("[") or view_model.result_payload.startswith("{")
+        else ""
+    )
+    result_block = f"```{code_block}\n{view_model.result_payload}\n```".strip()
+
+    output = "\n\n".join(
+        [
+            "Generated SQL:\n" f"```sql\n{view_model.sql}\n```",
+            view_model.query_summary_section,
+            "Result:\n" f"{result_block}",
+        ]
+    )
+    if view_model.note:
+        output += f"\n\n{view_model.note}"
     return output
+
+
+def format_public_query_result(tool_result: dict[str, Any]) -> str:
+    """Format a callback-owned public SQL result using the stable view model."""
+
+    return render_sql_result_view_model(build_sql_result_view_model(tool_result))

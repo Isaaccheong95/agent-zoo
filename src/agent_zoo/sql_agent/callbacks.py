@@ -17,9 +17,12 @@ from google.genai import types
 from .config import SQLAgentSettings, load_settings
 from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
 from .formatting import (
+    build_fallback_clarification_response,
     build_clarification_response,
+    clarification_requires_deterministic_fallback,
     format_clarification_response,
-    format_structured_response,
+    format_public_query_result,
+    looks_like_clarification_attempt,
     normalize_clarification_response,
 )
 try:
@@ -39,6 +42,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
 
 
 SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
+SQL_PUBLIC_RESULT_RENDERED_STATE_KEY = "temp:sql_public_result_rendered"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
 SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
@@ -78,6 +82,13 @@ def _normalize_column_name(value: str) -> str:
     return re.sub(r"\s+", "_", str(value).strip().lower())
 
 
+def _normalize_public_display_sql(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized_sql = re.sub(r"\s+", " ", value).strip().rstrip(";").strip()
+    return normalized_sql or None
+
+
 def _is_count_column(column_name: str) -> bool:
     normalized = _normalize_column_name(column_name)
     return "count" in normalized
@@ -93,6 +104,7 @@ def _is_safe_aggregate_column(column_name: str) -> bool:
 def _clear_private_result_state(state: Any) -> None:
     for key in (
         SQL_PUBLIC_RESULT_STATE_KEY,
+        SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
         SQL_INTERNAL_RESULT_REF_STATE_KEY,
         SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     ):
@@ -125,6 +137,18 @@ def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
     if not isinstance(query_frame, dict):
         return None
     return query_frame
+
+
+def _mark_public_query_result_rendered(state: Any) -> None:
+    if state is None:
+        return
+    state[SQL_PUBLIC_RESULT_RENDERED_STATE_KEY] = True
+
+
+def _public_query_result_was_rendered(state: Any) -> bool:
+    if state is None or not hasattr(state, "get"):
+        return False
+    return bool(state.get(SQL_PUBLIC_RESULT_RENDERED_STATE_KEY))
 
 
 def _request_ends_with_tool_response(llm_request) -> bool:
@@ -258,15 +282,17 @@ def _extract_comparison_filters_from_sql(
     comparison_filters: list[dict[str, str]] = []
     seen_filters: set[tuple[str, str, str]] = set()
     skipped_columns = {column.casefold() for column in (excluded_columns or set()) if column}
+    identifier_pattern = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?'
+    value_pattern = r"-?\d+(?:\.\d+)?|NULL|'(?:(?:'')|[^'])*'"
 
     for match in re.finditer(
-        r'(?P<column>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?)\s*'
-        r'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
-        r'(?P<value>-?\d+(?:\.\d+)?|NULL|\'(?:(?:\'\')|[^\'])*\')',
+        rf'(?:(?:CAST\(\s*(?P<cast_column>{identifier_pattern})\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*\))|(?P<column>{identifier_pattern}))\s*'
+        rf'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
+        rf'(?P<value>{value_pattern})',
         sql,
         flags=re.IGNORECASE,
     ):
-        column_name = _normalize_sql_identifier(match.group("column"))
+        column_name = _normalize_sql_identifier(match.group("cast_column") or match.group("column") or "")
         if not column_name or column_name.casefold() in skipped_columns:
             continue
 
@@ -1279,6 +1305,9 @@ def build_remember_query_result_callback(
             tool_response,
             active_settings,
         )
+        display_sql = _normalize_public_display_sql(args.get("sql") if isinstance(args, dict) else None)
+        if display_sql is not None:
+            public_result["display_sql"] = display_sql
         if last_query_frame is not None:
             public_result["query_summary_context"] = dict(last_query_frame)
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
@@ -1291,21 +1320,23 @@ def build_remember_query_result_callback(
     return remember_query_result
 
 
-def build_format_final_agent_response_callback(
-    settings: SQLAgentSettings | None = None,
-):
+def build_format_final_agent_response_callback():
     def format_final_agent_response(callback_context=None, **kwargs) -> types.Content | None:
         context = callback_context
         if context is None:
+            return None
+
+        if _public_query_result_was_rendered(context.state):
             return None
 
         public_query_result = context.state.get(SQL_PUBLIC_RESULT_STATE_KEY)
         if not isinstance(public_query_result, dict):
             return None
 
+        _mark_public_query_result_rendered(context.state)
         return types.Content(
             role="model",
-            parts=[types.Part(text=format_structured_response(public_query_result))],
+            parts=[types.Part(text=format_public_query_result(public_query_result))],
         )
 
     return format_final_agent_response
@@ -1337,7 +1368,21 @@ def build_normalize_clarification_after_model_callback(
 
         clarification = normalize_clarification_response(response_text)
         if clarification is None:
-            return None
+            if not looks_like_clarification_attempt(response_text):
+                return None
+            clarification = build_fallback_clarification_response()
+            _print_clarification_debug(
+                active_settings,
+                "after-model-fallback-reason",
+                "normalization_failed",
+            )
+        elif clarification_requires_deterministic_fallback(clarification):
+            clarification = build_fallback_clarification_response()
+            _print_clarification_debug(
+                active_settings,
+                "after-model-fallback-reason",
+                "low_confidence_normalization",
+            )
 
         clarification = _match_clarification_values_to_schema_guidance(
             clarification,
@@ -1379,9 +1424,7 @@ def build_normalize_clarification_after_model_callback(
     return normalize_clarification_after_model
 
 
-def build_finalize_after_query_before_model_callback(
-    settings: SQLAgentSettings | None = None,
-):
+def build_finalize_after_query_before_model_callback():
     def finalize_after_query(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         context = callback_context
         if context is None:
@@ -1391,10 +1434,11 @@ def build_finalize_after_query_before_model_callback(
         if not isinstance(public_query_result, dict):
             return None
 
+        _mark_public_query_result_rendered(context.state)
         return LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[types.Part(text=format_structured_response(public_query_result))],
+                parts=[types.Part(text=format_public_query_result(public_query_result))],
             )
         )
 
@@ -1500,7 +1544,7 @@ def build_combined_before_model_callback(
     )
 
     scope_gate = build_scope_gate_callback(classifier, debug=active_settings.debug)
-    finalize = build_finalize_after_query_before_model_callback(active_settings)
+    finalize = build_finalize_after_query_before_model_callback()
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
@@ -1668,8 +1712,3 @@ def build_combined_before_model_callback(
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined
-
-
-remember_query_result = build_remember_query_result_callback()
-normalize_clarification_after_model = build_normalize_clarification_after_model_callback()
-format_final_agent_response = build_format_final_agent_response_callback()
