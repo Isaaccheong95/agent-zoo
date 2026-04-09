@@ -121,6 +121,30 @@ def _normalize_selected_identifier(selected_identifier: Any, identifiers: list[s
     return identifier_lookup.get(_normalize_resolution_text(selected_identifier), "")
 
 
+def _normalize_selected_identifiers(selected_identifiers: Any, identifiers: list[str]) -> list[str]:
+    if not isinstance(selected_identifiers, list):
+        return []
+
+    identifier_lookup: dict[str, str] = {}
+    for identifier in identifiers:
+        normalized_identifier = _normalize_resolution_text(identifier)
+        if normalized_identifier and normalized_identifier not in identifier_lookup:
+            identifier_lookup[normalized_identifier] = identifier
+
+    normalized_matches: list[str] = []
+    seen_identifiers: set[str] = set()
+    for selected_identifier in selected_identifiers:
+        if not isinstance(selected_identifier, str):
+            continue
+        canonical_identifier = identifier_lookup.get(
+            _normalize_resolution_text(selected_identifier)
+        )
+        if canonical_identifier and canonical_identifier not in seen_identifiers:
+            seen_identifiers.add(canonical_identifier)
+            normalized_matches.append(canonical_identifier)
+    return normalized_matches
+
+
 def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
     return {
         "resolution_type": "custom_rule",
@@ -472,6 +496,98 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
             "target_column": "",
             "selected_values": [],
             "refinement_request": "",
+        }
+
+    return resolve
+
+
+def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
+    """Return a resolver for fresh-turn schema interpretation ambiguity.
+
+    The resolver decides whether a user request is already grounded enough to
+    proceed or whether the agent should ask a pre-query clarification between
+    multiple plausible schema columns.
+    """
+
+    system_prompt = (
+        "You are a strict schema-grounding resolver for a dataset SQL agent.\n"
+        "You will receive the latest user request plus the available schema columns, types, and any categorical value previews.\n"
+        "Your job is to decide whether the request is already specific enough at the column or field level, or whether it needs a clarification between multiple plausible schema columns before any SQL is generated.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"proceed|needs_clarification","candidate_columns":["..."]}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='needs_clarification' only when two or more provided schema columns are plausible interpretations of the user's wording and the request does not clearly choose one.\n"
+        "- Use resolution_type='proceed' when the request is already specific enough, when no nearby competing schema interpretation exists, or when any ambiguity is only about values within a single column.\n"
+        "- candidate_columns must contain only exact identifiers from the provided schema column list and must be ordered best-first.\n"
+        "- When resolution_type='needs_clarification', include 2 to 4 candidate_columns.\n"
+        "- When resolution_type='proceed', candidate_columns must be empty.\n"
+        "- This resolver is only for schema interpretation ambiguity, not for value-level ambiguity inside one chosen column.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def resolve(
+        user_text: str,
+        schema_context: str,
+        candidate_columns: list[str],
+    ) -> dict[str, Any]:
+        if not user_text or not user_text.strip() or not schema_context.strip() or not candidate_columns:
+            return {
+                "resolution_type": "proceed",
+                "candidate_columns": [],
+            }
+
+        classifier_input = (
+            "Schema column identifiers you may return:\n"
+            + "\n".join(f"- {identifier}" for identifier in candidate_columns)
+            + "\n\n"
+            + "Schema columns and previews:\n"
+            + schema_context.strip()
+            + "\n\nLatest user request:\n"
+            + user_text.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            system_prompt,
+            classifier_input,
+            max_tokens=500,
+            debug_label="schema-grounding-resolver" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return {
+                "resolution_type": "proceed",
+                "candidate_columns": [],
+            }
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-resolver",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return {
+                "resolution_type": "proceed",
+                "candidate_columns": [],
+            }
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        normalized_candidate_columns = _normalize_selected_identifiers(
+            parsed_response.get("candidate_columns"),
+            candidate_columns,
+        )
+
+        if resolution_type == "needs_clarification" and len(normalized_candidate_columns) >= 2:
+            return {
+                "resolution_type": "needs_clarification",
+                "candidate_columns": normalized_candidate_columns[:4],
+            }
+
+        return {
+            "resolution_type": "proceed",
+            "candidate_columns": [],
         }
 
     return resolve

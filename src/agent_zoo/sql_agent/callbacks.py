@@ -33,6 +33,7 @@ try:
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
         build_llm_result_refinement_resolver,
+        build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
     )
 except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
@@ -40,6 +41,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
         build_llm_result_refinement_resolver,
+        build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
     )
 
@@ -543,6 +545,103 @@ def _match_clarification_values_to_schema_guidance(
     return normalized_clarification
 
 
+def _build_schema_grounding_catalog(schema_summary: dict[str, Any]) -> dict[str, Any]:
+    tables = schema_summary.get("tables") or []
+    if not isinstance(tables, list):
+        return {
+            "context_text": "",
+            "candidate_columns": [],
+            "option_labels": {},
+        }
+
+    name_counts: dict[str, int] = {}
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+            normalized_column_name = column_name.casefold()
+            name_counts[normalized_column_name] = name_counts.get(normalized_column_name, 0) + 1
+
+    context_lines: list[str] = []
+    candidate_columns: list[str] = []
+    option_labels: dict[str, str] = {}
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        table_name = str(table.get("name") or "").strip()
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+
+            identifier = column_name
+            if name_counts.get(column_name.casefold(), 0) > 1 and table_name:
+                identifier = f"{table_name}.{column_name}"
+
+            candidate_columns.append(identifier)
+            declared_type = str(column.get("type") or "TEXT").strip() or "TEXT"
+            categorical_values = [
+                value.strip()
+                for value in column.get("categorical_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+            line = f"- {identifier} ({declared_type})"
+            if categorical_values:
+                preview_values = categorical_values[:4]
+                preview_text = ", ".join(preview_values)
+                if len(categorical_values) > len(preview_values):
+                    preview_text += ", ..."
+                line += f": categorical values = {preview_text}"
+                option_labels[identifier] = f"{identifier} (values: {preview_text})"
+            else:
+                option_labels[identifier] = identifier
+            context_lines.append(line)
+
+    return {
+        "context_text": "\n".join(context_lines),
+        "candidate_columns": candidate_columns,
+        "option_labels": option_labels,
+    }
+
+
+def _build_schema_grounding_clarification(
+    topic_context: str,
+    candidate_columns: list[str],
+    schema_grounding_catalog: dict[str, Any],
+) -> dict[str, Any] | None:
+    option_labels = schema_grounding_catalog.get("option_labels") or {}
+    selected_options: list[str] = []
+    option_columns: dict[str, str] = {}
+    for candidate_column in candidate_columns:
+        option_label = option_labels.get(candidate_column)
+        if not isinstance(option_label, str) or not option_label.strip():
+            continue
+        if option_label in option_columns:
+            continue
+        selected_options.append(option_label)
+        option_columns[option_label] = candidate_column
+
+    if len(selected_options) < 2:
+        return None
+
+    clarification = build_clarification_response(
+        "I found more than one nearby schema field for this request. Which one do you mean?",
+        selected_options,
+        clarification_kind=CLARIFICATION_KIND_INTERPRETATION,
+    )
+    if topic_context:
+        clarification["topic_context"] = topic_context
+    clarification["option_columns"] = option_columns
+    return clarification
+
+
 def _resolve_pending_clarification_reply(
     resolver,
     clarification: dict[str, Any],
@@ -736,6 +835,21 @@ def _apply_pending_clarification_followup_with_resolution(
         rewritten_sections.append(
             "Matched options from the reply: " + ", ".join(resolved_options)
         )
+        option_columns = clarification.get("option_columns")
+        if isinstance(option_columns, dict):
+            resolved_columns: list[str] = []
+            seen_columns: set[str] = set()
+            for resolved_option in resolved_options:
+                resolved_column = str(option_columns.get(resolved_option) or "").strip()
+                if not resolved_column or resolved_column in seen_columns:
+                    continue
+                seen_columns.add(resolved_column)
+                resolved_columns.append(resolved_column)
+            if resolved_columns:
+                label = "Resolved schema field from the reply: "
+                if len(resolved_columns) > 1:
+                    label = "Resolved schema fields from the reply: "
+                rewritten_sections.append(label + ", ".join(resolved_columns))
     if normalized_custom_rule:
         rewritten_sections.append(
             "Resolved custom rule from the reply: " + normalized_custom_rule
@@ -1559,6 +1673,11 @@ def build_combined_before_model_callback(
         active_settings.model,
         debug=active_settings.debug,
     )
+    schema_grounding_resolver = build_llm_schema_grounding_resolver(
+        active_settings.model,
+        debug=active_settings.debug,
+    )
+    schema_grounding_catalog = _build_schema_grounding_catalog(schema_summary)
 
     scope_gate = build_scope_gate_callback(classifier, debug=active_settings.debug)
     finalize = build_finalize_after_query_before_model_callback()
@@ -1567,6 +1686,7 @@ def build_combined_before_model_callback(
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
             user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+            topic_text = ""
             if user_text:
                 topic_text = _extract_topic_context_text(user_text)
                 callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
@@ -1726,6 +1846,54 @@ def build_combined_before_model_callback(
         result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
         if result is not None:
             return result
+
+        if callback_context is not None and not _request_ends_with_tool_response(llm_request):
+            user_text = _extract_last_user_text(llm_request) if llm_request is not None else ""
+            if user_text:
+                topic_text = str(
+                    callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+                    or callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+                    or ""
+                ).strip()
+                grounding_resolution = schema_grounding_resolver(
+                    user_text,
+                    str(schema_grounding_catalog.get("context_text") or ""),
+                    [
+                        identifier
+                        for identifier in schema_grounding_catalog.get("candidate_columns") or []
+                        if isinstance(identifier, str) and identifier.strip()
+                    ],
+                )
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-schema-grounding-resolution",
+                    grounding_resolution,
+                )
+                if grounding_resolution.get("resolution_type") == "needs_clarification":
+                    clarification = _build_schema_grounding_clarification(
+                        topic_text,
+                        [
+                            value
+                            for value in grounding_resolution.get("candidate_columns") or []
+                            if isinstance(value, str) and value.strip()
+                        ],
+                        schema_grounding_catalog,
+                    )
+                    if clarification is not None:
+                        callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-schema-grounding-clarification",
+                            clarification,
+                        )
+                        formatted_response = format_clarification_response(clarification)
+                        if formatted_response:
+                            return LlmResponse(
+                                content=types.Content(
+                                    role="model",
+                                    parts=[types.Part(text=formatted_response)],
+                                )
+                            )
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined

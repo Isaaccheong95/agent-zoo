@@ -47,6 +47,7 @@ from agent_zoo.sql_agent.tools import build_sql_tools
 from agent_zoo.scope_guard import (
     build_llm_clarification_resolver,
     build_llm_result_refinement_resolver,
+    build_llm_schema_grounding_resolver,
     build_llm_scope_gate,
 )
 
@@ -465,6 +466,68 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 "target_column": "",
                 "selected_values": [],
                 "refinement_request": "",
+            },
+        )
+
+    def test_schema_grounding_resolver_includes_schema_context(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk"]}'
+                        )
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many females drink",
+                "- gender (TEXT): categorical values = Female, Male\n- socalc (TEXT): categorical values = Never, Occasionally, Regularly, Unknown\n- socsmk (TEXT): categorical values = No, Unknown, Yes",
+                ["gender", "socalc", "socsmk"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "needs_clarification",
+                "candidate_columns": ["socalc", "socsmk"],
+            },
+        )
+        self.assertIn("proceed|needs_clarification", captured["system_prompt"])
+        self.assertIn("Schema column identifiers you may return", captured["user_prompt"])
+        self.assertIn("socalc", captured["user_prompt"])
+        self.assertIn("socsmk", captured["user_prompt"])
+        self.assertIn("Latest user request", captured["user_prompt"])
+        self.assertIn("how many females drink", captured["user_prompt"])
+
+    def test_schema_grounding_resolver_fails_open_on_invalid_output(self) -> None:
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many females drink",
+                "- socalc (TEXT): categorical values = Never, Occasionally, Regularly, Unknown",
+                ["socalc", "socsmk"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "proceed",
+                "candidate_columns": [],
             },
         )
 
@@ -2477,6 +2540,95 @@ Which category or combination should I use for \"alcoholic\"?
         )
         self.assertEqual(scope_gate_calls, ["tell me a joke"])
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
+
+    def test_combined_before_model_callback_creates_schema_grounding_clarification(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_schema_grounding_resolver(user_text: str, schema_context: str, candidate_columns: list[str]) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, candidate_columns))
+            return {
+                "resolution_type": "needs_clarification",
+                "candidate_columns": ["socalc", "socsmk"],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT, socsmk TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {"name": "gender", "type": "TEXT", "categorical_values": ["Female", "Male"]},
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="how many females drink")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(scope_gate_calls, ["how many females drink"])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        response_text = result.content.parts[0].text
+        self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
+        self.assertIn("1. socalc (values: Never, Occasionally, Regularly, Unknown)", response_text)
+        self.assertIn("2. socsmk (values: No, Unknown, Yes)", response_text)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["clarification_kind"],
+            "interpretation",
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "how many females drink",
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["option_columns"],
+            {
+                "socalc (values: Never, Occasionally, Regularly, Unknown)": "socalc",
+                "socsmk (values: No, Unknown, Yes)": "socsmk",
+            },
+        )
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
