@@ -536,15 +536,6 @@ The purpose of this layer is to keep rendering decisions out of the callback cod
 
 This function renders the final SQL answer from the typed contract.
 
-#### `build_default_explanation(tool_result)`
-
-Behavior:
-
-- on error, explain the failure
-- on zero rows, explain that the query succeeded but matched nothing
-- on truncated results, explain that this is a preview
-- otherwise explain that the query succeeded and how many rows came back
-
 #### `format_public_query_result(...)`
 
 This is the main callback-facing formatter for final SQL results.
@@ -556,10 +547,6 @@ It builds the view model and renders the final structured answer:
 3. `Result`
 
 If the public result kind is `detail_count_fallback`, it also appends the privacy note explaining why only the matching count is shown.
-
-#### `format_structured_response(...)`
-
-This now exists as a backward-compatible wrapper around `format_public_query_result(...)`.
 
 #### Clarification fallback behavior
 
@@ -595,8 +582,6 @@ This makes it easy to write deterministic tests for:
 - hallucinated columns
 
 #### `summarize_execution_result(...)`
-
-This helper is also imported by `formatting.py`.
 
 A subtle point: this summary is based on `execution_result["row_count"]`, which is the number of rows returned by the SQL result set, not necessarily the semantic meaning of the query.
 

@@ -482,95 +482,6 @@ def _get_matching_row_count(tool_result: dict) -> int | float | None:
     return None
 
 
-def _pluralize(value: int | float, singular: str, plural: str) -> str:
-    return singular if value == 1 else plural
-
-
-def summarize_execution_result(tool_result: dict) -> str:
-    if tool_result["status"] != "success":
-        return tool_result.get("error") or "The query failed."
-
-    public_result_kind = tool_result.get("public_result_kind")
-    matched_row_count = _get_matching_row_count(tool_result)
-    aggregate_columns = tool_result.get("aggregate_columns") or []
-    if public_result_kind == "safe_aggregate":
-        if tool_result.get("row_count", 0) > 1:
-            if matched_row_count is not None:
-                group_count = tool_result["row_count"]
-                return (
-                    "Computed grouped cohort-level aggregates across "
-                    f"{group_count} {_pluralize(group_count, 'group', 'groups')} "
-                    f"covering {matched_row_count} matching rows."
-                )
-            return "Computed grouped cohort-level aggregates."
-        if matched_row_count is not None:
-            return f"Computed cohort-level aggregate values for {matched_row_count} matching rows."
-        if aggregate_columns:
-            return "Computed cohort-level aggregate values."
-        return "Computed a cohort-level aggregate value."
-
-    if matched_row_count is not None:
-        if matched_row_count == 0:
-            return "No matching rows were found."
-        if matched_row_count == 1:
-            return "Found 1 matching row."
-        return f"Found {matched_row_count} matching rows."
-
-    row_count = tool_result["row_count"]
-    if row_count == 0:
-        return "No matching rows were found."
-    if row_count == 1:
-        return "Found 1 matching row."
-    if tool_result["truncated"]:
-        return f"Found {row_count} matching rows. Returning a preview."
-    return f"Found {row_count} matching rows."
-
-
-def build_default_explanation(tool_result: dict) -> str:
-    if tool_result["status"] != "success":
-        return tool_result.get("error") or "The query could not be executed safely."
-
-    public_result_kind = tool_result.get("public_result_kind")
-    matched_row_count = _get_matching_row_count(tool_result)
-    if public_result_kind == "safe_aggregate":
-        if tool_result.get("row_count", 0) > 1 and matched_row_count is not None:
-            return (
-                "The query executed successfully and returned grouped cohort-level "
-                f"aggregate values spanning {matched_row_count} matching row(s)."
-            )
-        if matched_row_count is not None:
-            return (
-                "The query executed successfully and returned cohort-level aggregate "
-                f"values computed over {matched_row_count} matching row(s)."
-            )
-        return "The query executed successfully and returned cohort-level aggregate values."
-
-    if matched_row_count is not None:
-        if matched_row_count == 0:
-            return "The query executed successfully but returned no matching rows."
-        if public_result_kind == "detail_count_fallback":
-            return (
-                "The query matched rows successfully, but detailed row output is "
-                "suppressed in privacy mode, so only the matching count is shown."
-            )
-        if tool_result.get("rows") and len(tool_result["rows"][0]) > 1:
-            return (
-                "The query executed successfully and returned grouped counts covering "
-                f"{matched_row_count} matching row(s)."
-            )
-        return (
-            "The query executed successfully and the public response reports "
-            f"{matched_row_count} matching row(s)."
-        )
-
-    row_count = tool_result.get("row_count", 0)
-    if row_count == 0:
-        return "The query executed successfully but returned no matching rows."
-    if tool_result.get("truncated"):
-        return f"The query executed successfully and returned {row_count} rows, so this response shows a preview."
-    return f"The query executed successfully and returned {row_count} row(s)."
-
-
 def _build_query_action_summary(tool_result: dict) -> str:
     if tool_result.get("status") != "success":
         return "Attempted a read-only query against the current filtered dataset."
@@ -695,9 +606,3 @@ def format_public_query_result(tool_result: dict[str, Any]) -> str:
     """Format a callback-owned public SQL result using the stable view model."""
 
     return render_sql_result_view_model(build_sql_result_view_model(tool_result))
-
-
-def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
-    # explanation is retained for backward compatibility with existing call sites.
-    _ = explanation
-    return format_public_query_result(tool_result)
