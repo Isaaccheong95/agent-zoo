@@ -1,6 +1,6 @@
 """Format SQL execution results into the agent's final user-facing response.
 
-This module converts structured tool output into the four-section response
+This module converts structured tool output into the deterministic response
 format expected by the SQL agent. It is used by callbacks and is not meant to
 be run as a standalone script.
 """
@@ -500,18 +500,89 @@ def build_default_explanation(tool_result: dict) -> str:
     return f"The query executed successfully and returned {row_count} row(s)."
 
 
+def _build_query_action_summary(tool_result: dict) -> str:
+    if tool_result.get("status") != "success":
+        return "Attempted a read-only query against the current filtered dataset."
+
+    public_result_kind = tool_result.get("public_result_kind")
+    if public_result_kind == "detail_count_fallback":
+        return "Matched rows in the current filtered dataset and returned only the safe count."
+    if public_result_kind == "safe_aggregate":
+        if tool_result.get("row_count", 0) > 1:
+            return "Computed grouped aggregate values for the matched cohort."
+        return "Computed aggregate values for the matched cohort."
+    if public_result_kind == "count_aggregate":
+        return "Counted matching rows in the current filtered dataset."
+
+    rows = tool_result.get("rows") or []
+    if len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
+        return "Computed a scalar result from the current filtered dataset."
+    return "Selected matching rows from the current filtered dataset."
+
+
+def _build_query_filter_bullets(tool_result: dict) -> list[str]:
+    query_summary_context = tool_result.get("query_summary_context")
+    if not isinstance(query_summary_context, dict):
+        return []
+
+    bullets: list[str] = []
+    categorical_filters = [
+        entry
+        for entry in (query_summary_context.get("categorical_filters") or [])
+        if isinstance(entry, dict)
+    ]
+    for entry in categorical_filters:
+        column_name = str(entry.get("column") or "").strip()
+        selected_values = [
+            value.strip()
+            for value in entry.get("selected_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not column_name or not selected_values:
+            continue
+        if len(selected_values) == 1:
+            bullets.append(f"{column_name} = {selected_values[0]}")
+            continue
+        bullets.append(f"{column_name} in {', '.join(selected_values)}")
+
+    comparison_filters = [
+        entry
+        for entry in (query_summary_context.get("comparison_filters") or [])
+        if isinstance(entry, dict)
+    ]
+    for entry in comparison_filters:
+        column_name = str(entry.get("column") or "").strip()
+        operator = str(entry.get("operator") or "").strip()
+        value = str(entry.get("value") or "").strip()
+        if not column_name or not operator or not value:
+            continue
+        bullets.append(f"{column_name} {operator} {value}")
+
+    return bullets
+
+
+def _format_query_summary_section(tool_result: dict) -> str:
+    bullets = _build_query_filter_bullets(tool_result)
+    if not bullets:
+        bullets = [_build_query_action_summary(tool_result)]
+
+    return "What I matched:\n" + "\n".join(f"- {bullet}" for bullet in bullets)
+
+
 def format_structured_response(tool_result: dict, explanation: str | None = None) -> str:
     sql = tool_result.get("sql") or "Not executed"
     result_payload = format_result_payload(tool_result)
+    query_summary_section = _format_query_summary_section(tool_result)
 
     code_block = "json" if result_payload.startswith("[") or result_payload.startswith("{") else ""
     result_block = f"```{code_block}\n{result_payload}\n```".strip()
 
-    output = (
-        "Generated SQL:\n"
-        f"```sql\n{sql}\n```\n\n"
-        "Result:\n"
-        f"{result_block}"
+    output = "\n\n".join(
+        [
+            "Generated SQL:\n" f"```sql\n{sql}\n```",
+            query_summary_section,
+            "Result:\n" f"{result_block}",
+        ]
     )
 
     if tool_result.get("public_result_kind") == "detail_count_fallback":

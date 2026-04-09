@@ -180,6 +180,22 @@ def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
     ]
 
 
+def _normalize_sql_identifier(value: str) -> str:
+    identifier = value.strip()
+    if "." in identifier:
+        identifier = identifier.rsplit(".", 1)[-1]
+    if identifier.startswith('"') and identifier.endswith('"') and len(identifier) >= 2:
+        identifier = identifier[1:-1]
+    return identifier.strip()
+
+
+def _normalize_sql_literal(value: str) -> str:
+    literal = value.strip()
+    if literal.startswith("'") and literal.endswith("'") and len(literal) >= 2:
+        literal = literal[1:-1].replace("''", "'")
+    return literal.strip()
+
+
 def _extract_categorical_filters_from_sql(
     sql: str,
     categorical_value_guidance: list[dict[str, Any]],
@@ -234,6 +250,45 @@ def _extract_categorical_filters_from_sql(
     return filters
 
 
+def _extract_comparison_filters_from_sql(
+    sql: str,
+    *,
+    excluded_columns: set[str] | None = None,
+) -> list[dict[str, str]]:
+    comparison_filters: list[dict[str, str]] = []
+    seen_filters: set[tuple[str, str, str]] = set()
+    skipped_columns = {column.casefold() for column in (excluded_columns or set()) if column}
+
+    for match in re.finditer(
+        r'(?P<column>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?)\s*'
+        r'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
+        r'(?P<value>-?\d+(?:\.\d+)?|NULL|\'(?:(?:\'\')|[^\'])*\')',
+        sql,
+        flags=re.IGNORECASE,
+    ):
+        column_name = _normalize_sql_identifier(match.group("column"))
+        if not column_name or column_name.casefold() in skipped_columns:
+            continue
+
+        normalized_filter = (
+            column_name,
+            match.group("operator"),
+            _normalize_sql_literal(match.group("value")),
+        )
+        if normalized_filter in seen_filters:
+            continue
+        seen_filters.add(normalized_filter)
+        comparison_filters.append(
+            {
+                "column": normalized_filter[0],
+                "operator": normalized_filter[1],
+                "value": normalized_filter[2],
+            }
+        )
+
+    return comparison_filters
+
+
 def _build_last_query_frame(
     state: Any,
     args: dict[str, Any],
@@ -262,6 +317,16 @@ def _build_last_query_frame(
     categorical_filters = _extract_categorical_filters_from_sql(raw_sql, categorical_value_guidance)
     if categorical_filters:
         query_frame["categorical_filters"] = categorical_filters
+    comparison_filters = _extract_comparison_filters_from_sql(
+        raw_sql,
+        excluded_columns={
+            str(entry.get("column") or "").strip()
+            for entry in categorical_filters
+            if isinstance(entry, dict)
+        },
+    )
+    if comparison_filters:
+        query_frame["comparison_filters"] = comparison_filters
     return query_frame
 
 
@@ -1186,6 +1251,7 @@ def build_remember_query_result_callback(
 
         is_final = _tool_call_is_final(args)
         _clear_private_result_state(tool_context.state)
+        last_query_frame: dict[str, Any] | None = None
 
         if active_settings.capture_internal_rows and tool_response.get("status") == "success":
             tool_context.state[SQL_INTERNAL_QUERY_RESULT_STATE_KEY] = tool_response
@@ -1213,6 +1279,8 @@ def build_remember_query_result_callback(
             tool_response,
             active_settings,
         )
+        if last_query_frame is not None:
+            public_result["query_summary_context"] = dict(last_query_frame)
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
 
         if active_settings.count_aggregates_only:

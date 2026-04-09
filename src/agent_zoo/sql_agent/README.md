@@ -73,8 +73,8 @@
 This repository contains a Google ADK agent that turns a natural-language question into a safe, read-only SQLite query, executes that query locally, and returns:
 
 - the generated SQL
+- a short summary of what it matched
 - the result
-- a short explanation
 
 This README is intentionally detailed. It is meant to explain not just how to run the agent, but how the code is wired together, why each file exists, how data flows through the system, and where the current limitations are.
 
@@ -166,9 +166,8 @@ after_agent_callback formats final response
     v
 User sees:
 - Generated SQL
-- Result summary
+- What I matched
 - Result
-- Explanation
 ```
 
 ## How To Run It
@@ -370,11 +369,10 @@ It has two layers:
 - use `COUNT(*)` for counts
 - use `LIMIT` for large listings
 - avoid exposing reasoning
-- output exactly four sections:
+- output exactly these top-level sections:
   - `Generated SQL`
-  - `Result summary`
+  - `What I matched`
   - `Result`
-  - `Explanation`
 
 `build_agent_instruction(settings)` also appends:
 
@@ -508,12 +506,11 @@ Behavior:
 
 #### `format_structured_response(...)`
 
-This assembles the final four-section answer:
+This assembles the final structured answer:
 
 1. `Generated SQL`
-2. `Result summary`
+2. `What I matched`
 3. `Result`
-4. `Explanation`
 
 This formatting function is what the `after_agent_callback` ultimately returns to the user.
 
@@ -869,7 +866,7 @@ SELECT COUNT(*) FROM titanic_passengers WHERE sex = 'female' AND age < 45
    - schema-valid according to `EXPLAIN QUERY PLAN`
 8. SQLite executes the query in read-only mode.
 9. The callback stores the tool response in state.
-10. The final callback formats the answer into the four-section output.
+10. The final callback formats the answer into the structured output.
 
 ## Data Contracts
 
