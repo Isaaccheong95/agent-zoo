@@ -929,6 +929,56 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             [{"column": "age", "operator": ">", "value": "46"}],
         )
 
+    def test_remember_query_result_includes_cast_comparison_filters_in_final_render(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Male", "Female"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                    {"column": "Centre", "values": ["HospitalA", "HospitalB"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "how many females are smokers from hosp A and under 45",
+            }
+        )
+        simple_sql = (
+            "SELECT COUNT(*) AS matching_count FROM filtered_dataset "
+            "WHERE gender = 'Female' AND socsmk = 'Yes' AND Centre = 'HospitalA' "
+            "AND CAST(age AS INTEGER) < 45"
+        )
+
+        callback(
+            tool,
+            {
+                "sql": simple_sql,
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [{"matching_count": 11}],
+                columns=["matching_count"],
+                sql=simple_sql,
+            ),
+        )
+
+        query_frame = tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]
+        self.assertEqual(
+            query_frame["comparison_filters"],
+            [{"column": "age", "operator": "<", "value": "45"}],
+        )
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn("- age < 45", content.parts[0].text)
+
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
             [

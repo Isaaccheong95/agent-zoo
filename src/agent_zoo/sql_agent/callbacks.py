@@ -282,15 +282,17 @@ def _extract_comparison_filters_from_sql(
     comparison_filters: list[dict[str, str]] = []
     seen_filters: set[tuple[str, str, str]] = set()
     skipped_columns = {column.casefold() for column in (excluded_columns or set()) if column}
+    identifier_pattern = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?'
+    value_pattern = r"-?\d+(?:\.\d+)?|NULL|'(?:(?:'')|[^'])*'"
 
     for match in re.finditer(
-        r'(?P<column>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?)\s*'
-        r'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
-        r'(?P<value>-?\d+(?:\.\d+)?|NULL|\'(?:(?:\'\')|[^\'])*\')',
+        rf'(?:(?:CAST\(\s*(?P<cast_column>{identifier_pattern})\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*\))|(?P<column>{identifier_pattern}))\s*'
+        rf'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
+        rf'(?P<value>{value_pattern})',
         sql,
         flags=re.IGNORECASE,
     ):
-        column_name = _normalize_sql_identifier(match.group("column"))
+        column_name = _normalize_sql_identifier(match.group("cast_column") or match.group("column") or "")
         if not column_name or column_name.casefold() in skipped_columns:
             continue
 
