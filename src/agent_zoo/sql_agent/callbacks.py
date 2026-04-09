@@ -82,6 +82,13 @@ def _normalize_column_name(value: str) -> str:
     return re.sub(r"\s+", "_", str(value).strip().lower())
 
 
+def _normalize_public_display_sql(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized_sql = re.sub(r"\s+", " ", value).strip().rstrip(";").strip()
+    return normalized_sql or None
+
+
 def _is_count_column(column_name: str) -> bool:
     normalized = _normalize_column_name(column_name)
     return "count" in normalized
@@ -1296,6 +1303,9 @@ def build_remember_query_result_callback(
             tool_response,
             active_settings,
         )
+        display_sql = _normalize_public_display_sql(args.get("sql") if isinstance(args, dict) else None)
+        if display_sql is not None:
+            public_result["display_sql"] = display_sql
         if last_query_frame is not None:
             public_result["query_summary_context"] = dict(last_query_frame)
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result

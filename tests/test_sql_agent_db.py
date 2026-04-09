@@ -593,6 +593,38 @@ class SQLAgentObjectModeTestCase(unittest.TestCase):
             ],
         )
 
+    def test_object_mode_final_render_shows_original_query_not_canonicalized_sql(self) -> None:
+        simple_sql = "SELECT COUNT(*) AS matching_count FROM records WHERE city = 'Tokyo'"
+        tool_response = execute_sqlite_query(
+            self.db_path,
+            simple_sql,
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+
+        self.assertEqual(tool_response["status"], "success")
+        self.assertIn("__az_object_source", tool_response["sql"])
+
+        callback = build_remember_query_result_callback(self._object_settings(minimum_aggregate_count=1))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={})
+
+        callback(
+            tool,
+            {"sql": simple_sql, "is_final": True},
+            tool_context,
+            tool_response,
+        )
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["display_sql"], simple_sql)
+        self.assertIn("__az_object_source", public_result["sql"])
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn(simple_sql, content.parts[0].text)
+        self.assertNotIn("__az_object_source", content.parts[0].text)
+
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):
     def _settings(self, **overrides) -> SQLAgentSettings:
@@ -1346,6 +1378,37 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(model.matched_row_count, 12)
         self.assertEqual(model.query_summary_context, tool_result["query_summary_context"])
         self.assertIn("privacy guardrails", model.note or "")
+
+    def test_build_sql_result_view_model_prefers_display_sql_when_present(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": (
+                "WITH __az_object_source AS (SELECT * FROM filtered_dataset WHERE gender = 'Female') "
+                "SELECT COUNT(*) AS matching_count FROM __az_object_canonical AS filtered_dataset"
+            ),
+            "display_sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female'",
+            "columns": ["matching_count"],
+            "rows": [{"matching_count": 12}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "count_aggregate",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+
+        self.assertEqual(model.sql, tool_result["display_sql"])
 
     def test_render_sql_result_view_model_matches_existing_formatter_output(self) -> None:
         tool_result = {

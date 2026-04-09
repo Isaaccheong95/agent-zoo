@@ -522,7 +522,7 @@ This is why aggregate queries like `SELECT COUNT(*) ...` display just the number
 
 This function converts the callback-owned public result dictionary into a small deterministic response contract. The current contract includes:
 
-- the executed SQL
+- the display SQL shown to the user, preferring the original tool-call query when callbacks provide one
 - the rendered result payload
 - the `What I matched` section content
 - the public result kind
@@ -965,6 +965,7 @@ The public result dictionary can extend the execution-tool result with fields su
 
 ```python
 {
+  "display_sql": "SELECT COUNT(*) AS passenger_count FROM filtered_dataset WHERE sex = 'female'",
   "matched_row_count": 225,
   "public_result_kind": "count_aggregate" | "safe_aggregate" | "detail_count_fallback",
   "query_summary_context": {
@@ -978,6 +979,8 @@ The public result dictionary can extend the execution-tool result with fields su
   },
 }
 ```
+
+When object-level canonicalization is enabled, `display_sql` can remain the simple dataset query while the raw execution-tool `sql` field still contains the internally rewritten canonical SQL that actually ran.
 
 That callback-owned dictionary is then adapted into `SQLResultViewModel` inside `formatting.py`, which is the deterministic renderer contract for final SQL answers.
 

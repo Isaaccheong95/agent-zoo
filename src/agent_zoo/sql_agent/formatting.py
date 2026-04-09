@@ -552,7 +552,9 @@ def _format_query_summary_section(tool_result: dict) -> str:
 
 
 def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewModel:
-    sql = tool_result.get("sql") or "Not executed"
+    display_sql = tool_result.get("display_sql")
+    if not isinstance(display_sql, str) or not display_sql.strip():
+        display_sql = str(tool_result.get("sql") or "Not executed")
     result_payload = format_result_payload(tool_result)
     query_summary_section = _format_query_summary_section(tool_result)
     public_result_kind = tool_result.get("public_result_kind")
@@ -568,7 +570,7 @@ def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewMod
 
     return SQLResultViewModel(
         status=str(tool_result.get("status") or "error"),
-        sql=sql,
+        sql=display_sql,
         result_payload=result_payload,
         query_summary_section=query_summary_section,
         public_result_kind=public_result_kind,
