@@ -506,7 +506,11 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 choices=[
                     SimpleNamespace(
                         message=SimpleNamespace(
-                            content='{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk"]}'
+                            content=(
+                                '{"resolution_type":"needs_clarification",'
+                                '"grounded_filters":[{"column":"gender","selected_values":["Female"]}],'
+                                '"candidate_columns":["socalc","socsmk"]}'
+                            )
                         )
                     )
                 ]
@@ -518,6 +522,24 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             resolution = resolver(
                 "how many females drink",
                 "- gender (TEXT): categorical values = Female, Male\n- socalc (TEXT): categorical values = Never, Occasionally, Regularly, Unknown\n- socsmk (TEXT): categorical values = No, Unknown, Yes",
+                [
+                    {
+                        "column": "gender",
+                        "candidate_value": "Female",
+                        "field_label": "Gender",
+                        "matched_user_phrase": "females",
+                        "confidence": 0.95,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "gender",
+                        "candidate_value": "Male",
+                        "field_label": "Gender",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                ],
                 ["gender", "socalc", "socsmk"],
             )
 
@@ -525,11 +547,14 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             resolution,
             {
                 "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
                 "candidate_columns": ["socalc", "socsmk"],
             },
         )
         self.assertIn("proceed|needs_clarification", captured["system_prompt"])
+        self.assertIn("grounded_filters", captured["system_prompt"])
         self.assertIn("Schema column identifiers you may return", captured["user_prompt"])
+        self.assertIn("Categorical grounding candidates", captured["user_prompt"])
         self.assertIn("socalc", captured["user_prompt"])
         self.assertIn("socsmk", captured["user_prompt"])
         self.assertIn("Latest user request", captured["user_prompt"])
@@ -547,6 +572,16 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             resolution = resolver(
                 "how many females drink",
                 "- socalc (TEXT): categorical values = Never, Occasionally, Regularly, Unknown",
+                [
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Never",
+                        "field_label": "Alcohol consumption",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    }
+                ],
                 ["socalc", "socsmk"],
             )
 
@@ -554,6 +589,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             resolution,
             {
                 "resolution_type": "proceed",
+                "grounded_filters": {},
                 "candidate_columns": [],
             },
         )
@@ -2699,16 +2735,22 @@ Which category or combination should I use for \"alcoholic\"?
 
     def test_combined_before_model_callback_creates_schema_grounding_clarification(self) -> None:
         scope_gate_calls: list[str] = []
-        schema_grounding_calls: list[tuple[str, str, list[str]]] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return True, None
 
-        def fake_schema_grounding_resolver(user_text: str, schema_context: str, candidate_columns: list[str]) -> dict[str, object]:
-            schema_grounding_calls.append((user_text, schema_context, candidate_columns))
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
             return {
                 "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
                 "candidate_columns": ["socalc", "socsmk"],
             }
 
@@ -2773,7 +2815,13 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIsNotNone(result)
         self.assertEqual(scope_gate_calls, ["how many females drink"])
         self.assertEqual(len(schema_grounding_calls), 1)
-        self.assertEqual(schema_grounding_calls[0][2], ["socalc", "socsmk"])
+        self.assertEqual(schema_grounding_calls[0][3], ["gender", "socalc", "socsmk"])
+        self.assertTrue(
+            any(
+                entry.get("column") == "gender" and entry.get("candidate_value") == "Female"
+                for entry in schema_grounding_calls[0][2]
+            )
+        )
         response_text = result.content.parts[0].text
         self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
         self.assertIn("1. Alcohol consumption", response_text)
@@ -2795,19 +2843,29 @@ Which category or combination should I use for \"alcoholic\"?
                 "Smoking status": "socsmk",
             },
         )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["grounded_filters"],
+            {"gender": ["Female"]},
+        )
 
     def test_combined_before_model_callback_uses_request_glossary_and_excludes_grounded_gender(self) -> None:
         scope_gate_calls: list[str] = []
-        schema_grounding_calls: list[tuple[str, str, list[str]]] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return True, None
 
-        def fake_schema_grounding_resolver(user_text: str, schema_context: str, candidate_columns: list[str]) -> dict[str, object]:
-            schema_grounding_calls.append((user_text, schema_context, candidate_columns))
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
             return {
                 "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Male"]},
                 "candidate_columns": ["socsmk", "socalc"],
             }
 
@@ -2883,9 +2941,13 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(scope_gate_calls, ["how many guys drink"])
         self.assertEqual(len(schema_grounding_calls), 1)
         self.assertEqual(schema_grounding_calls[0][0], "how many guys drink")
-        self.assertEqual(schema_grounding_calls[0][2], ["socsmk", "socalc"])
-        self.assertIn("Already grounded categorical filters from the user wording", schema_grounding_calls[0][1])
-        self.assertIn("- gender = Male", schema_grounding_calls[0][1])
+        self.assertEqual(schema_grounding_calls[0][3], ["gender", "socsmk", "socalc"])
+        self.assertTrue(
+            any(
+                entry.get("column") == "gender" and entry.get("candidate_value") == "Male"
+                for entry in schema_grounding_calls[0][2]
+            )
+        )
         response_text = result.content.parts[0].text
         self.assertIn("1. Smoking status", response_text)
         self.assertIn("2. Alcohol consumption status", response_text)
@@ -2901,6 +2963,88 @@ Which category or combination should I use for \"alcoholic\"?
                 "Alcohol consumption status": "socalc",
             },
         )
+
+    def test_combined_before_model_callback_rewrites_grounded_filters_without_clarification(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {"gender": ["Male"]},
+                "candidate_columns": [],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Gender",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="how many guys drink")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, ["how many guys drink"])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("The user's dataset request already grounds some categorical filters", rewritten_text)
+        self.assertIn("Original dataset request: how many guys drink", rewritten_text)
+        self.assertIn("- gender = Male", rewritten_text)
+        self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, state)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
