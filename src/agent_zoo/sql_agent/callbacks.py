@@ -2201,12 +2201,7 @@ def build_combined_before_model_callback(
                         )
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-        result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
-        if result is not None:
-            return result
-
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
-            raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             if user_text:
                 topic_text = str(
                     callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
@@ -2301,6 +2296,16 @@ def build_combined_before_model_callback(
                             "before-model-followup-rewritten",
                             _extract_last_user_text(llm_request),
                         )
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-branch",
+                            "continuing schema grounding flow without scope gate",
+                        )
+                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+        result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
+        if result is not None:
+            return result
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined
