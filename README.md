@@ -49,7 +49,7 @@ If you are not using `uv`, create and activate your virtual environment first, t
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.1.0"
+pip install "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.3.0"
 ```
 
 This plain `pip install` path can take a long time because `pip` has to resolve the full Google ADK dependency tree from scratch when installing from the Git repo. If you want a faster install experience, prefer `uv`.
@@ -58,7 +58,7 @@ If you are using `uv` and do not already have a virtual environment created for 
 
 ```bash
 uv venv
-uv pip install --python .venv/bin/python "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.1.0"
+uv pip install --python .venv/bin/python "git+https://github.com/Isaaccheong95/agent-zoo.git@v0.3.0"
 ```
 
 If you already have a `uv`-managed virtual environment for the project, skip `uv venv` and just run the `uv pip install ...` command.
