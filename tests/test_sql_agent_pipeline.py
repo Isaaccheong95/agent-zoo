@@ -45,6 +45,30 @@ def create_pipeline_fixture(db_path: Path) -> None:
     connection.close()
 
 
+def create_missing_pipeline_fixture(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE patients (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            sex TEXT,
+            age TEXT
+        );
+
+        INSERT INTO patients (name, sex, age) VALUES
+            ('Anya', 'female', '14'),
+            ('Ben', 'male', '42'),
+            ('Cara', NULL, NULL),
+            ('Drew', '', ''),
+            ('Eli', ' ', ' '),
+            ('Fay', 'female', '33');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 class SQLPipelineTestCase(unittest.TestCase):
     def setUp(self) -> None:
         temp_root = REPO_ROOT / ".tmp_test_runs"
@@ -198,6 +222,53 @@ class SQLPipelineTestCase(unittest.TestCase):
 
         sql_runtime._RUNNER_CACHE.clear()
         sql_runtime._INITIALIZED_SESSION_KEYS.clear()
+
+
+class SQLPipelineMissingGroupTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_root = REPO_ROOT / ".tmp_test_runs"
+        temp_root.mkdir(exist_ok=True)
+        self.db_path = temp_root / f"{uuid.uuid4().hex}.sqlite"
+        create_missing_pipeline_fixture(self.db_path)
+
+    def tearDown(self) -> None:
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_run_nl_to_sql_pipeline_surfaces_unknown_null_bucket_for_case_groups(self) -> None:
+        def generator(_: str, __: dict) -> dict:
+            return {
+                "sql": """
+                    SELECT CASE
+                        WHEN CAST(age AS INTEGER) <= 17 THEN '0-17'
+                        WHEN CAST(age AS INTEGER) BETWEEN 18 AND 39 THEN '18-39'
+                        WHEN CAST(age AS INTEGER) >= 40 THEN '40+'
+                    END AS age_category,
+                    COUNT(*) AS patient_count
+                    FROM patients
+                    GROUP BY age_category
+                    ORDER BY age_category
+                """,
+                "explanation": "Buckets patients into age ranges.",
+            }
+
+        result = run_nl_to_sql_pipeline(
+            "Split patients by age categories.",
+            str(self.db_path),
+            generator,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Unknown / Null", result["execution"].get("display_sql", ""))
+        self.assertEqual(
+            {row["age_category"]: row["patient_count"] for row in result["execution"]["rows"]},
+            {
+                "0-17": 1,
+                "18-39": 1,
+                "40+": 1,
+                "Unknown / Null": 3,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -1533,7 +1533,174 @@ def _build_count_sql(sql: str) -> str | None:
     return f"{prefix} {count_sql}".strip()
 
 
-def _build_grouped_count_sql(sql: str) -> str | None:
+def _split_top_level_sql_expressions(sql_fragment: str) -> list[str]:
+    expressions: list[str] = []
+    current: list[str] = []
+    state = "normal"
+    depth = 0
+    index = 0
+
+    while index < len(sql_fragment):
+        char = sql_fragment[index]
+        next_char = sql_fragment[index + 1] if index + 1 < len(sql_fragment) else ""
+
+        if state == "line_comment":
+            current.append(char)
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            current.append(char)
+            if char == "*" and next_char == "/":
+                current.append(next_char)
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            current.append(char)
+            if char == "'" and next_char == "'":
+                current.append(next_char)
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            current.append(char)
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            current.append(char)
+            current.append(next_char)
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            current.append(char)
+            current.append(next_char)
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            current.append(char)
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            current.append(char)
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            current.append(char)
+            index += 1
+            continue
+
+        if char == ")":
+            depth = max(0, depth - 1)
+            current.append(char)
+            index += 1
+            continue
+
+        if char == "," and depth == 0:
+            expression = "".join(current).strip()
+            if expression:
+                expressions.append(expression)
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    trailing_expression = "".join(current).strip()
+    if trailing_expression:
+        expressions.append(trailing_expression)
+
+    return expressions
+
+
+def _find_last_top_level_keyword(sql: str, keyword: str) -> int | None:
+    last_position = None
+    search_start = 0
+    while search_start < len(sql):
+        next_position = _find_top_level_keyword(sql[search_start:], keyword)
+        if next_position is None:
+            break
+        absolute_position = search_start + next_position
+        last_position = absolute_position
+        search_start = absolute_position + len(keyword)
+    return last_position
+
+
+def _extract_select_item_parts(select_item: str) -> tuple[str, str | None]:
+    item = select_item.strip()
+    if not item:
+        return "", None
+
+    as_pos = _find_last_top_level_keyword(item, "AS")
+    if as_pos is None:
+        return item, None
+
+    expression = item[:as_pos].strip()
+    alias_sql = item[as_pos + len("AS"):].strip()
+    if not expression or not alias_sql:
+        return item, None
+    return expression, alias_sql
+
+
+def _find_group_projection_select_items(sql: str, group_column_names: list[str]) -> list[str] | None:
+    select_pos = _find_top_level_keyword(sql, "SELECT")
+    from_pos = _find_top_level_keyword(sql, "FROM")
+    if select_pos is None or from_pos is None or from_pos <= select_pos:
+        return None
+
+    select_clause = sql[select_pos + len("SELECT"):from_pos].strip()
+    select_items = _split_top_level_sql_expressions(select_clause)
+    if not select_items:
+        return None
+
+    projected_items: list[str] = []
+    for column_name in group_column_names:
+        normalized_column_name = str(column_name or "").strip().casefold()
+        if not normalized_column_name:
+            return None
+
+        matched_item = None
+        for select_item in select_items:
+            expression, alias_sql = _extract_select_item_parts(select_item)
+            candidate_names = {
+                _normalize_sql_identifier(expression).casefold(),
+            }
+            if alias_sql:
+                candidate_names.add(_normalize_sql_identifier(alias_sql).casefold())
+            if normalized_column_name in candidate_names:
+                matched_item = select_item.strip()
+                break
+
+        if matched_item is None:
+            return None
+        projected_items.append(matched_item)
+
+    return projected_items
+
+
+def _build_grouped_count_sql(sql: str, group_column_names: list[str] | None = None) -> str | None:
     select_pos = _find_top_level_keyword(sql, "SELECT")
     from_pos = _find_top_level_keyword(sql, "FROM")
     group_by_pos = _find_top_level_keyword(sql, "GROUP BY")
@@ -1559,7 +1726,12 @@ def _build_grouped_count_sql(sql: str) -> str | None:
     if not group_by_clause:
         return None
 
-    count_sql = f"SELECT {group_by_clause}, COUNT(*) AS matching_count {from_clause}"
+    grouped_select_items = None
+    if group_column_names:
+        grouped_select_items = _find_group_projection_select_items(sql, group_column_names)
+
+    projected_group_sql = ", ".join(grouped_select_items) if grouped_select_items else group_by_clause
+    count_sql = f"SELECT {projected_group_sql}, COUNT(*) AS matching_count {from_clause}"
     return f"{prefix} {count_sql}".strip()
 
 
@@ -1609,7 +1781,12 @@ def _build_aggregate_public_result(
             return None
         if has_group_by:
             db_path = tool_response.get("db_path") or ""
-            count_sql = _build_grouped_count_sql(sql)
+            group_column_names = [
+                column
+                for column in columns
+                if column not in aggregate_columns
+            ]
+            count_sql = _build_grouped_count_sql(sql, group_column_names)
             count_result = (
                 execute_sqlite_query(db_path, count_sql, preview_rows=max(len(rows), 1))
                 if (count_sql and db_path)
@@ -1795,7 +1972,9 @@ def build_remember_query_result_callback(
             tool_response,
             active_settings,
         )
-        display_sql = _normalize_public_display_sql(args.get("sql") if isinstance(args, dict) else None)
+        display_sql = _normalize_public_display_sql(tool_response.get("display_sql"))
+        if display_sql is None:
+            display_sql = _normalize_public_display_sql(args.get("sql") if isinstance(args, dict) else None)
         if display_sql is not None:
             public_result["display_sql"] = display_sql
         if last_query_frame is not None:

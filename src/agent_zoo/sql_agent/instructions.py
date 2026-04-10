@@ -39,6 +39,8 @@ Rules:
 - Prefer `COUNT(*) AS matching_count` for count questions.
 - For `AVG`, `MIN`, or `MAX` questions, also include `COUNT(*) AS matching_count` in the same query.
 - For grouped aggregate questions, include the grouping column(s), `COUNT(*) AS matching_count`, and aggregate aliases like `average_*`, `minimum_*`, or `maximum_*`.
+- For grouped or bucketed category outputs, explicitly map SQL NULL and blank or whitespace values to `Unknown / Null` so missing values appear as their own category.
+- When you build grouped buckets with `CASE`, add the `Unknown / Null` branch before the other bucket conditions.
 - Do not use window functions such as `OVER (...)`.
 - Use simple, deterministic SQL.
 - Do not repeat the same query after a successful result.
