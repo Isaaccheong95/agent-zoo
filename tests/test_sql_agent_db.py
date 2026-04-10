@@ -1667,10 +1667,53 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(content)
         response_text = content.parts[0].text
         self.assertIn("What I matched:", response_text)
-        self.assertIn("- gender = Male", response_text)
-        self.assertIn("- sococc in Retired, Student, Unemployed", response_text)
+        self.assertIn("- gender = Male  \n  Stored values for gender: Male, Female", response_text)
+        self.assertIn(
+            "- sococc in Retired, Student, Unemployed  \n  Stored values for sococc: Employed, Retired, Student, Unemployed, Unknown",
+            response_text,
+        )
+        self.assertIn(
+            "Stored values for sococc: Employed, Retired, Student, Unemployed, Unknown",
+            response_text,
+        )
         self.assertNotIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertLess(response_text.index("What I matched:"), response_text.index("Result:"))
+
+    def test_formatted_final_response_omits_stored_values_when_filter_already_uses_all_values(self) -> None:
+        callback = build_format_final_agent_response_callback()
+        content = callback(
+            SimpleNamespace(
+                state={
+                    SQL_PUBLIC_RESULT_STATE_KEY: {
+                        "status": "success",
+                        "db_path": "fixture.sqlite",
+                        "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender IN ('Female', 'Male')",
+                        "columns": ["matching_count"],
+                        "rows": [{"matching_count": 12}],
+                        "row_count": 1,
+                        "preview_row_count": 1,
+                        "truncated": False,
+                        "error": None,
+                        "matched_row_count": 12,
+                        "public_result_kind": "count_aggregate",
+                        "query_summary_context": {
+                            "categorical_filters": [
+                                {
+                                    "column": "gender",
+                                    "selected_values": ["Female", "Male"],
+                                    "available_values": ["Female", "Male"],
+                                },
+                            ],
+                        },
+                    }
+                }
+            )
+        )
+
+        self.assertIsNotNone(content)
+        response_text = content.parts[0].text
+        self.assertIn("- gender in Female, Male", response_text)
+        self.assertNotIn("Stored values for gender:", response_text)
 
     def test_formatted_final_response_includes_comparison_filters(self) -> None:
         callback = build_format_final_agent_response_callback()
@@ -1741,7 +1784,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("SELECT COUNT(*) AS matching_count FROM people", response_text)
         self.assertIn("What I matched:", response_text)
-        self.assertIn("- gender = Female", response_text)
+        self.assertIn("- gender = Female  \n  Stored values for gender: Female, Male", response_text)
         self.assertNotIn("- Counted matching rows in the current filtered dataset.", response_text)
         self.assertIn("```", response_text)
         self.assertIn("4", response_text)
@@ -1815,6 +1858,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(model.public_result_kind, "detail_count_fallback")
         self.assertEqual(model.matched_row_count, 12)
         self.assertEqual(model.query_summary_context, tool_result["query_summary_context"])
+        self.assertIn("- gender = Female  \n  Stored values for gender: Female, Male", model.query_summary_section)
         self.assertIn("privacy guardrails", model.note or "")
 
     def test_build_sql_result_view_model_prefers_display_sql_when_present(self) -> None:
