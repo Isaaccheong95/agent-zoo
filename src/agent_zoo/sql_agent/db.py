@@ -24,26 +24,44 @@ from .config import (
 
 
 INTERNAL_TABLE_PREFIXES = ("sqlite_", "__")
-UNSAFE_SQL_TOKENS = {
-    "ALTER",
-    "ANALYZE",
-    "ATTACH",
-    "BEGIN",
-    "COMMIT",
-    "CREATE",
-    "DELETE",
-    "DETACH",
-    "DROP",
+READ_ONLY_ROOT_STATEMENT_KEYWORDS = ("SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE")
+UNKNOWN_GROUP_VALUE_LABEL = "Unknown / Null"
+SQL_IDENTIFIER_EXPRESSION_PATTERN = re.compile(
+    r'^(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))*$'
+)
+SQL_IDENTIFIER_TOKEN_PATTERN = re.compile(
+    r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))*'
+)
+CASE_MISSING_SOURCE_IGNORED_IDENTIFIERS = {
+    "AND",
+    "AS",
+    "BETWEEN",
+    "BLOB",
+    "CASE",
+    "CAST",
+    "COALESCE",
+    "ELSE",
     "END",
-    "INSERT",
-    "PRAGMA",
-    "REINDEX",
-    "RELEASE",
-    "REPLACE",
-    "ROLLBACK",
-    "SAVEPOINT",
-    "UPDATE",
-    "VACUUM",
+    "FALSE",
+    "GLOB",
+    "IN",
+    "INTEGER",
+    "IS",
+    "LIKE",
+    "LOWER",
+    "NOT",
+    "NULL",
+    "NULLIF",
+    "NUMERIC",
+    "OR",
+    "REAL",
+    "REGEXP",
+    "TEXT",
+    "THEN",
+    "TRIM",
+    "TRUE",
+    "UPPER",
+    "WHEN",
 }
 OBJECT_SOURCE_CTE_NAME = "__az_object_source"
 OBJECT_RANKED_CTE_NAME = "__az_object_ranked"
@@ -300,10 +318,11 @@ def _format_categorical_value_guidance(guidance_entries: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
-def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
+def _find_top_level_keyword_positions(sql: str, keyword: str) -> list[int]:
     upper = sql.upper()
     keyword_upper = keyword.upper()
     keyword_len = len(keyword_upper)
+    positions: list[int] = []
     state = "normal"
     depth = 0
     index = 0
@@ -341,6 +360,18 @@ def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
             index += 1
             continue
 
+        if state == "backtick":
+            if char == "`":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "bracket":
+            if char == "]":
+                state = "normal"
+            index += 1
+            continue
+
         if char == "-" and next_char == "-":
             state = "line_comment"
             index += 2
@@ -361,6 +392,16 @@ def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
             index += 1
             continue
 
+        if char == "`":
+            state = "backtick"
+            index += 1
+            continue
+
+        if char == "[":
+            state = "bracket"
+            index += 1
+            continue
+
         if char == "(":
             depth += 1
             index += 1
@@ -375,11 +416,50 @@ def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
             before = upper[index - 1] if index > 0 else " "
             after = upper[index + keyword_len] if index + keyword_len < len(upper) else " "
             if (not before.isalnum() and before != "_") and (not after.isalnum() and after != "_"):
-                return index
+                positions.append(index)
+                index += keyword_len
+                continue
 
         index += 1
 
-    return None
+    return positions
+
+
+def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
+    positions = _find_top_level_keyword_positions(sql, keyword)
+    if not positions:
+        return None
+    return positions[0]
+
+
+def _find_last_top_level_keyword(sql: str, keyword: str) -> int | None:
+    positions = _find_top_level_keyword_positions(sql, keyword)
+    if not positions:
+        return None
+    return positions[-1]
+
+
+def _resolve_effective_root_statement(sql: str) -> str | None:
+    normalized_sql = _normalized_statement(sql)
+    if not normalized_sql:
+        return None
+
+    first_keyword_match = re.match(r"^([A-Za-z]+)", normalized_sql)
+    if first_keyword_match is None:
+        return None
+
+    first_keyword = first_keyword_match.group(1).upper()
+    if first_keyword != "WITH":
+        return first_keyword
+
+    candidate_positions = [
+        (position, keyword)
+        for keyword in READ_ONLY_ROOT_STATEMENT_KEYWORDS
+        if (position := _find_top_level_keyword(normalized_sql, keyword)) is not None
+    ]
+    if not candidate_positions:
+        return None
+    return min(candidate_positions, key=lambda item: item[0])[1]
 
 
 def _extract_top_level_query_sections(sql: str) -> dict[str, str] | None:
@@ -400,6 +480,355 @@ def _extract_top_level_query_sections(sql: str) -> dict[str, str] | None:
         "from_clause": sql[from_pos:cut_pos].rstrip(),
         "suffix": sql[cut_pos:].strip(),
     }
+
+
+def _extract_top_level_clause_body_range(
+    sql: str,
+    clause_keyword: str,
+    following_keywords: tuple[str, ...],
+) -> tuple[int, int] | None:
+    clause_pos = _find_top_level_keyword(sql, clause_keyword)
+    if clause_pos is None:
+        return None
+
+    body_start = clause_pos + len(clause_keyword)
+    body_end = len(sql)
+    for keyword in following_keywords:
+        keyword_pos = _find_top_level_keyword(sql, keyword)
+        if keyword_pos is not None and keyword_pos > clause_pos and keyword_pos < body_end:
+            body_end = keyword_pos
+
+    return body_start, body_end
+
+
+def _split_top_level_expressions(sql_fragment: str) -> list[str]:
+    expressions: list[str] = []
+    current: list[str] = []
+    state = "normal"
+    depth = 0
+    index = 0
+
+    while index < len(sql_fragment):
+        char = sql_fragment[index]
+        next_char = sql_fragment[index + 1] if index + 1 < len(sql_fragment) else ""
+
+        if state == "line_comment":
+            current.append(char)
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            current.append(char)
+            if char == "*" and next_char == "/":
+                current.append(next_char)
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            current.append(char)
+            if char == "'" and next_char == "'":
+                current.append(next_char)
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            current.append(char)
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "backtick":
+            current.append(char)
+            if char == "`":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "bracket":
+            current.append(char)
+            if char == "]":
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            current.append(char)
+            current.append(next_char)
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            current.append(char)
+            current.append(next_char)
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            current.append(char)
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            current.append(char)
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "`":
+            current.append(char)
+            state = "backtick"
+            index += 1
+            continue
+
+        if char == "[":
+            current.append(char)
+            state = "bracket"
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            current.append(char)
+            index += 1
+            continue
+
+        if char == ")":
+            depth = max(0, depth - 1)
+            current.append(char)
+            index += 1
+            continue
+
+        if char == "," and depth == 0:
+            expression = "".join(current).strip()
+            if expression:
+                expressions.append(expression)
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    trailing_expression = "".join(current).strip()
+    if trailing_expression:
+        expressions.append(trailing_expression)
+
+    return expressions
+
+
+def _normalize_sql_reference(value: str) -> str:
+    normalized = _normalize_whitespace(str(value or ""))
+    if not normalized:
+        return ""
+
+    parts = re.split(r"\s*\.\s*", normalized)
+    candidate = parts[-1].strip() if parts else normalized
+    if candidate.startswith('"') and candidate.endswith('"') and len(candidate) >= 2:
+        candidate = candidate[1:-1]
+    elif candidate.startswith("`") and candidate.endswith("`") and len(candidate) >= 2:
+        candidate = candidate[1:-1]
+    elif candidate.startswith("[") and candidate.endswith("]") and len(candidate) >= 2:
+        candidate = candidate[1:-1]
+    return candidate.strip()
+
+
+def _extract_select_item_parts(select_item: str) -> tuple[str, str | None]:
+    item = select_item.strip()
+    if not item:
+        return "", None
+
+    as_pos = _find_last_top_level_keyword(item, "AS")
+    if as_pos is None:
+        return item, None
+
+    expression = item[:as_pos].strip()
+    alias_sql = item[as_pos + len("AS"):].strip()
+    if not expression or not alias_sql:
+        return item, None
+    return expression, alias_sql
+
+
+def _infer_select_item_alias_sql(expression: str) -> str | None:
+    normalized_expression = expression.strip()
+    if not SQL_IDENTIFIER_EXPRESSION_PATTERN.fullmatch(normalized_expression):
+        return None
+
+    return re.split(r"\s*\.\s*", normalized_expression)[-1].strip()
+
+
+def _reference_match_keys(value: str) -> set[str]:
+    normalized_value = _normalize_whitespace(value)
+    if not normalized_value:
+        return set()
+
+    keys = {normalized_value.casefold()}
+    normalized_reference = _normalize_sql_reference(normalized_value)
+    if normalized_reference:
+        keys.add(normalized_reference.casefold())
+    return keys
+
+
+def _escape_sql_string_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _infer_case_missing_probe_expression(expression: str) -> str | None:
+    if not re.match(r"^\s*CASE\b", expression, flags=re.IGNORECASE):
+        return None
+
+    cleaned_expression, _, _ = _scan_sql(expression)
+    candidates: dict[str, str] = {}
+    for match in SQL_IDENTIFIER_TOKEN_PATTERN.finditer(cleaned_expression):
+        candidate_sql = match.group(0).strip()
+        candidate_name = _normalize_sql_reference(candidate_sql)
+        if not candidate_name:
+            continue
+        if candidate_name.upper() in CASE_MISSING_SOURCE_IGNORED_IDENTIFIERS:
+            continue
+        candidates.setdefault(candidate_name.casefold(), candidate_sql)
+
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates.values()))
+
+
+def _build_missing_group_expression(expression: str) -> str:
+    stripped_expression = expression.strip()
+    probe_expression = _infer_case_missing_probe_expression(stripped_expression) or stripped_expression
+    label_literal = _escape_sql_string_literal(UNKNOWN_GROUP_VALUE_LABEL)
+    return (
+        "CASE WHEN NULLIF(TRIM(CAST(("
+        + probe_expression
+        + ") AS TEXT)), '') IS NULL "
+        + f"THEN '{label_literal}' ELSE ({stripped_expression}) END"
+    )
+
+
+def _render_missing_group_select_item(expression: str, alias_sql: str | None) -> str:
+    rewritten_expression = _build_missing_group_expression(expression)
+    if alias_sql:
+        return f"{rewritten_expression} AS {alias_sql}"
+    return rewritten_expression
+
+
+def _replace_sql_ranges(sql: str, replacements: list[tuple[int, int, str]]) -> str:
+    rewritten_sql = sql
+    for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+        rewritten_sql = rewritten_sql[:start] + replacement + rewritten_sql[end:]
+    return rewritten_sql
+
+
+def _rewrite_grouped_missing_category_sql(sql: str) -> str | None:
+    normalized_sql = _normalized_statement(sql)
+    group_by_range = _extract_top_level_clause_body_range(
+        normalized_sql,
+        "GROUP BY",
+        ("HAVING", "ORDER BY", "LIMIT"),
+    )
+    if group_by_range is None:
+        return None
+
+    select_pos = _find_top_level_keyword(normalized_sql, "SELECT")
+    from_pos = _find_top_level_keyword(normalized_sql, "FROM")
+    if select_pos is None or from_pos is None or from_pos <= select_pos:
+        return None
+
+    select_clause = normalized_sql[select_pos + len("SELECT"):from_pos].strip()
+    group_by_clause = normalized_sql[group_by_range[0]:group_by_range[1]].strip()
+    select_items = _split_top_level_expressions(select_clause)
+    group_by_items = _split_top_level_expressions(group_by_clause)
+    if not select_items or not group_by_items:
+        return None
+
+    select_metadata: list[dict[str, Any]] = []
+    rewritten_select_items = list(select_items)
+    rewritten_group_by_items: list[str] = []
+    any_rewrite = False
+
+    for select_item in select_items:
+        expression, alias_sql = _extract_select_item_parts(select_item)
+        inferred_alias_sql = alias_sql or _infer_select_item_alias_sql(expression)
+        match_keys = _reference_match_keys(expression)
+        if alias_sql:
+            match_keys.update(_reference_match_keys(alias_sql))
+        elif inferred_alias_sql:
+            match_keys.update(_reference_match_keys(inferred_alias_sql))
+        select_metadata.append(
+            {
+                "expression": expression,
+                "alias_sql": alias_sql,
+                "display_alias_sql": inferred_alias_sql,
+                "match_keys": match_keys,
+            }
+        )
+
+    for group_by_item in group_by_items:
+        stripped_group_by_item = group_by_item.strip()
+        if not stripped_group_by_item:
+            continue
+
+        if re.fullmatch(r"\d+", stripped_group_by_item):
+            ordinal = int(stripped_group_by_item)
+            if 1 <= ordinal <= len(select_metadata):
+                select_entry = select_metadata[ordinal - 1]
+                rewritten_select_items[ordinal - 1] = _render_missing_group_select_item(
+                    select_entry["expression"],
+                    select_entry["display_alias_sql"],
+                )
+                any_rewrite = True
+            rewritten_group_by_items.append(stripped_group_by_item)
+            continue
+
+        group_match_keys = _reference_match_keys(stripped_group_by_item)
+        matched_index = None
+        for index, select_entry in enumerate(select_metadata):
+            if select_entry["match_keys"] & group_match_keys:
+                matched_index = index
+                break
+
+        if matched_index is None:
+            rewritten_group_by_items.append(_build_missing_group_expression(stripped_group_by_item))
+            any_rewrite = True
+            continue
+
+        matched_entry = select_metadata[matched_index]
+        rewritten_select_items[matched_index] = _render_missing_group_select_item(
+            matched_entry["expression"],
+            matched_entry["display_alias_sql"],
+        )
+        rewritten_group_by_items.append(_build_missing_group_expression(matched_entry["expression"]))
+        any_rewrite = True
+
+    if not any_rewrite:
+        return None
+
+    rewritten_sql = _replace_sql_ranges(
+        normalized_sql,
+        [
+            (select_pos + len("SELECT"), from_pos, f" {', '.join(rewritten_select_items)} "),
+            (group_by_range[0], group_by_range[1], f" {', '.join(rewritten_group_by_items)} "),
+        ],
+    )
+    return _normalized_statement(rewritten_sql)
+
+
+def _attach_display_sql(result: dict[str, Any], display_sql: str | None) -> dict[str, Any]:
+    if display_sql:
+        result["display_sql"] = display_sql
+    return result
 
 
 def _extract_source_segment(from_clause: str) -> str:
@@ -709,7 +1138,7 @@ def validate_sql_read_only(sql: str, db_path: str | Path) -> dict[str, Any]:
             "db_path": str(_as_path(db_path)),
         }
 
-    _, token_text, statements = _scan_sql(candidate)
+    _, _, statements = _scan_sql(candidate)
 
     if not statements:
         return {
@@ -746,15 +1175,11 @@ def validate_sql_read_only(sql: str, db_path: str | Path) -> dict[str, Any]:
             "db_path": str(path),
         }
 
-    normalized_token_text = _normalize_whitespace(token_text).upper()
-    unsafe_match = re.search(
-        r"\b(" + "|".join(sorted(UNSAFE_SQL_TOKENS)) + r")\b",
-        normalized_token_text,
-    )
-    if unsafe_match:
+    effective_root_statement = _resolve_effective_root_statement(normalized_sql)
+    if effective_root_statement != "SELECT":
         return {
             "is_valid": False,
-            "reason": f"Unsafe SQL token detected: {unsafe_match.group(1)}.",
+            "reason": "Only read-only SELECT and WITH queries are allowed.",
             "normalized_sql": normalized_sql,
             "db_path": str(path),
         }
@@ -789,9 +1214,10 @@ def execute_sqlite_query(
     preview_rows = max(1, preview_rows)
     validation = validate_sql_read_only(sql, db_path)
     normalized_sql = validation.get("normalized_sql") or _normalized_statement(sql or "")
+    display_sql: str | None = None
 
     if not validation["is_valid"]:
-        return {
+        return _attach_display_sql({
             "status": "error",
             "db_path": validation["db_path"],
             "sql": normalized_sql,
@@ -801,11 +1227,32 @@ def execute_sqlite_query(
             "preview_row_count": 0,
             "truncated": False,
             "error": validation["reason"],
-        }
+        }, display_sql)
 
     effective_sql = normalized_sql
+    rewritten_group_sql = _rewrite_grouped_missing_category_sql(normalized_sql)
+    if rewritten_group_sql and rewritten_group_sql != normalized_sql:
+        rewritten_validation = validate_sql_read_only(rewritten_group_sql, db_path)
+        if not rewritten_validation["is_valid"]:
+            return _attach_display_sql({
+                "status": "error",
+                "db_path": rewritten_validation["db_path"],
+                "sql": normalized_sql,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "preview_row_count": 0,
+                "truncated": False,
+                "error": (
+                    "Grouped missing-category normalization could not rewrite the query safely: "
+                    f"{rewritten_validation['reason']}"
+                ),
+            }, display_sql)
+        effective_sql = rewritten_validation.get("normalized_sql") or _normalized_statement(rewritten_group_sql)
+        display_sql = effective_sql
+
     if object_order_column and not object_id_column:
-        return {
+        return _attach_display_sql({
             "status": "error",
             "db_path": validation["db_path"],
             "sql": normalized_sql,
@@ -815,7 +1262,7 @@ def execute_sqlite_query(
             "preview_row_count": 0,
             "truncated": False,
             "error": "Object-level mode requires object_id_column when object_order_column is configured.",
-        }
+        }, display_sql)
 
     if object_id_column:
         object_mode_error = validate_object_level_columns(
@@ -824,7 +1271,7 @@ def execute_sqlite_query(
             object_order_column,
         )
         if object_mode_error is not None:
-            return {
+            return _attach_display_sql({
                 "status": "error",
                 "db_path": validation["db_path"],
                 "sql": normalized_sql,
@@ -834,15 +1281,15 @@ def execute_sqlite_query(
                 "preview_row_count": 0,
                 "truncated": False,
                 "error": object_mode_error,
-            }
+            }, display_sql)
 
         object_sql, object_sql_error = _build_object_mode_sql(
-            normalized_sql,
+            effective_sql,
             object_id_column,
             object_order_column,
         )
         if object_sql_error is not None or object_sql is None:
-            return {
+            return _attach_display_sql({
                 "status": "error",
                 "db_path": validation["db_path"],
                 "sql": normalized_sql,
@@ -852,11 +1299,11 @@ def execute_sqlite_query(
                 "preview_row_count": 0,
                 "truncated": False,
                 "error": object_sql_error or "Object-level mode could not rewrite the query safely.",
-            }
+            }, display_sql)
 
         rewritten_validation = validate_sql_read_only(object_sql, db_path)
         if not rewritten_validation["is_valid"]:
-            return {
+            return _attach_display_sql({
                 "status": "error",
                 "db_path": rewritten_validation["db_path"],
                 "sql": normalized_sql,
@@ -869,7 +1316,7 @@ def execute_sqlite_query(
                     "Object-level mode could not canonicalize the query safely: "
                     f"{rewritten_validation['reason']}"
                 ),
-            }
+            }, display_sql)
         effective_sql = rewritten_validation.get("normalized_sql") or _normalized_statement(object_sql)
 
     try:
@@ -886,7 +1333,7 @@ def execute_sqlite_query(
             else:
                 row_count = len(preview)
 
-        return {
+        return _attach_display_sql({
             "status": "success",
             "db_path": str(_ensure_database_exists(db_path)),
             "sql": effective_sql,
@@ -896,9 +1343,9 @@ def execute_sqlite_query(
             "preview_row_count": len(preview),
             "truncated": truncated,
             "error": None,
-        }
+        }, display_sql)
     except sqlite3.Error as exc:
-        return {
+        return _attach_display_sql({
             "status": "error",
             "db_path": str(_as_path(db_path)),
             "sql": effective_sql,
@@ -908,7 +1355,7 @@ def execute_sqlite_query(
             "preview_row_count": 0,
             "truncated": False,
             "error": f"SQLite execution failed: {exc}",
-        }
+        }, display_sql)
 
 
 def count_subset_rows(db_path: str | Path, count_sql: str) -> int | None:

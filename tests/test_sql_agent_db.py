@@ -130,6 +130,30 @@ def create_object_mode_fixture_database(db_path: Path) -> None:
     connection.close()
 
 
+def create_missing_group_fixture_database(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE patients (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            sex TEXT,
+            age TEXT
+        );
+
+        INSERT INTO patients (name, sex, age) VALUES
+            ('Anya', 'female', '14'),
+            ('Ben', 'male', '42'),
+            ('Cara', NULL, NULL),
+            ('Drew', '', ''),
+            ('Eli', ' ', ' '),
+            ('Fay', 'female', '33');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 def make_query_result(
     rows: list[dict],
     *,
@@ -139,8 +163,9 @@ def make_query_result(
     status: str = "success",
     error: str | None = None,
     sql: str = "SELECT ...",
+    display_sql: str | None = None,
 ) -> dict:
-    return {
+    result = {
         "status": status,
         "db_path": "fixture.sqlite",
         "sql": sql,
@@ -151,6 +176,9 @@ def make_query_result(
         "truncated": truncated,
         "error": error,
     }
+    if display_sql is not None:
+        result["display_sql"] = display_sql
+    return result
 
 class SQLiteHelpersTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -229,6 +257,50 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertTrue(select_validation["is_valid"])
         self.assertTrue(with_validation["is_valid"])
 
+    def test_validate_sql_read_only_allows_case_expressions(self) -> None:
+        validation = validate_sql_read_only(
+            """
+            SELECT CASE
+                WHEN age <= 17 THEN '0-17'
+                WHEN age >= 18 AND age <= 39 THEN '18-39'
+                WHEN age >= 40 AND age <= 59 THEN '40-59'
+                WHEN age >= 60 AND age <= 79 THEN '60-79'
+                WHEN age >= 80 THEN '80+'
+                ELSE 'Unknown / Null'
+            END AS age_category,
+            COUNT(*) AS patient_count
+            FROM people
+            GROUP BY age_category
+            ORDER BY age_category
+            """,
+            self.db_path,
+        )
+
+        self.assertTrue(validation["is_valid"])
+
+    def test_validate_sql_read_only_allows_with_union_query(self) -> None:
+        validation = validate_sql_read_only(
+            """
+            WITH person_names AS (
+                SELECT name AS label FROM people
+            )
+            SELECT label FROM person_names
+            UNION
+            SELECT city AS label FROM visits
+            """,
+            self.db_path,
+        )
+
+        self.assertTrue(validation["is_valid"])
+
+    def test_validate_sql_read_only_allows_bracket_quoted_keyword_aliases(self) -> None:
+        validation = validate_sql_read_only(
+            "SELECT [name] AS [UPDATE] FROM people ORDER BY [UPDATE]",
+            self.db_path,
+        )
+
+        self.assertTrue(validation["is_valid"])
+
     def test_validate_sql_read_only_blocks_unsafe_and_multi_statement_sql(self) -> None:
         unsafe_validation = validate_sql_read_only("DELETE FROM people", self.db_path)
         multi_statement_validation = validate_sql_read_only(
@@ -240,6 +312,31 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("Only read-only SELECT and WITH queries are allowed", unsafe_validation["reason"])
         self.assertFalse(multi_statement_validation["is_valid"])
         self.assertIn("single SQL statement", multi_statement_validation["reason"])
+
+    def test_validate_sql_read_only_blocks_with_delete_and_update(self) -> None:
+        delete_validation = validate_sql_read_only(
+            """
+            WITH filtered AS (
+                SELECT id FROM people WHERE sex = 'female'
+            )
+            DELETE FROM people WHERE id IN (SELECT id FROM filtered)
+            """,
+            self.db_path,
+        )
+        update_validation = validate_sql_read_only(
+            """
+            WITH filtered AS (
+                SELECT id FROM people WHERE sex = 'female'
+            )
+            UPDATE people SET age = 0 WHERE id IN (SELECT id FROM filtered)
+            """,
+            self.db_path,
+        )
+
+        self.assertFalse(delete_validation["is_valid"])
+        self.assertIn("Only read-only SELECT and WITH queries are allowed", delete_validation["reason"])
+        self.assertFalse(update_validation["is_valid"])
+        self.assertIn("Only read-only SELECT and WITH queries are allowed", update_validation["reason"])
 
     def test_validate_sql_read_only_catches_hallucinated_columns(self) -> None:
         validation = validate_sql_read_only(
@@ -591,6 +688,63 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 "resolution_type": "proceed",
                 "grounded_filters": {},
                 "candidate_columns": [],
+            },
+        )
+
+
+class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_root = REPO_ROOT / ".tmp_test_runs"
+        temp_root.mkdir(exist_ok=True)
+        self.db_path = temp_root / f"{uuid.uuid4().hex}.sqlite"
+        create_missing_group_fixture_database(self.db_path)
+
+    def tearDown(self) -> None:
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_execute_sqlite_query_groups_null_and_blank_values_under_unknown_label(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT sex, COUNT(*) AS matching_count FROM patients GROUP BY sex ORDER BY sex",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Unknown / Null", result.get("display_sql", ""))
+        self.assertEqual(
+            {row["sex"]: row["matching_count"] for row in result["rows"]},
+            {
+                "Unknown / Null": 3,
+                "female": 2,
+                "male": 1,
+            },
+        )
+
+    def test_execute_sqlite_query_rewrites_case_buckets_for_missing_source_values(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            """
+            SELECT CASE
+                WHEN CAST(age AS INTEGER) <= 17 THEN '0-17'
+                WHEN CAST(age AS INTEGER) BETWEEN 18 AND 39 THEN '18-39'
+                WHEN CAST(age AS INTEGER) >= 40 THEN '40+'
+            END AS age_category,
+            COUNT(*) AS patient_count
+            FROM patients
+            GROUP BY age_category
+            ORDER BY age_category
+            """,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Unknown / Null", result.get("display_sql", ""))
+        self.assertEqual(
+            {row["age_category"]: row["patient_count"] for row in result["rows"]},
+            {
+                "0-17": 1,
+                "18-39": 1,
+                "40+": 1,
+                "Unknown / Null": 3,
             },
         )
 
@@ -962,6 +1116,34 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertIsNone(final_response)
 
+    def test_remember_query_result_prefers_tool_response_display_sql(self) -> None:
+        rewritten_sql = (
+            "SELECT CASE WHEN NULLIF(TRIM(CAST((sex) AS TEXT)), '') IS NULL THEN 'Unknown / Null' "
+            "ELSE (sex) END AS sex, COUNT(*) AS matching_count FROM people "
+            "GROUP BY CASE WHEN NULLIF(TRIM(CAST((sex) AS TEXT)), '') IS NULL THEN 'Unknown / Null' "
+            "ELSE (sex) END ORDER BY sex"
+        )
+        state = self._invoke_after_tool_with_state(
+            self._settings(minimum_aggregate_count=1),
+            make_query_result(
+                [
+                    {"sex": "Unknown / Null", "matching_count": 3},
+                    {"sex": "female", "matching_count": 2},
+                    {"sex": "male", "matching_count": 1},
+                ],
+                columns=["sex", "matching_count"],
+                row_count=3,
+                sql=rewritten_sql,
+                display_sql=rewritten_sql,
+            ),
+            state={},
+            args={"sql": "SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex ORDER BY sex"},
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["display_sql"], rewritten_sql)
+        self.assertIn("Unknown / Null", public_result["display_sql"])
+
     def test_remember_query_result_stores_last_query_frame_for_final_query(self) -> None:
         with patch(
             "agent_zoo.sql_agent.callbacks.get_schema_summary",
@@ -1104,6 +1286,70 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
         self.assertIsNotNone(content)
         self.assertIn("- age < 45", content.parts[0].text)
+
+    def test_remember_query_result_ignores_case_bucket_comparisons_in_query_summary(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "parent_category", "values": ["B-cell lymphoma", "T-cell lymphoma"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "split b cell patients by age categories",
+            }
+        )
+        sql = (
+            "SELECT CASE "
+            "WHEN CAST(age AS INTEGER) >= 70 THEN '70+' "
+            "WHEN CAST(age AS INTEGER) BETWEEN 60 AND 69 THEN '60-69' "
+            "ELSE 'Unknown / Null' END AS age_category, "
+            "COUNT(*) AS matching_count FROM filtered_dataset "
+            "WHERE parent_category = 'B-cell lymphoma' "
+            "GROUP BY age_category ORDER BY age_category"
+        )
+
+        callback(
+            tool,
+            {
+                "sql": sql,
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [
+                    {"age_category": "70+", "matching_count": 51},
+                    {"age_category": "Unknown / Null", "matching_count": 12},
+                ],
+                columns=["age_category", "matching_count"],
+                row_count=2,
+                sql=sql,
+            ),
+        )
+
+        query_frame = tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]
+        self.assertEqual(
+            query_frame.get("categorical_filters"),
+            [
+                {
+                    "column": "parent_category",
+                    "selected_values": ["B-cell lymphoma"],
+                    "available_values": ["B-cell lymphoma", "T-cell lymphoma"],
+                }
+            ],
+        )
+        self.assertNotIn("comparison_filters", query_frame)
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn("- parent_category = B-cell lymphoma", content.parts[0].text)
+        self.assertNotIn("age >= 70", content.parts[0].text)
 
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(

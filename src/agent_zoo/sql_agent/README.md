@@ -89,8 +89,8 @@ At a high level, the SQL agent is a single-agent Google ADK application built ar
 The model is responsible for understanding the user's request and proposing SQL. The Python code is responsible for enforcing guardrails:
 
 - introspecting the schema
-- validating that SQL is read-only
-- rejecting unsafe statements
+- validating that SQL is structurally read-only
+- rejecting write or administrative statements before execution
 - catching hallucinated tables and columns
 - executing against SQLite in read-only mode
 - formatting a predictable final answer
@@ -371,7 +371,7 @@ It has two layers:
 - avoid inventing tables or columns
 - stay read-only
 - use `LOWER(...)` when appropriate
-- handle `NULL` carefully
+- handle grouped or bucketed missing values by mapping `NULL` and blank strings to `Unknown / Null`
 - use `COUNT(*)` for counts
 - use `LIMIT` for large listings
 - avoid exposing reasoning
@@ -749,8 +749,7 @@ It produces three outputs:
 #### Why those outputs matter
 
 - `statements` is used to detect multi-statement SQL.
-- `token_text` is used to search for unsafe keywords without being fooled by comments or quoted strings.
-- `cleaned` preserves a cleaned version of the query as it was scanned.
+- `cleaned` and `token_text` preserve a comment-aware and quote-aware scan that later helpers reuse for top-level keyword detection and identifier extraction.
 
 This is the main reason the validator can safely reject things like:
 
@@ -774,34 +773,16 @@ It validates in layers:
 4. Reject multi-statement SQL.
 5. Normalize whitespace and strip trailing semicolons.
 6. Require the first keyword to be `SELECT` or `WITH`.
-7. Reject unsafe tokens anywhere in the SQL token stream.
+7. Resolve the effective top-level statement after any optional `WITH` CTEs and require that statement to be `SELECT`.
 8. Run `EXPLAIN QUERY PLAN` on the read-only connection.
 
-#### Unsafe tokens
+#### Why structural validation is used
 
-These are blocked:
+- Valid read-only expressions such as `CASE ... END` should pass validation.
+- Writable CTE forms such as `WITH filtered AS (...) DELETE FROM ...` should still be rejected.
+- SQLite schema or admin commands such as `PRAGMA`, `ATTACH`, or `VACUUM` should never reach execution.
 
-- `ALTER`
-- `ANALYZE`
-- `ATTACH`
-- `BEGIN`
-- `COMMIT`
-- `CREATE`
-- `DELETE`
-- `DETACH`
-- `DROP`
-- `END`
-- `INSERT`
-- `PRAGMA`
-- `REINDEX`
-- `RELEASE`
-- `REPLACE`
-- `ROLLBACK`
-- `SAVEPOINT`
-- `UPDATE`
-- `VACUUM`
-
-The validator is intentionally conservative. If the model generates administrative or write-like SQL, it is rejected.
+The validator is intentionally conservative about executable statement kinds, but it is no longer a flat keyword blacklist. It inspects the top-level statement shape so valid read-only SQL features remain usable while write and administrative statements are still blocked.
 
 #### Why `EXPLAIN QUERY PLAN` is used
 
@@ -835,12 +816,14 @@ Execution flow:
 
 1. clamp `preview_rows` to at least 1
 2. call `validate_sql_read_only(...)`
-3. if invalid, return a structured error result
-4. open a read-only connection
-5. execute the normalized SQL
-6. extract column names
-7. fetch `preview_rows + 1` rows
-8. if more than `preview_rows` rows exist:
+3. if the query has a top-level `GROUP BY`, deterministically rewrite grouped or bucketed category expressions so `NULL` and blank or whitespace values surface as `Unknown / Null`
+4. validate any rewritten grouped SQL again before execution
+5. if invalid, return a structured error result
+6. open a read-only connection
+7. execute the normalized SQL
+8. extract column names
+9. fetch `preview_rows + 1` rows
+10. if more than `preview_rows` rows exist:
    - mark the result as truncated
    - compute full row count with:
 
@@ -848,7 +831,7 @@ Execution flow:
 SELECT COUNT(*) AS total_count FROM (<query>) AS result_set
 ```
 
-9. return a structured result dictionary
+11. return a structured result dictionary
 
 The return shape is:
 
@@ -981,6 +964,8 @@ The public result dictionary can extend the execution-tool result with fields su
 ```
 
 When object-level canonicalization is enabled, `display_sql` can remain the simple dataset query while the raw execution-tool `sql` field still contains the internally rewritten canonical SQL that actually ran.
+
+When grouped or bucketed missing-value normalization rewrites a query, `display_sql` should reflect that semantics-changing grouped SQL so the user-visible `Unknown / Null` bucket matches the SQL they see, even if the raw execution `sql` field later changes again for object-level canonicalization.
 
 That callback-owned dictionary is then adapted into `SQLResultViewModel` inside `formatting.py`, which is the deterministic renderer contract for final SQL answers.
 
