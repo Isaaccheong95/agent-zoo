@@ -674,6 +674,40 @@ def _build_query_action_summary(tool_result: dict) -> str:
     return "Selected matching rows from the current filtered dataset."
 
 
+def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
+    column_name = str(entry.get("column") or "").strip()
+    selected_values = [
+        value.strip()
+        for value in entry.get("selected_values") or []
+        if isinstance(value, str) and value.strip()
+    ]
+    available_values = [
+        value.strip()
+        for value in entry.get("available_values") or []
+        if isinstance(value, str) and value.strip()
+    ]
+    if not column_name or not selected_values:
+        return None
+
+    if len(selected_values) == 1:
+        bullet = f"{column_name} = {selected_values[0]}"
+    else:
+        bullet = f"{column_name} in {', '.join(selected_values)}"
+
+    normalized_selected_values = {value.casefold() for value in selected_values}
+    normalized_available_values = {value.casefold() for value in available_values}
+    if (
+        available_values
+        and normalized_available_values
+        and normalized_selected_values < normalized_available_values
+    ):
+        bullet += (
+            f"  \n  Stored values for {column_name}: "
+            + ", ".join(available_values)
+        )
+    return bullet
+
+
 def _build_query_filter_bullets(tool_result: dict) -> list[str]:
     query_summary_context = tool_result.get("query_summary_context")
     if not isinstance(query_summary_context, dict):
@@ -686,18 +720,9 @@ def _build_query_filter_bullets(tool_result: dict) -> list[str]:
         if isinstance(entry, dict)
     ]
     for entry in categorical_filters:
-        column_name = str(entry.get("column") or "").strip()
-        selected_values = [
-            value.strip()
-            for value in entry.get("selected_values") or []
-            if isinstance(value, str) and value.strip()
-        ]
-        if not column_name or not selected_values:
-            continue
-        if len(selected_values) == 1:
-            bullets.append(f"{column_name} = {selected_values[0]}")
-            continue
-        bullets.append(f"{column_name} in {', '.join(selected_values)}")
+        bullet = _build_categorical_filter_bullet(entry)
+        if bullet:
+            bullets.append(bullet)
 
     comparison_filters = [
         entry

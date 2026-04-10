@@ -172,6 +172,10 @@ User sees:
 - Generated SQL
 - What I matched
 - Result
+
+When a categorical filter matched only a subset of a column's known low-cardinality stored values,
+the `What I matched` section also shows a labeled `Stored values for <column>:` line for that same
+column so users can see other stored categories without changing the executed query.
 ```
 
 ## How To Run It
@@ -545,6 +549,9 @@ It builds the view model and renders the final structured answer:
 1. `Generated SQL`
 2. `What I matched`
 3. `Result`
+
+For categorical filters, `What I matched` may include an indented `Stored values for <column>:`
+line when the executed query used only some of the column's known low-cardinality stored values.
 
 If the public result kind is `detail_count_fallback`, it also appends the privacy note explaining why only the matching count is shown.
 
