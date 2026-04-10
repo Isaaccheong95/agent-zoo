@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import re
 from typing import Any
 
@@ -30,6 +31,14 @@ _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2
 _FALLBACK_CLARIFICATION_MESSAGE = (
     "I need clarification before I can run the query. "
     "Please specify the exact category, value, or rule you want me to use."
+)
+_SAFE_AGGREGATE_COLUMN_PATTERNS = (
+    "avg",
+    "average",
+    "min",
+    "minimum",
+    "max",
+    "maximum",
 )
 
 
@@ -550,6 +559,78 @@ def format_clarification_response(clarification: dict[str, Any]) -> str:
         parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     return "\n\n".join(parts).strip()
 
+
+def _is_numeric_display_value(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _normalize_result_column_name(value: str) -> str:
+    return re.sub(r"\s+", "_", str(value).strip().lower())
+
+
+def _is_count_result_column(column_name: str) -> bool:
+    return "count" in _normalize_result_column_name(column_name)
+
+
+def _is_safe_aggregate_result_column(column_name: str) -> bool:
+    normalized = _normalize_result_column_name(column_name)
+    if _is_count_result_column(normalized):
+        return False
+    return any(pattern in normalized for pattern in _SAFE_AGGREGATE_COLUMN_PATTERNS)
+
+
+def _get_display_aggregate_columns(tool_result: dict[str, Any], rows: list[Any]) -> set[str]:
+    aggregate_columns = {
+        str(column).strip()
+        for column in (tool_result.get("aggregate_columns") or [])
+        if isinstance(column, str) and str(column).strip()
+    }
+    if aggregate_columns:
+        return aggregate_columns
+
+    columns = [
+        str(column).strip()
+        for column in (tool_result.get("columns") or [])
+        if isinstance(column, str) and str(column).strip()
+    ]
+    if not columns or not rows:
+        return set()
+
+    detected_columns: set[str] = set()
+    for column in columns:
+        if not _is_safe_aggregate_result_column(column):
+            continue
+        if all(isinstance(row, dict) and _is_numeric_display_value(row.get(column)) for row in rows):
+            detected_columns.add(column)
+    return detected_columns
+
+
+def _format_fixed_decimal(value: int | float) -> str:
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
+        return str(value)
+    return f"{numeric_value:.2f}"
+
+
+def _build_display_rows(tool_result: dict[str, Any], rows: list[Any]) -> list[Any]:
+    aggregate_columns = _get_display_aggregate_columns(tool_result, rows)
+    if not aggregate_columns:
+        return rows
+
+    display_rows: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return rows
+
+        display_row: dict[str, Any] = {}
+        for column, value in row.items():
+            if column in aggregate_columns and _is_numeric_display_value(value):
+                display_row[column] = _format_fixed_decimal(value)
+                continue
+            display_row[column] = value
+        display_rows.append(display_row)
+    return display_rows
+
 def format_result_payload(tool_result: dict) -> str:
     if tool_result["status"] != "success":
         return tool_result.get("error") or "Execution failed."
@@ -558,10 +639,12 @@ def format_result_payload(tool_result: dict) -> str:
     if not rows:
         return "No rows returned."
 
-    if len(rows) == 1 and len(rows[0]) == 1:
-        return str(next(iter(rows[0].values())))
+    display_rows = _build_display_rows(tool_result, rows)
 
-    return json.dumps(rows, indent=2)
+    if len(display_rows) == 1 and isinstance(display_rows[0], dict) and len(display_rows[0]) == 1:
+        return str(next(iter(display_rows[0].values())))
+
+    return json.dumps(display_rows, indent=2)
 
 
 def _get_matching_row_count(tool_result: dict) -> int | float | None:
