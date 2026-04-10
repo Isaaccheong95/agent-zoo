@@ -25,7 +25,7 @@ from .config import (
 
 INTERNAL_TABLE_PREFIXES = ("sqlite_", "__")
 READ_ONLY_ROOT_STATEMENT_KEYWORDS = ("SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE")
-UNKNOWN_GROUP_VALUE_LABEL = "Unknown / Null"
+UNKNOWN_GROUP_VALUE_LABEL = "Null"
 SQL_IDENTIFIER_EXPRESSION_PATTERN = re.compile(
     r'^(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))*$'
 )
