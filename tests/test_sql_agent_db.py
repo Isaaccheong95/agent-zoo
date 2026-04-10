@@ -1491,6 +1491,10 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["rows"][0]["average_age"], 36.25)
         self.assertEqual(public_result["matched_row_count"], 4)
         self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+        model = build_sql_result_view_model(public_result)
+        self.assertIn('"average_age": "36.25"', model.result_payload)
+        self.assertIn('"matching_count": 4', model.result_payload)
+        self.assertNotIn('"matching_count": "4.00"', model.result_payload)
 
     def test_scalar_average_below_threshold_is_blocked(self) -> None:
         state = self._invoke_after_tool(
@@ -1526,6 +1530,18 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["matched_row_count"], 9)
         self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
         self.assertEqual(public_result["rows"][0]["average_age"], 31.4)
+        self.assertEqual(public_result["rows"][1]["average_age"], 44.0)
+
+        callback = build_format_final_agent_response_callback()
+        content = callback(SimpleNamespace(state=state))
+
+        self.assertIsNotNone(content)
+        response_text = content.parts[0].text
+        self.assertIn('"average_age": "31.40"', response_text)
+        self.assertIn('"average_age": "44.00"', response_text)
+        self.assertIn('"matching_count": 5', response_text)
+        self.assertIn('"matching_count": 4', response_text)
+        self.assertNotIn('"matching_count": "5.00"', response_text)
 
     def test_grouped_average_without_matching_count_derives_group_counts(self) -> None:
         count_result = make_query_result(
@@ -1832,6 +1848,33 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertEqual(model.sql, tool_result["display_sql"])
 
+    def test_build_sql_result_view_model_formats_scalar_safe_aggregate_to_two_decimals(self) -> None:
+        tool_result = {
+            "status": "success",
+            "sql": "SELECT AVG(age) AS average_age FROM filtered_dataset WHERE gender = 'Female'",
+            "columns": ["average_age"],
+            "rows": [{"average_age": 44.0}],
+            "row_count": 1,
+            "preview_row_count": 1,
+            "truncated": False,
+            "error": None,
+            "matched_row_count": 12,
+            "public_result_kind": "safe_aggregate",
+            "query_summary_context": {
+                "categorical_filters": [
+                    {
+                        "column": "gender",
+                        "selected_values": ["Female"],
+                        "available_values": ["Female", "Male"],
+                    },
+                ],
+            },
+        }
+
+        model = build_sql_result_view_model(tool_result)
+
+        self.assertEqual(model.result_payload, "44.00")
+
     def test_render_sql_result_view_model_matches_existing_formatter_output(self) -> None:
         tool_result = {
             "status": "success",
@@ -1857,6 +1900,8 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         model = build_sql_result_view_model(tool_result)
         rendered = render_sql_result_view_model(model)
+
+        self.assertEqual(model.result_payload, "12")
 
         callback = build_format_final_agent_response_callback()
         content = callback(SimpleNamespace(state={SQL_PUBLIC_RESULT_STATE_KEY: tool_result}))
