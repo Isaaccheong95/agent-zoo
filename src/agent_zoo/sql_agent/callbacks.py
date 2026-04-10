@@ -437,6 +437,145 @@ def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
     ]
 
 
+def _mask_char_for_sql_filter_extraction(char: str) -> str:
+    return "\n" if char == "\n" else " "
+
+
+def _mask_case_expressions(sql: str) -> str:
+    masked = list(sql)
+    state = "normal"
+    case_depth = 0
+    index = 0
+
+    while index < len(sql):
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+
+        if state == "line_comment":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == "*" and next_char == "/":
+                if case_depth > 0:
+                    masked[index + 1] = _mask_char_for_sql_filter_extraction(next_char)
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == "'" and next_char == "'":
+                if case_depth > 0:
+                    masked[index + 1] = _mask_char_for_sql_filter_extraction(next_char)
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "backtick":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == "`":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "bracket":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            if char == "]":
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+                masked[index + 1] = _mask_char_for_sql_filter_extraction(next_char)
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+                masked[index + 1] = _mask_char_for_sql_filter_extraction(next_char)
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "`":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            state = "backtick"
+            index += 1
+            continue
+
+        if char == "[":
+            if case_depth > 0:
+                masked[index] = _mask_char_for_sql_filter_extraction(char)
+            state = "bracket"
+            index += 1
+            continue
+
+        if char.isalpha() or char == "_":
+            token_start = index
+            index += 1
+            while index < len(sql) and (sql[index].isalnum() or sql[index] == "_"):
+                index += 1
+            token = sql[token_start:index]
+            token_upper = token.upper()
+            if token_upper == "CASE":
+                case_depth += 1
+            if case_depth > 0:
+                for mask_index in range(token_start, index):
+                    masked[mask_index] = _mask_char_for_sql_filter_extraction(sql[mask_index])
+            if token_upper == "END" and case_depth > 0:
+                case_depth -= 1
+            continue
+
+        if case_depth > 0:
+            masked[index] = _mask_char_for_sql_filter_extraction(char)
+
+        index += 1
+
+    return "".join(masked)
+
+
 def _normalize_sql_identifier(value: str) -> str:
     identifier = value.strip()
     if "." in identifier:
@@ -457,6 +596,7 @@ def _extract_categorical_filters_from_sql(
     sql: str,
     categorical_value_guidance: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    searchable_sql = _mask_case_expressions(sql)
     filters: list[dict[str, Any]] = []
     for entry in categorical_value_guidance:
         column_name = str(entry.get("column") or "").strip()
@@ -473,7 +613,7 @@ def _extract_categorical_filters_from_sql(
 
         in_match = re.search(
             rf"{quoted_or_bare_column}\s+IN\s*\((?P<values>[^)]*)\)",
-            sql,
+            searchable_sql,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if in_match is not None:
@@ -487,7 +627,7 @@ def _extract_categorical_filters_from_sql(
                 match.group(1).replace("''", "'")
                 for match in re.finditer(
                     rf"{quoted_or_bare_column}\s*=\s*'((?:''|[^'])*)'",
-                    sql,
+                    searchable_sql,
                     flags=re.IGNORECASE,
                 )
             ]
@@ -512,6 +652,7 @@ def _extract_comparison_filters_from_sql(
     *,
     excluded_columns: set[str] | None = None,
 ) -> list[dict[str, str]]:
+    searchable_sql = _mask_case_expressions(sql)
     comparison_filters: list[dict[str, str]] = []
     seen_filters: set[tuple[str, str, str]] = set()
     skipped_columns = {column.casefold() for column in (excluded_columns or set()) if column}
@@ -522,7 +663,7 @@ def _extract_comparison_filters_from_sql(
         rf'(?:(?:CAST\(\s*(?P<cast_column>{identifier_pattern})\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*\))|(?P<column>{identifier_pattern}))\s*'
         rf'(?P<operator>>=|<=|<>|!=|=|>|<)\s*'
         rf'(?P<value>{value_pattern})',
-        sql,
+        searchable_sql,
         flags=re.IGNORECASE,
     ):
         column_name = _normalize_sql_identifier(match.group("cast_column") or match.group("column") or "")

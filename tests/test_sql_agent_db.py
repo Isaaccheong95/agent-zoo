@@ -1287,6 +1287,70 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(content)
         self.assertIn("- age < 45", content.parts[0].text)
 
+    def test_remember_query_result_ignores_case_bucket_comparisons_in_query_summary(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "parent_category", "values": ["B-cell lymphoma", "T-cell lymphoma"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "split b cell patients by age categories",
+            }
+        )
+        sql = (
+            "SELECT CASE "
+            "WHEN CAST(age AS INTEGER) >= 70 THEN '70+' "
+            "WHEN CAST(age AS INTEGER) BETWEEN 60 AND 69 THEN '60-69' "
+            "ELSE 'Unknown / Null' END AS age_category, "
+            "COUNT(*) AS matching_count FROM filtered_dataset "
+            "WHERE parent_category = 'B-cell lymphoma' "
+            "GROUP BY age_category ORDER BY age_category"
+        )
+
+        callback(
+            tool,
+            {
+                "sql": sql,
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [
+                    {"age_category": "70+", "matching_count": 51},
+                    {"age_category": "Unknown / Null", "matching_count": 12},
+                ],
+                columns=["age_category", "matching_count"],
+                row_count=2,
+                sql=sql,
+            ),
+        )
+
+        query_frame = tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]
+        self.assertEqual(
+            query_frame.get("categorical_filters"),
+            [
+                {
+                    "column": "parent_category",
+                    "selected_values": ["B-cell lymphoma"],
+                    "available_values": ["B-cell lymphoma", "T-cell lymphoma"],
+                }
+            ],
+        )
+        self.assertNotIn("comparison_filters", query_frame)
+
+        content = build_format_final_agent_response_callback()(SimpleNamespace(state=tool_context.state))
+        self.assertIsNotNone(content)
+        self.assertIn("- parent_category = B-cell lymphoma", content.parts[0].text)
+        self.assertNotIn("age >= 70", content.parts[0].text)
+
     def test_capture_internal_rows_stores_raw_result_reference(self) -> None:
         raw_result = make_query_result(
             [
