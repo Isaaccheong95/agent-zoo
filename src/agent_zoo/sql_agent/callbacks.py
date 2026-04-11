@@ -67,7 +67,6 @@ SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
 SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
-SQL_WORKING_MEMORY_RECENT_REFINEMENT_KEY = "recent_refinement"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -2589,11 +2588,6 @@ def build_remember_query_result_callback(
                 recent_refinement = None
                 if isinstance(source_query_frame, dict):
                     recent_refinement = _build_recent_refinement(source_query_frame, last_query_frame)
-                _set_sql_working_memory_value(
-                    tool_context.state,
-                    SQL_WORKING_MEMORY_RECENT_REFINEMENT_KEY,
-                    recent_refinement,
-                )
                 if recent_refinement is not None:
                     rewritten_question = _rewrite_question_from_recent_refinement(
                         source_query_frame,

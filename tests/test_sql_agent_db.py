@@ -1356,7 +1356,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             get_sql_current_query_frame(tool_context.state)["topic_context"],
         )
         self.assertEqual(
-            working_memory["recent_refinement"]["changes"],
+            get_sql_current_query_frame(tool_context.state)["recent_refinement"]["changes"],
             [
                 {
                     "column": "gender",
