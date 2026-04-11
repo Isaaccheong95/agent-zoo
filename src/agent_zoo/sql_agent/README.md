@@ -375,7 +375,7 @@ It has two layers:
 - avoid inventing tables or columns
 - stay read-only
 - use `LOWER(...)` when appropriate
-- handle grouped or bucketed missing values by mapping `NULL` and blank strings to `Unknown / Null`
+- handle grouped or bucketed missing values by mapping `NULL` and blank strings to `Null`
 - use `COUNT(*)` for counts
 - use `LIMIT` for large listings
 - avoid exposing reasoning
@@ -554,6 +554,10 @@ For categorical filters, `What I matched` may include an indented `Stored values
 line when the executed query used only some of the column's known low-cardinality stored values.
 
 If the public result kind is `detail_count_fallback`, it also appends the privacy note explaining why only the matching count is shown.
+
+If a grouped result omits one or more buckets due to the minimum aggregate threshold, it appends a generic privacy note explaining that some grouped results were omitted.
+
+If an initial grouped aggregate result was truncated to preview rows, the callback layer can re-run that grouped SQL with the full grouped row count before applying privacy suppression, so safe buckets are not blocked solely because the first tool response was only a preview.
 
 #### Clarification fallback behavior
 
@@ -823,7 +827,7 @@ Execution flow:
 
 1. clamp `preview_rows` to at least 1
 2. call `validate_sql_read_only(...)`
-3. if the query has a top-level `GROUP BY`, deterministically rewrite grouped or bucketed category expressions so `NULL` and blank or whitespace values surface as `Unknown / Null`
+3. if the query has a top-level `GROUP BY`, deterministically rewrite grouped or bucketed category expressions so `NULL` and blank or whitespace values surface as `Null`
 4. validate any rewritten grouped SQL again before execution
 5. if invalid, return a structured error result
 6. open a read-only connection
@@ -958,6 +962,7 @@ The public result dictionary can extend the execution-tool result with fields su
   "display_sql": "SELECT COUNT(*) AS passenger_count FROM filtered_dataset WHERE sex = 'female'",
   "matched_row_count": 225,
   "public_result_kind": "count_aggregate" | "safe_aggregate" | "detail_count_fallback",
+  "grouped_result_suppressed": False,
   "query_summary_context": {
     "question": "how many females are older than 46",
     "categorical_filters": [
@@ -970,9 +975,11 @@ The public result dictionary can extend the execution-tool result with fields su
 }
 ```
 
+When grouped buckets are partially suppressed for privacy, `grouped_result_suppressed` is `True` and `matched_row_count` can be omitted so hidden bucket sizes are not reconstructable from the visible output.
+
 When object-level canonicalization is enabled, `display_sql` can remain the simple dataset query while the raw execution-tool `sql` field still contains the internally rewritten canonical SQL that actually ran.
 
-When grouped or bucketed missing-value normalization rewrites a query, `display_sql` should reflect that semantics-changing grouped SQL so the user-visible `Unknown / Null` bucket matches the SQL they see, even if the raw execution `sql` field later changes again for object-level canonicalization.
+When grouped or bucketed missing-value normalization rewrites a query, `display_sql` should reflect that semantics-changing grouped SQL so the user-visible `Null` bucket matches the SQL they see, even if the raw execution `sql` field later changes again for object-level canonicalization.
 
 That callback-owned dictionary is then adapted into `SQLResultViewModel` inside `formatting.py`, which is the deterministic renderer contract for final SQL answers.
 

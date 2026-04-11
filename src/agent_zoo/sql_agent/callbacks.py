@@ -1425,6 +1425,66 @@ def _build_scalar_public_result(
     }
 
 
+def _build_grouped_public_result(
+    tool_response: dict[str, Any],
+    columns: list[str],
+    public_rows: list[dict[str, Any]],
+    normalized_count_values: list[int],
+    minimum_aggregate_count: int,
+    *,
+    public_result_kind: str,
+    aggregate_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    safe_rows = [
+        row
+        for row, matching_count in zip(public_rows, normalized_count_values)
+        if matching_count >= minimum_aggregate_count
+    ]
+    if not safe_rows:
+        return _build_privacy_error_result(
+            tool_response,
+            "Privacy guardrail blocked this grouped result because at least one group count is below the minimum threshold.",
+            matched_row_count=_normalize_count_value(sum(normalized_count_values)),
+        )
+
+    public_result = dict(tool_response)
+    public_result["columns"] = columns
+    public_result["rows"] = safe_rows
+    public_result["row_count"] = len(safe_rows)
+    public_result["preview_row_count"] = len(safe_rows)
+    public_result["public_result_kind"] = public_result_kind
+    if aggregate_columns is not None:
+        public_result["aggregate_columns"] = aggregate_columns
+
+    if len(safe_rows) == len(public_rows):
+        public_result["matched_row_count"] = _normalize_count_value(sum(normalized_count_values))
+    else:
+        public_result.pop("matched_row_count", None)
+        public_result["grouped_result_suppressed"] = True
+
+    return public_result
+
+
+def _reload_complete_grouped_result(tool_response: dict[str, Any]) -> dict[str, Any] | None:
+    db_path = str(tool_response.get("db_path") or "").strip()
+    sql = str(tool_response.get("sql") or "").strip()
+    if not db_path or not sql:
+        return None
+
+    row_count = _normalize_count_value(tool_response.get("row_count"))
+    if not isinstance(row_count, int) or row_count < 1:
+        return None
+
+    complete_result = execute_sqlite_query(
+        db_path,
+        sql,
+        preview_rows=row_count,
+    )
+    if complete_result.get("status") != "success" or complete_result.get("truncated"):
+        return None
+    return complete_result
+
+
 def _extract_scalar_numeric_value(rows: list[dict[str, Any]]) -> Any | None:
     if len(rows) != 1:
         return None
@@ -1900,6 +1960,22 @@ def _build_aggregate_public_result(
     columns = tool_response.get("columns") or []
     sql = tool_response.get("sql") or ""
     has_group_by = _sql_has_top_level_group_by(sql)
+
+    if has_group_by and tool_response.get("truncated"):
+        complete_grouped_result = _reload_complete_grouped_result(tool_response)
+        if complete_grouped_result is None:
+            return _build_privacy_error_result(
+                tool_response,
+                (
+                    "Privacy guardrail blocked this aggregate result because only a preview "
+                    "was available, so not every cohort or group could be checked safely."
+                ),
+            )
+        tool_response = complete_grouped_result
+        rows = tool_response.get("rows") or []
+        columns = tool_response.get("columns") or []
+        sql = tool_response.get("sql") or sql
+
     count_column = _detect_count_column(rows, columns)
     if count_column is None:
         scalar_numeric_value = _extract_scalar_numeric_value(rows)
@@ -1973,20 +2049,15 @@ def _build_aggregate_public_result(
                     public_row[column] = row.get(column)
                 public_rows.append(public_row)
 
-            if any(value < minimum_aggregate_count for value in count_values):
-                return _build_privacy_error_result(
-                    tool_response,
-                    "Privacy guardrail blocked this grouped result because at least one group count is below the minimum threshold.",
-                    matched_row_count=_normalize_count_value(sum(count_values)),
-                )
-
-            public_result = dict(tool_response)
-            public_result["columns"] = [*group_columns, "matching_count", *remaining_columns]
-            public_result["rows"] = public_rows
-            public_result["matched_row_count"] = _normalize_count_value(sum(count_values))
-            public_result["aggregate_columns"] = aggregate_columns
-            public_result["public_result_kind"] = "safe_aggregate"
-            return public_result
+            return _build_grouped_public_result(
+                tool_response,
+                [*group_columns, "matching_count", *remaining_columns],
+                public_rows,
+                count_values,
+                minimum_aggregate_count,
+                public_result_kind="safe_aggregate",
+                aggregate_columns=aggregate_columns,
+            )
 
         db_path = tool_response.get("db_path") or ""
         count_sql = _build_count_sql(sql)
@@ -2020,23 +2091,29 @@ def _build_aggregate_public_result(
             ),
         )
 
-    count_values = [row[count_column] for row in rows]
-    if any(value < minimum_aggregate_count for value in count_values):
+    normalized_count_values = [_normalize_count_value(row[count_column]) for row in rows]
+    if any(value < minimum_aggregate_count for value in normalized_count_values):
         if not is_grouped:
-            matching_count = _normalize_count_value(count_values[0])
+            matching_count = normalized_count_values[0]
             return _build_privacy_error_result(
                 tool_response,
                 "Privacy guardrail blocked this result because the matching count is below the minimum threshold.",
                 matched_row_count=matching_count,
             )
-        return _build_privacy_error_result(
+        return _build_grouped_public_result(
             tool_response,
-            "Privacy guardrail blocked this grouped result because at least one group count is below the minimum threshold.",
-            matched_row_count=_normalize_count_value(sum(count_values)),
+            columns,
+            rows,
+            normalized_count_values,
+            minimum_aggregate_count,
+            public_result_kind=(
+                "safe_aggregate" if aggregate_columns else "count_aggregate"
+            ),
+            aggregate_columns=aggregate_columns,
         )
 
     public_result = dict(tool_response)
-    public_result["matched_row_count"] = _normalize_count_value(sum(count_values))
+    public_result["matched_row_count"] = _normalize_count_value(sum(normalized_count_values))
     public_result["aggregate_columns"] = aggregate_columns
     public_result["public_result_kind"] = (
         "safe_aggregate" if aggregate_columns else "count_aggregate"

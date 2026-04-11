@@ -703,18 +703,18 @@ class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
         if self.db_path.exists():
             self.db_path.unlink()
 
-    def test_execute_sqlite_query_groups_null_and_blank_values_under_unknown_label(self) -> None:
+    def test_execute_sqlite_query_groups_null_and_blank_values_under_null_label(self) -> None:
         result = execute_sqlite_query(
             self.db_path,
             "SELECT sex, COUNT(*) AS matching_count FROM patients GROUP BY sex ORDER BY sex",
         )
 
         self.assertEqual(result["status"], "success")
-        self.assertIn("Unknown / Null", result.get("display_sql", ""))
+        self.assertIn("'Null'", result.get("display_sql", ""))
         self.assertEqual(
             {row["sex"]: row["matching_count"] for row in result["rows"]},
             {
-                "Unknown / Null": 3,
+                "Null": 3,
                 "female": 2,
                 "male": 1,
             },
@@ -737,14 +737,14 @@ class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "success")
-        self.assertIn("Unknown / Null", result.get("display_sql", ""))
+        self.assertIn("'Null'", result.get("display_sql", ""))
         self.assertEqual(
             {row["age_category"]: row["patient_count"] for row in result["rows"]},
             {
                 "0-17": 1,
                 "18-39": 1,
                 "40+": 1,
-                "Unknown / Null": 3,
+                "Null": 3,
             },
         )
 
@@ -1437,7 +1437,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["matched_row_count"], 4)
         self.assertEqual(public_result["public_result_kind"], "count_aggregate")
 
-    def test_grouped_counts_below_threshold_are_blocked(self) -> None:
+    def test_grouped_counts_below_threshold_are_suppressed(self) -> None:
         state = self._invoke_after_tool(
             self._settings(minimum_aggregate_count=3),
             make_query_result(
@@ -1452,9 +1452,73 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(public_result["rows"], [{"sex": "female", "matching_count": 5}])
+        self.assertEqual(public_result["row_count"], 1)
+        self.assertEqual(public_result["preview_row_count"], 1)
+        self.assertEqual(public_result["public_result_kind"], "count_aggregate")
+        self.assertTrue(public_result["grouped_result_suppressed"])
+        self.assertIsNone(public_result.get("matched_row_count"))
+
+    def test_grouped_counts_all_below_threshold_are_blocked(self) -> None:
+        state = self._invoke_after_tool(
+            self._settings(minimum_aggregate_count=3),
+            make_query_result(
+                [
+                    {"sex": "female", "matching_count": 2},
+                    {"sex": "male", "matching_count": 1},
+                ],
+                columns=["sex", "matching_count"],
+                row_count=2,
+                sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
+            ),
+        )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
         self.assertEqual(public_result["status"], "error")
         self.assertTrue(public_result["privacy_blocked"])
         self.assertIn("group count is below the minimum threshold", public_result["error"])
+
+    def test_grouped_counts_truncated_preview_reloads_full_groups(self) -> None:
+        sql = "SELECT gender, trmttype, COUNT(*) AS matching_count FROM people GROUP BY gender, trmttype"
+        full_result = make_query_result(
+            [
+                {"gender": "Female", "trmttype": "Chemo", "matching_count": 5},
+                {"gender": "Male", "trmttype": "Chemo", "matching_count": 4},
+                {"gender": "Null", "trmttype": "Others", "matching_count": 1},
+            ],
+            columns=["gender", "trmttype", "matching_count"],
+            row_count=3,
+            sql=sql,
+        )
+
+        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=full_result) as mocked_query:
+            state = self._invoke_after_tool(
+                self._settings(minimum_aggregate_count=3),
+                make_query_result(
+                    [
+                        {"gender": "Female", "trmttype": "Chemo", "matching_count": 5},
+                        {"gender": "Male", "trmttype": "Chemo", "matching_count": 4},
+                    ],
+                    columns=["gender", "trmttype", "matching_count"],
+                    row_count=3,
+                    truncated=True,
+                    sql=sql,
+                ),
+            )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(
+            public_result["rows"],
+            [
+                {"gender": "Female", "trmttype": "Chemo", "matching_count": 5},
+                {"gender": "Male", "trmttype": "Chemo", "matching_count": 4},
+            ],
+        )
+        self.assertTrue(public_result["grouped_result_suppressed"])
+        self.assertIsNone(public_result.get("matched_row_count"))
+        mocked_query.assert_called_once_with("fixture.sqlite", sql, preview_rows=3)
 
     def test_grouped_counts_above_threshold_are_kept_publicly(self) -> None:
         state = self._invoke_after_tool(
@@ -1574,7 +1638,98 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertEqual(public_result["matched_row_count"], 9)
         self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
 
-    def test_grouped_average_below_threshold_is_blocked(self) -> None:
+    def test_grouped_average_without_matching_count_suppresses_unsafe_groups(self) -> None:
+        count_result = make_query_result(
+            [
+                {"sex": "female", "matching_count": 5},
+                {"sex": "male", "matching_count": 1},
+            ],
+            columns=["sex", "matching_count"],
+            row_count=2,
+            sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
+        )
+
+        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=count_result):
+            state = self._invoke_after_tool(
+                self._settings(minimum_aggregate_count=3),
+                make_query_result(
+                    [
+                        {"sex": "female", "average_age": 31.4},
+                        {"sex": "male", "average_age": 44.0},
+                    ],
+                    columns=["sex", "average_age"],
+                    row_count=2,
+                    sql="SELECT sex, AVG(age) AS average_age FROM people GROUP BY sex",
+                ),
+            )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(
+            public_result["rows"],
+            [{"sex": "female", "matching_count": 5, "average_age": 31.4}],
+        )
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+        self.assertTrue(public_result["grouped_result_suppressed"])
+        self.assertIsNone(public_result.get("matched_row_count"))
+
+    def test_grouped_average_truncated_preview_reloads_full_groups(self) -> None:
+        sql = "SELECT sex, AVG(age) AS average_age FROM people GROUP BY sex"
+        full_grouped_result = make_query_result(
+            [
+                {"sex": "female", "average_age": 31.4},
+                {"sex": "male", "average_age": 44.0},
+                {"sex": "Null", "average_age": 52.0},
+            ],
+            columns=["sex", "average_age"],
+            row_count=3,
+            sql=sql,
+        )
+        count_result = make_query_result(
+            [
+                {"sex": "female", "matching_count": 5},
+                {"sex": "male", "matching_count": 4},
+                {"sex": "Null", "matching_count": 1},
+            ],
+            columns=["sex", "matching_count"],
+            row_count=3,
+            sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
+        )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.execute_sqlite_query",
+            side_effect=[full_grouped_result, count_result],
+        ) as mocked_query:
+            state = self._invoke_after_tool(
+                self._settings(minimum_aggregate_count=3),
+                make_query_result(
+                    [
+                        {"sex": "female", "average_age": 31.4},
+                        {"sex": "male", "average_age": 44.0},
+                    ],
+                    columns=["sex", "average_age"],
+                    row_count=3,
+                    truncated=True,
+                    sql=sql,
+                ),
+            )
+
+        public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(
+            public_result["rows"],
+            [
+                {"sex": "female", "matching_count": 5, "average_age": 31.4},
+                {"sex": "male", "matching_count": 4, "average_age": 44.0},
+            ],
+        )
+        self.assertTrue(public_result["grouped_result_suppressed"])
+        self.assertIsNone(public_result.get("matched_row_count"))
+        self.assertEqual(mocked_query.call_count, 2)
+        self.assertEqual(mocked_query.call_args_list[0].args, ("fixture.sqlite", sql))
+        self.assertEqual(mocked_query.call_args_list[0].kwargs, {"preview_rows": 3})
+
+    def test_grouped_average_below_threshold_is_suppressed(self) -> None:
         state = self._invoke_after_tool(
             self._settings(minimum_aggregate_count=3),
             make_query_result(
@@ -1589,9 +1744,16 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
-        self.assertEqual(public_result["status"], "error")
-        self.assertTrue(public_result["privacy_blocked"])
-        self.assertIn("group count is below the minimum threshold", public_result["error"])
+        self.assertEqual(public_result["status"], "success")
+        self.assertEqual(
+            public_result["rows"],
+            [{"sex": "female", "matching_count": 5, "average_age": 31.4}],
+        )
+        self.assertEqual(public_result["row_count"], 1)
+        self.assertEqual(public_result["preview_row_count"], 1)
+        self.assertEqual(public_result["public_result_kind"], "safe_aggregate")
+        self.assertTrue(public_result["grouped_result_suppressed"])
+        self.assertIsNone(public_result.get("matched_row_count"))
 
     def test_count_mode_off_preserves_public_passthrough(self) -> None:
         raw_result = make_query_result(
@@ -1630,6 +1792,39 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIn("4", response_text)
         self.assertNotIn("Alice", response_text)
         self.assertNotIn('"name"', response_text)
+
+    def test_formatted_grouped_response_notes_suppressed_groups(self) -> None:
+        callback = build_format_final_agent_response_callback()
+        content = callback(
+            SimpleNamespace(
+                state={
+                    SQL_PUBLIC_RESULT_STATE_KEY: {
+                        "status": "success",
+                        "db_path": "fixture.sqlite",
+                        "sql": "SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
+                        "columns": ["sex", "matching_count"],
+                        "rows": [{"sex": "female", "matching_count": 5}],
+                        "row_count": 1,
+                        "preview_row_count": 1,
+                        "truncated": False,
+                        "error": None,
+                        "public_result_kind": "count_aggregate",
+                        "grouped_result_suppressed": True,
+                    }
+                }
+            )
+        )
+
+        self.assertIsNotNone(content)
+        response_text = content.parts[0].text
+        self.assertIn(
+            "- Counted rows for the privacy-safe matched groups in the current filtered dataset.",
+            response_text,
+        )
+        self.assertIn(
+            "Note: Some grouped results were omitted due to privacy guardrails.",
+            response_text,
+        )
 
     def test_formatted_final_response_includes_matched_categories(self) -> None:
         callback = build_format_final_agent_response_callback()
