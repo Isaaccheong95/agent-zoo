@@ -29,6 +29,7 @@ from agent_zoo.sql_agent.callbacks import (
     SQL_PENDING_CLARIFICATION_STATE_KEY,
     SQL_PUBLIC_RESULT_STATE_KEY,
     SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
+    SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY,
     build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
@@ -50,6 +51,7 @@ from agent_zoo.scope_guard import (
     build_llm_schema_grounding_resolver,
     build_llm_scope_gate,
 )
+from agent_zoo.working_memory import get_agent_working_memory, get_agent_working_memory_value
 
 
 def create_fixture_database(db_path: Path) -> None:
@@ -179,6 +181,10 @@ def make_query_result(
     if display_sql is not None:
         result["display_sql"] = display_sql
     return result
+
+
+def get_sql_working_memory(state: dict[str, object]) -> dict[str, object]:
+    return get_agent_working_memory(state, "sql_agent")
 
 class SQLiteHelpersTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -553,11 +559,68 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             },
         )
         self.assertIn("refine_query|needs_clarification|topic_change", captured["system_prompt"])
-        self.assertIn("Previous dataset question", captured["user_prompt"])
+        self.assertIn("Current committed dataset question/topic", captured["user_prompt"])
         self.assertIn("how many males dont work", captured["user_prompt"])
-        self.assertIn("Previous SQL query", captured["user_prompt"])
-        self.assertIn("Categorical filters from the previous query", captured["user_prompt"])
+        self.assertIn("Current committed SQL query", captured["user_prompt"])
+        self.assertIn("Categorical filters from the current committed query", captured["user_prompt"])
         self.assertIn("Latest user reply", captured["user_prompt"])
+
+    def test_result_refinement_resolver_includes_recent_refinement_history(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_type":"topic_change","target_column":"","selected_values":[],"refinement_request":""}'
+                        )
+                    )
+                ]
+            )
+
+        resolver = build_llm_result_refinement_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolver(
+                {
+                    "question": "how many males work",
+                    "topic_context": (
+                        "Current committed dataset question/topic: how many males work\n\n"
+                        "Current committed categorical filters:\n- gender = Female\n- sococc = Employed"
+                    ),
+                    "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Female"], "available_values": ["Male", "Female"]},
+                        {
+                            "column": "sococc",
+                            "selected_values": ["Employed"],
+                            "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                        },
+                    ],
+                    "recent_refinement": {
+                        "changes": [
+                            {
+                                "column": "gender",
+                                "previous_values": ["Male"],
+                                "selected_values": ["Female"],
+                                "added_values": ["Female"],
+                                "removed_values": ["Male"],
+                            }
+                        ]
+                    },
+                },
+                "number of working adults",
+            )
+
+        self.assertIn("Current committed query context", captured["user_prompt"])
+        self.assertIn("Current committed categorical filters", captured["user_prompt"])
+        self.assertIn("Recent categorical refinement history", captured["user_prompt"])
+        self.assertIn(
+            "gender: previous = Male; current = Female; added = Female; removed = Male",
+            captured["user_prompt"],
+        )
 
     def test_result_refinement_resolver_fails_closed_on_invalid_output(self) -> None:
         def completion(**kwargs):
@@ -1197,6 +1260,77 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
         public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
         self.assertEqual(public_result["query_summary_context"], query_frame)
+
+    def test_remember_query_result_stores_current_query_frame_in_shared_memory(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Male", "Female"]},
+                    {
+                        "column": "sococc",
+                        "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    },
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        previous_query_frame = {
+            "question": "how many males work",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+            "categorical_filters": [
+                {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                {
+                    "column": "sococc",
+                    "selected_values": ["Employed"],
+                    "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                },
+            ],
+        }
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "females?",
+                SQL_LAST_QUERY_FRAME_STATE_KEY: previous_query_frame,
+                SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY: previous_query_frame,
+            }
+        )
+
+        callback(
+            tool,
+            {
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [{"matching_count": 12}],
+                columns=["matching_count"],
+                sql="SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+            ),
+        )
+
+        working_memory = get_sql_working_memory(tool_context.state)
+        self.assertIn("current_query_frame", working_memory)
+        self.assertEqual(
+            get_agent_working_memory_value(tool_context.state, "sql_agent", "current_query_frame"),
+            tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY],
+        )
+        self.assertEqual(
+            working_memory["recent_refinement"]["changes"],
+            [
+                {
+                    "column": "gender",
+                    "previous_values": ["Male"],
+                    "selected_values": ["Female"],
+                    "available_values": ["Male", "Female"],
+                    "added_values": ["Female"],
+                    "removed_values": ["Male"],
+                }
+            ],
+        )
 
     def test_remember_query_result_includes_non_categorical_comparison_filters(self) -> None:
         with patch(
@@ -3208,6 +3342,71 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIn("The user is refining the previous dataset request", rewritten_text)
         self.assertIn("Previous dataset question: how many males dont work", rewritten_text)
         self.assertIn("Use this updated value set for sococc: Retired, Student, Unemployed", rewritten_text)
+
+    def test_combined_before_model_callback_restores_recently_removed_value_without_llm(self) -> None:
+        scope_gate_calls: list[str] = []
+        refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            refinement_resolver_calls.append((frame, user_text))
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_LAST_QUERY_FRAME_STATE_KEY: {
+                "question": "how many females are smokers and drink alcohol",
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE socalc = 'Regularly'",
+                "categorical_filters": [
+                    {
+                        "column": "socalc",
+                        "selected_values": ["Regularly"],
+                        "available_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                    }
+                ],
+                "recent_refinement": {
+                    "changes": [
+                        {
+                            "column": "socalc",
+                            "previous_values": ["Occasionally", "Regularly"],
+                            "selected_values": ["Regularly"],
+                            "available_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            "removed_values": ["Occasionally"],
+                        }
+                    ]
+                },
+            }
+        }
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="add it back")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(refinement_resolver_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Use this updated value set for socalc: Occasionally, Regularly", rewritten_text)
 
     def test_combined_before_model_callback_applies_scope_gate_for_topic_change(self) -> None:
         scope_gate_calls: list[str] = []

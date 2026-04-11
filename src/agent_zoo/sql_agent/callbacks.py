@@ -8,6 +8,7 @@ directly.
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any
 
@@ -28,6 +29,16 @@ from .formatting import (
     looks_like_clarification_attempt,
     normalize_clarification_response,
 )
+try:
+    from ..working_memory import (
+        get_agent_working_memory_value,
+        set_agent_working_memory_value,
+    )
+except ImportError:  # Support ADK loading this package as top-level `sql_agent`.
+    from working_memory import (  # type: ignore[no-redef]
+        get_agent_working_memory_value,
+        set_agent_working_memory_value,
+    )
 try:
     from ..scope_guard import (
         DEFAULT_REFUSAL_MESSAGE,
@@ -54,6 +65,11 @@ SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
 SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
 SQL_LAST_QUERY_FRAME_STATE_KEY = "sql_last_query_frame"
+SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_frame"
+SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
+SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
+SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
+SQL_WORKING_MEMORY_RECENT_REFINEMENT_KEY = "recent_refinement"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -62,6 +78,8 @@ SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "max",
     "maximum",
 )
+_GENERIC_ADD_HINT_TOKENS = frozenset({"add", "again", "also", "back", "include", "put", "restore", "too"})
+_GENERIC_REMOVE_HINT_TOKENS = frozenset({"drop", "exclude", "remove", "without"})
 
 
 def _print_clarification_debug(settings: SQLAgentSettings, stage: str, payload: Any) -> None:
@@ -120,13 +138,13 @@ def _clear_private_result_state(state: Any) -> None:
 
 
 def _clear_pending_clarification_state(state: Any) -> None:
-    if hasattr(state, "pop"):
-        state.pop(SQL_PENDING_CLARIFICATION_STATE_KEY, None)
-    elif SQL_PENDING_CLARIFICATION_STATE_KEY in state:
-        state[SQL_PENDING_CLARIFICATION_STATE_KEY] = None
+    _set_pending_clarification_state(state, None)
 
 
 def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
+    pending = _get_sql_working_memory_value(state, SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY)
+    if isinstance(pending, dict):
+        return pending
     if state is None or not hasattr(state, "get"):
         return None
     pending = state.get(SQL_PENDING_CLARIFICATION_STATE_KEY)
@@ -136,12 +154,301 @@ def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
 
 
 def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
+    query_frame = _get_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY)
+    if isinstance(query_frame, dict):
+        return query_frame
     if state is None or not hasattr(state, "get"):
         return None
     query_frame = state.get(SQL_LAST_QUERY_FRAME_STATE_KEY)
     if not isinstance(query_frame, dict):
         return None
     return query_frame
+
+
+def _get_sql_working_memory_value(state: Any, field_name: str) -> Any:
+    return get_agent_working_memory_value(state, SQL_WORKING_MEMORY_NAMESPACE, field_name)
+
+
+def _set_sql_working_memory_value(state: Any, field_name: str, value: Any) -> None:
+    set_agent_working_memory_value(state, SQL_WORKING_MEMORY_NAMESPACE, field_name, value)
+
+
+def _set_pending_clarification_state(
+    state: Any,
+    clarification: dict[str, Any] | None,
+) -> None:
+    _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY, clarification)
+    if state is None:
+        return
+    if clarification is None:
+        if hasattr(state, "pop"):
+            state.pop(SQL_PENDING_CLARIFICATION_STATE_KEY, None)
+        elif SQL_PENDING_CLARIFICATION_STATE_KEY in state:
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY] = None
+        return
+    state[SQL_PENDING_CLARIFICATION_STATE_KEY] = copy.deepcopy(clarification)
+
+
+def _set_last_query_frame_state(
+    state: Any,
+    query_frame: dict[str, Any] | None,
+) -> None:
+    _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY, query_frame)
+    if state is None:
+        return
+    if query_frame is None:
+        if hasattr(state, "pop"):
+            state.pop(SQL_LAST_QUERY_FRAME_STATE_KEY, None)
+        elif SQL_LAST_QUERY_FRAME_STATE_KEY in state:
+            state[SQL_LAST_QUERY_FRAME_STATE_KEY] = None
+        return
+    state[SQL_LAST_QUERY_FRAME_STATE_KEY] = copy.deepcopy(query_frame)
+
+
+def _ordered_unique_values(values: list[str]) -> list[str]:
+    ordered_values: list[str] = []
+    seen_values: set[str] = set()
+    for value in values:
+        normalized_value = str(value or "").strip()
+        if not normalized_value or normalized_value in seen_values:
+            continue
+        seen_values.add(normalized_value)
+        ordered_values.append(normalized_value)
+    return ordered_values
+
+
+def _build_query_frame_topic_context(query_frame: dict[str, Any]) -> str:
+    if not isinstance(query_frame, dict):
+        return ""
+
+    context_sections: list[str] = []
+    question = str(query_frame.get("question") or "").strip()
+    if question:
+        context_sections.append(f"Current committed dataset question/topic: {question}")
+
+    categorical_lines: list[str] = []
+    for entry in query_frame.get("categorical_filters") or []:
+        if not isinstance(entry, dict):
+            continue
+        column_name = str(entry.get("column") or "").strip()
+        selected_values = [
+            value
+            for value in entry.get("selected_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not column_name or not selected_values:
+            continue
+        categorical_lines.append(f"- {column_name} = {', '.join(selected_values)}")
+    if categorical_lines:
+        context_sections.append(
+            "Current committed categorical filters:\n" + "\n".join(categorical_lines)
+        )
+
+    comparison_lines: list[str] = []
+    for entry in query_frame.get("comparison_filters") or []:
+        if not isinstance(entry, dict):
+            continue
+        column_name = str(entry.get("column") or "").strip()
+        operator = str(entry.get("operator") or "").strip()
+        value = str(entry.get("value") or "").strip()
+        if not column_name or not operator or not value:
+            continue
+        comparison_lines.append(f"- {column_name} {operator} {value}")
+    if comparison_lines:
+        context_sections.append(
+            "Current committed comparison filters:\n" + "\n".join(comparison_lines)
+        )
+
+    return "\n\n".join(context_sections).strip()
+
+
+def _select_clarification_query_context(state: Any) -> str | None:
+    query_frame = _get_last_query_frame(state)
+    if not isinstance(query_frame, dict):
+        return None
+    topic_context = str(query_frame.get("topic_context") or "").strip()
+    return topic_context or None
+
+
+def _build_recent_refinement(
+    previous_query_frame: dict[str, Any],
+    current_query_frame: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(previous_query_frame, dict) or not isinstance(current_query_frame, dict):
+        return None
+
+    previous_filters = {
+        str(entry.get("column") or "").strip(): entry
+        for entry in previous_query_frame.get("categorical_filters") or []
+        if isinstance(entry, dict) and str(entry.get("column") or "").strip()
+    }
+    current_filters = {
+        str(entry.get("column") or "").strip(): entry
+        for entry in current_query_frame.get("categorical_filters") or []
+        if isinstance(entry, dict) and str(entry.get("column") or "").strip()
+    }
+    changed_columns = previous_filters.keys() | current_filters.keys()
+
+    changes: list[dict[str, Any]] = []
+    for column_name in sorted(changed_columns):
+        previous_entry = previous_filters.get(column_name) or {}
+        current_entry = current_filters.get(column_name) or {}
+        previous_values = _ordered_unique_values(
+            [
+                value
+                for value in previous_entry.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        current_values = _ordered_unique_values(
+            [
+                value
+                for value in current_entry.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if previous_values == current_values:
+            continue
+
+        available_values = _ordered_unique_values(
+            [
+                value
+                for value in [
+                    *(current_entry.get("available_values") or []),
+                    *(previous_entry.get("available_values") or []),
+                ]
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        added_values = [value for value in current_values if value not in previous_values]
+        removed_values = [value for value in previous_values if value not in current_values]
+        change = {
+            "column": column_name,
+            "previous_values": previous_values,
+            "selected_values": current_values,
+            "available_values": available_values,
+        }
+        if added_values:
+            change["added_values"] = added_values
+        if removed_values:
+            change["removed_values"] = removed_values
+        changes.append(change)
+
+    if not changes:
+        return None
+
+    recent_refinement = {
+        "changes": changes,
+    }
+    previous_topic_context = str(previous_query_frame.get("topic_context") or "").strip()
+    if previous_topic_context:
+        recent_refinement["previous_topic_context"] = previous_topic_context
+    return recent_refinement
+
+
+def _resolve_recent_refinement_followup(
+    last_query_frame: dict[str, Any],
+    user_text: str,
+) -> dict[str, Any] | None:
+    if not isinstance(last_query_frame, dict) or not user_text or not user_text.strip():
+        return None
+
+    recent_refinement = last_query_frame.get("recent_refinement")
+    if not isinstance(recent_refinement, dict):
+        return None
+
+    changes = [
+        entry
+        for entry in recent_refinement.get("changes") or []
+        if isinstance(entry, dict)
+    ]
+    if len(changes) != 1:
+        return None
+
+    change = changes[0]
+    target_column = str(change.get("column") or "").strip()
+    if not target_column:
+        return None
+
+    filter_entry = next(
+        (
+            entry
+            for entry in last_query_frame.get("categorical_filters") or []
+            if isinstance(entry, dict) and str(entry.get("column") or "").strip() == target_column
+        ),
+        None,
+    )
+    if filter_entry is None:
+        return None
+
+    current_selected_values = _ordered_unique_values(
+        [
+            value
+            for value in filter_entry.get("selected_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+    )
+    available_values = _ordered_unique_values(
+        [
+            value
+            for value in filter_entry.get("available_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+    )
+    if not current_selected_values or not available_values:
+        return None
+
+    reply_tokens = set(re.findall(r"[a-z]+", user_text.casefold()))
+    has_add_hint = bool(reply_tokens & _GENERIC_ADD_HINT_TOKENS)
+    has_remove_hint = bool(reply_tokens & _GENERIC_REMOVE_HINT_TOKENS)
+    explicit_values = _extract_matching_clarification_options(user_text, available_values)
+
+    updated_values: list[str] | None = None
+    if explicit_values:
+        if has_add_hint:
+            updated_values = _ordered_unique_values(current_selected_values + explicit_values)
+        elif has_remove_hint:
+            updated_values = [
+                value for value in current_selected_values if value not in explicit_values
+            ]
+    elif has_add_hint:
+        removed_values = _ordered_unique_values(
+            [
+                value
+                for value in change.get("removed_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if removed_values:
+            updated_values = _ordered_unique_values(current_selected_values + removed_values)
+    elif has_remove_hint:
+        added_values = _ordered_unique_values(
+            [
+                value
+                for value in change.get("added_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if added_values:
+            updated_values = [
+                value for value in current_selected_values if value not in added_values
+            ]
+
+    if not updated_values:
+        return None
+
+    normalized_updated_values = [
+        value for value in available_values if value in updated_values
+    ]
+    if not normalized_updated_values or normalized_updated_values == current_selected_values:
+        return None
+
+    return {
+        "resolution_type": "refine_query",
+        "target_column": target_column,
+        "selected_values": normalized_updated_values,
+        "refinement_request": "",
+    }
 
 
 def _mark_public_query_result_rendered(state: Any) -> None:
@@ -727,6 +1034,9 @@ def _build_last_query_frame(
     )
     if comparison_filters:
         query_frame["comparison_filters"] = comparison_filters
+    topic_context = _build_query_frame_topic_context(query_frame)
+    if topic_context:
+        query_frame["topic_context"] = topic_context
     return query_frame
 
 
@@ -1106,7 +1416,7 @@ def _resolve_pending_clarification_reply(
             "custom_rule": "",
         }
 
-    topic_context = clarification.get("topic_context")
+    topic_context = clarification.get("query_context") or clarification.get("topic_context")
     clarification_question = clarification.get("user_message")
     options = clarification.get("options") or []
     return resolver(
@@ -1170,6 +1480,10 @@ def _build_result_refinement_clarification(
     )
     if previous_question:
         clarification["topic_context"] = previous_question
+    query_context = str(last_query_frame.get("topic_context") or "").strip()
+    if query_context:
+        clarification["query_context"] = query_context
+    clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
     return clarification
 
 
@@ -2179,12 +2493,27 @@ def build_remember_query_result_callback(
                 categorical_value_guidance,
             )
             if last_query_frame is not None:
-                tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY] = last_query_frame
+                source_query_frame = tool_context.state.get(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY)
+                recent_refinement = None
+                if isinstance(source_query_frame, dict):
+                    recent_refinement = _build_recent_refinement(source_query_frame, last_query_frame)
+                _set_sql_working_memory_value(
+                    tool_context.state,
+                    SQL_WORKING_MEMORY_RECENT_REFINEMENT_KEY,
+                    recent_refinement,
+                )
+                if recent_refinement is not None:
+                    last_query_frame["recent_refinement"] = recent_refinement
+                _set_last_query_frame_state(tool_context.state, last_query_frame)
                 _print_clarification_debug(
                     active_settings,
                     "after-tool-last-query-frame",
                     last_query_frame,
                 )
+                if hasattr(tool_context.state, "pop"):
+                    tool_context.state.pop(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY, None)
+                elif SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY in tool_context.state:
+                    tool_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = None
 
         public_result = _build_public_query_result(
             tool_response,
@@ -2196,7 +2525,11 @@ def build_remember_query_result_callback(
         if display_sql is not None:
             public_result["display_sql"] = display_sql
         if last_query_frame is not None:
-            public_result["query_summary_context"] = dict(last_query_frame)
+            public_result["query_summary_context"] = {
+                key: value
+                for key, value in last_query_frame.items()
+                if key != "recent_refinement"
+            }
         tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY] = public_result
 
         if active_settings.count_aggregates_only:
@@ -2278,10 +2611,12 @@ def build_normalize_clarification_after_model_callback(
         )
 
         topic_context = None
+        query_context = None
         if callback_context is not None:
             topic_context = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
             if not isinstance(topic_context, str):
                 topic_context = None
+            query_context = _select_clarification_query_context(callback_context.state)
         clarification = _prune_topic_context_option(clarification, topic_context)
         _print_clarification_debug(active_settings, "after-model-normalized", clarification)
 
@@ -2289,7 +2624,9 @@ def build_normalize_clarification_after_model_callback(
             pending_clarification = dict(clarification)
             if isinstance(topic_context, str) and topic_context.strip():
                 pending_clarification["topic_context"] = topic_context.strip()
-            callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = pending_clarification
+            if isinstance(query_context, str) and query_context.strip():
+                pending_clarification["query_context"] = query_context.strip()
+            _set_pending_clarification_state(callback_context.state, pending_clarification)
             _print_clarification_debug(
                 active_settings,
                 "after-model-pending-state",
@@ -2474,6 +2811,11 @@ def build_combined_before_model_callback(
                         pending_clarification,
                     )
                     if clarification_followup:
+                        base_query_frame = pending_clarification.get("base_query_frame")
+                        if isinstance(base_query_frame, dict):
+                            callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                base_query_frame
+                            )
                         topic_context = pending_clarification.get("topic_context")
                         if isinstance(topic_context, str) and topic_context.strip():
                             callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
@@ -2515,6 +2857,11 @@ def build_combined_before_model_callback(
                             custom_rule=clarification_resolution.get("custom_rule"),
                         )
                         if clarification_followup:
+                            base_query_frame = pending_clarification.get("base_query_frame")
+                            if isinstance(base_query_frame, dict):
+                                callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                    base_query_frame
+                                )
                             topic_context = pending_clarification.get("topic_context")
                             if isinstance(topic_context, str) and topic_context.strip():
                                 callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
@@ -2539,7 +2886,9 @@ def build_combined_before_model_callback(
                     "before-model-last-query-frame",
                     last_query_frame,
                 )
-                refinement_resolution = result_refinement_resolver(last_query_frame, user_text)
+                refinement_resolution = _resolve_recent_refinement_followup(last_query_frame, user_text)
+                if refinement_resolution is None:
+                    refinement_resolution = result_refinement_resolver(last_query_frame, user_text)
                 _print_clarification_debug(
                     active_settings,
                     "before-model-result-refinement-resolution",
@@ -2552,7 +2901,7 @@ def build_combined_before_model_callback(
                         str(refinement_resolution.get("target_column") or "").strip(),
                     )
                     if clarification is not None:
-                        callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+                        _set_pending_clarification_state(callback_context.state, clarification)
                         topic_context = clarification.get("topic_context")
                         if isinstance(topic_context, str) and topic_context.strip():
                             callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
@@ -2583,6 +2932,9 @@ def build_combined_before_model_callback(
                         refinement_request=str(refinement_resolution.get("refinement_request") or "").strip(),
                     )
                     if refinement_followup:
+                        callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                            last_query_frame
+                        )
                         previous_question = str(last_query_frame.get("question") or "").strip()
                         if previous_question:
                             callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_question
@@ -2667,7 +3019,7 @@ def build_combined_before_model_callback(
                         grounded_filters=grounded_filters,
                     )
                     if clarification is not None:
-                        callback_context.state[SQL_PENDING_CLARIFICATION_STATE_KEY] = clarification
+                        _set_pending_clarification_state(callback_context.state, clarification)
                         _print_clarification_debug(
                             active_settings,
                             "before-model-schema-grounding-clarification",

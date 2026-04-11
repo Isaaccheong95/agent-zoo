@@ -394,6 +394,7 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
 
         previous_question = str(last_query_frame.get("question") or "").strip() or "[unknown]"
         previous_sql = str(last_query_frame.get("sql") or "").strip() or "[unknown]"
+        topic_context = str(last_query_frame.get("topic_context") or "").strip() or previous_question
         categorical_filters = [
             entry
             for entry in (last_query_frame.get("categorical_filters") or [])
@@ -417,13 +418,35 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
             )
         filter_text = "\n".join(filter_lines) if filter_lines else "[none]"
 
+        refinement_history_lines: list[str] = []
+        recent_refinement = last_query_frame.get("recent_refinement")
+        if isinstance(recent_refinement, dict):
+            for entry in recent_refinement.get("changes") or []:
+                if not isinstance(entry, dict):
+                    continue
+                column_name = str(entry.get("column") or "").strip()
+                if not column_name:
+                    continue
+                previous_values = ", ".join(entry.get("previous_values") or []) or "[none]"
+                current_values = ", ".join(entry.get("selected_values") or []) or "[none]"
+                added_values = ", ".join(entry.get("added_values") or []) or "[none]"
+                removed_values = ", ".join(entry.get("removed_values") or []) or "[none]"
+                refinement_history_lines.append(
+                    f"- {column_name}: previous = {previous_values}; current = {current_values}; added = {added_values}; removed = {removed_values}"
+                )
+        refinement_history_text = "\n".join(refinement_history_lines) if refinement_history_lines else "[none]"
+
         classifier_input = (
-            "Previous dataset question:\n"
+            "Current committed dataset question/topic:\n"
             f"{previous_question}\n\n"
-            "Previous SQL query:\n"
+            "Current committed query context:\n"
+            f"{topic_context}\n\n"
+            "Current committed SQL query:\n"
             f"{previous_sql}\n\n"
-            "Categorical filters from the previous query:\n"
+            "Categorical filters from the current committed query:\n"
             f"{filter_text}\n\n"
+            "Recent categorical refinement history:\n"
+            f"{refinement_history_text}\n\n"
             "Latest user reply:\n"
             f"{user_reply.strip()}"
         )
