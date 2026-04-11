@@ -235,7 +235,7 @@ class SQLPipelineMissingGroupTestCase(unittest.TestCase):
         if self.db_path.exists():
             self.db_path.unlink()
 
-    def test_run_nl_to_sql_pipeline_surfaces_unknown_null_bucket_for_case_groups(self) -> None:
+    def test_run_nl_to_sql_pipeline_surfaces_null_bucket_for_case_groups(self) -> None:
         def generator(_: str, __: dict) -> dict:
             return {
                 "sql": """
@@ -259,14 +259,14 @@ class SQLPipelineMissingGroupTestCase(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "success")
-        self.assertIn("Unknown / Null", result["execution"].get("display_sql", ""))
+        self.assertIn("'Null'", result["execution"].get("display_sql", ""))
         self.assertEqual(
             {row["age_category"]: row["patient_count"] for row in result["execution"]["rows"]},
             {
                 "0-17": 1,
                 "18-39": 1,
                 "40+": 1,
-                "Unknown / Null": 3,
+                "Null": 3,
             },
         )
 

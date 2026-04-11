@@ -32,6 +32,9 @@ _FALLBACK_CLARIFICATION_MESSAGE = (
     "I need clarification before I can run the query. "
     "Please specify the exact category, value, or rule you want me to use."
 )
+_GROUPED_SUPPRESSION_NOTE = (
+    "Note: Some grouped results were omitted due to privacy guardrails."
+)
 _SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -659,8 +662,13 @@ def _build_query_action_summary(tool_result: dict) -> str:
         return "Attempted a read-only query against the current filtered dataset."
 
     public_result_kind = tool_result.get("public_result_kind")
+    grouped_result_suppressed = bool(tool_result.get("grouped_result_suppressed"))
     if public_result_kind == "detail_count_fallback":
         return "Matched rows in the current filtered dataset and returned only the safe count."
+    if grouped_result_suppressed and public_result_kind == "safe_aggregate":
+        return "Computed grouped aggregate values for the privacy-safe matched groups."
+    if grouped_result_suppressed and public_result_kind == "count_aggregate":
+        return "Counted rows for the privacy-safe matched groups in the current filtered dataset."
     if public_result_kind == "safe_aggregate":
         if tool_result.get("row_count", 0) > 1:
             return "Computed grouped aggregate values for the matched cohort."
@@ -764,6 +772,8 @@ def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewMod
             "Note: Individual row-level data cannot be returned due to privacy guardrails. "
             "Only the number of matching records is shown."
         )
+    elif tool_result.get("grouped_result_suppressed"):
+        note = _GROUPED_SUPPRESSION_NOTE
 
     return SQLResultViewModel(
         status=str(tool_result.get("status") or "error"),
