@@ -437,6 +437,8 @@ It uses ADK's `InMemoryRunner`.
 
 `run_interactive_loop(...)` creates one shared runner and one shared session, then reuses them across multiple user turns. That means session state can survive between turns during the same interactive run.
 
+The SQL agent now layers a small per-agent working-memory snapshot on top of that session state. In practice, that means the callback flow can keep the current committed query frame, pending clarification state, and the most recent categorical refinement diff together under one SQL-agent namespace instead of treating every follow-up as only "last user text + last SQL". When a refinement deterministically swaps one stored categorical value for another, the committed query frame also rewrites its question/topic text to stay aligned with the current filter state.
+
 ### 7. `callbacks.py` captures the tool result and finalizes the answer
 
 This file is one of the most important implementation details.
@@ -466,7 +468,7 @@ When that tool runs, the callback builds a public result and stores it into ADK 
 temp:sql_public_result
 ```
 
-If a final query frame exists, it also stores deterministic summary context such as matched categorical filters and comparison filters. The callback is not formatting the visible answer yet. It is preparing the structured public contract that later rendering uses.
+If a final query frame exists, it also stores deterministic summary context such as matched categorical filters and comparison filters. The callback now also updates the SQL agent's shared working-memory snapshot with the current committed query frame and, when the current turn was a refinement, a one-step categorical diff describing which values were added or removed. Model-born clarifications also inherit the current committed query frame so later clarification replies can continue from the committed state instead of a transient short phrase. The callback is not formatting the visible answer yet. It is preparing the structured public contract that later rendering uses.
 
 #### `build_normalize_clarification_after_model_callback(...)`
 
