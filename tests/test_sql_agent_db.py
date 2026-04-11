@@ -1319,6 +1319,14 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY],
         )
         self.assertEqual(
+            tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]["question"],
+            "how many females work",
+        )
+        self.assertIn(
+            "Current committed dataset question/topic: how many females work",
+            tool_context.state[SQL_LAST_QUERY_FRAME_STATE_KEY]["topic_context"],
+        )
+        self.assertEqual(
             working_memory["recent_refinement"]["changes"],
             [
                 {
@@ -2326,6 +2334,61 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             "generic",
         )
 
+    def test_after_model_callback_attaches_base_query_frame_context_when_available(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        base_query_frame = {
+            "question": "how many females work",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+            "categorical_filters": [
+                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                {
+                    "column": "sococc",
+                    "selected_values": ["Employed"],
+                    "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                },
+            ],
+            "topic_context": (
+                "Current committed dataset question/topic: how many females work\n\n"
+                "Current committed categorical filters:\n- gender = Female\n- sococc = Employed"
+            ),
+        }
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "number of working adults",
+            SQL_LAST_QUERY_FRAME_STATE_KEY: base_query_frame,
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"Which occupation status should I count as working?",'
+                                '"options":["Employed","Retired","Student"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["topic_context"],
+            "number of working adults",
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["query_context"],
+            base_query_frame["topic_context"],
+        )
+        self.assertEqual(
+            state[SQL_PENDING_CLARIFICATION_STATE_KEY]["base_query_frame"],
+            base_query_frame,
+        )
+
     def test_after_model_callback_preserves_interpretation_clarification_options(self) -> None:
         with patch(
             "agent_zoo.sql_agent.callbacks.get_schema_summary",
@@ -3104,6 +3167,153 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIn("The user is replying to the previous clarification", rewritten_text)
         self.assertIn("Matched options from the reply: Occasionally, Regularly", rewritten_text)
         self.assertNotIn(SQL_PENDING_CLARIFICATION_STATE_KEY, persisted_state)
+
+    def test_combined_before_model_callback_prefers_query_context_for_pending_clarification_resolution(self) -> None:
+        scope_gate_calls: list[str] = []
+        resolver_calls: list[tuple[str, str, list[str], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
+            resolver_calls.append((topic_context, clarification_question, options, user_reply))
+            return {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": user_reply}
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=fake_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state = {
+            SQL_PENDING_CLARIFICATION_STATE_KEY: {
+                "topic_context": "add it back",
+                "query_context": (
+                    "Current committed dataset question/topic: how many females work\n\n"
+                    "Current committed categorical filters:\n- gender = Female\n- sococc = Employed"
+                ),
+                "user_message": "Which occupation status should I count as working?",
+                "options": ["Employed", "Retired", "Student"],
+            }
+        }
+        expected_query_context = state[SQL_PENDING_CLARIFICATION_STATE_KEY]["query_context"]
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="count only people who are currently working")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(
+            resolver_calls,
+            [
+                (
+                    expected_query_context,
+                    "Which occupation status should I count as working?",
+                    ["Employed", "Retired", "Student"],
+                    "count only people who are currently working",
+                )
+            ],
+        )
+
+    def test_combined_before_model_callback_uses_rewritten_current_state_for_broader_followup(self) -> None:
+        scope_gate_calls: list[str] = []
+        refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            refinement_resolver_calls.append((frame, user_text))
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Male", "Female"]},
+                    {
+                        "column": "sococc",
+                        "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    },
+                ],
+            },
+        ):
+            remember_callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ):
+            before_callback = build_combined_before_model_callback(self._settings())
+
+        previous_query_frame = {
+            "question": "how many males work",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+            "categorical_filters": [
+                {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                {
+                    "column": "sococc",
+                    "selected_values": ["Employed"],
+                    "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                },
+            ],
+        }
+        state = {
+            SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "females?",
+            SQL_LAST_QUERY_FRAME_STATE_KEY: previous_query_frame,
+            SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY: previous_query_frame,
+        }
+        remember_callback(
+            SimpleNamespace(name="execute_sqlite_read_only"),
+            {
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+                "is_final": True,
+            },
+            SimpleNamespace(state=state),
+            make_query_result(
+                [{"matching_count": 12}],
+                columns=["matching_count"],
+                sql="SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc = 'Employed'",
+            ),
+        )
+
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="number of working adults")])]
+        )
+
+        result = before_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.content.parts[0].text, "blocked")
+        self.assertEqual(scope_gate_calls, ["number of working adults"])
+        self.assertEqual(len(refinement_resolver_calls), 1)
+        captured_frame, captured_reply = refinement_resolver_calls[0]
+        self.assertEqual(captured_reply, "number of working adults")
+        self.assertEqual(captured_frame["question"], "how many females work")
+        self.assertIn("recent_refinement", captured_frame)
+        self.assertIn(
+            "Current committed dataset question/topic: how many females work",
+            captured_frame["topic_context"],
+        )
 
     def test_combined_before_model_callback_keeps_custom_rule_followup_in_clarification_flow(self) -> None:
         scope_gate_calls: list[str] = []

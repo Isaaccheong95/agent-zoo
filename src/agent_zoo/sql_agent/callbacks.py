@@ -217,6 +217,116 @@ def _ordered_unique_values(values: list[str]) -> list[str]:
     return ordered_values
 
 
+def _get_query_frame_question_text(query_frame: dict[str, Any]) -> str:
+    if not isinstance(query_frame, dict):
+        return ""
+
+    question = str(query_frame.get("question") or "").strip()
+    if question:
+        return question
+
+    topic_context = str(query_frame.get("topic_context") or "").strip()
+    if not topic_context:
+        return ""
+
+    first_line = topic_context.splitlines()[0].strip()
+    prefix = "Current committed dataset question/topic:"
+    if first_line.startswith(prefix):
+        return first_line[len(prefix) :].strip()
+    return first_line
+
+
+def _replace_phrase_case_insensitive(text: str, source_phrase: str, target_phrase: str) -> tuple[str, bool]:
+    if not text or not source_phrase or not target_phrase:
+        return text, False
+
+    pattern = rf"(?<!\w){re.escape(source_phrase)}(?!\w)"
+    if re.search(pattern, text, flags=re.IGNORECASE) is None:
+        return text, False
+
+    def _replacement(match: re.Match[str]) -> str:
+        matched_text = match.group(0)
+        if matched_text.islower():
+            return target_phrase.lower()
+        if matched_text.isupper():
+            return target_phrase.upper()
+        if matched_text[:1].isupper() and matched_text[1:].islower():
+            return target_phrase.capitalize()
+        return target_phrase
+
+    return re.sub(pattern, _replacement, text, flags=re.IGNORECASE), True
+
+
+def _pluralize_phrase(value: str) -> str:
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return ""
+
+    tokens = normalized_value.split()
+    last_token = tokens[-1]
+    if len(last_token) <= 1:
+        return normalized_value
+    if re.search(r"(?:s|x|z|ch|sh)$", last_token, flags=re.IGNORECASE):
+        plural_token = last_token + "es"
+    elif last_token.endswith(("y", "Y")) and len(last_token) > 1 and last_token[-2].lower() not in {"a", "e", "i", "o", "u"}:
+        plural_token = last_token[:-1] + ("IES" if last_token[-1].isupper() else "ies")
+    else:
+        plural_token = last_token + "s"
+
+    tokens[-1] = plural_token
+    return " ".join(tokens)
+
+
+def _rewrite_question_from_recent_refinement(
+    source_query_frame: dict[str, Any],
+    recent_refinement: dict[str, Any] | None,
+) -> str:
+    source_question = _get_query_frame_question_text(source_query_frame)
+    if not source_question or not isinstance(recent_refinement, dict):
+        return source_question
+
+    rewritten_question = source_question
+    replaced_any_value = False
+    for change in recent_refinement.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+
+        previous_values = _ordered_unique_values(
+            [
+                value
+                for value in change.get("previous_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        current_values = _ordered_unique_values(
+            [
+                value
+                for value in change.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if len(previous_values) != 1 or len(current_values) != 1:
+            continue
+
+        candidate_pairs = [
+            (previous_values[0], current_values[0]),
+            (_pluralize_phrase(previous_values[0]), _pluralize_phrase(current_values[0])),
+        ]
+        for source_phrase, target_phrase in candidate_pairs:
+            rewritten_question, replaced_value = _replace_phrase_case_insensitive(
+                rewritten_question,
+                source_phrase,
+                target_phrase,
+            )
+            replaced_any_value = replaced_any_value or replaced_value
+            if replaced_value:
+                break
+
+    if replaced_any_value:
+        return rewritten_question
+    return source_question
+
+
 def _build_query_frame_topic_context(query_frame: dict[str, Any]) -> str:
     if not isinstance(query_frame, dict):
         return ""
@@ -268,6 +378,22 @@ def _select_clarification_query_context(state: Any) -> str | None:
         return None
     topic_context = str(query_frame.get("topic_context") or "").strip()
     return topic_context or None
+
+
+def _select_pending_clarification_topic_text(clarification: dict[str, Any]) -> str | None:
+    if not isinstance(clarification, dict):
+        return None
+
+    base_query_frame = clarification.get("base_query_frame")
+    if isinstance(base_query_frame, dict):
+        base_question = _get_query_frame_question_text(base_query_frame)
+        if base_question:
+            return base_question
+
+    topic_context = clarification.get("topic_context")
+    if isinstance(topic_context, str) and topic_context.strip():
+        return topic_context.strip()
+    return None
 
 
 def _build_recent_refinement(
@@ -1462,7 +1588,7 @@ def _build_result_refinement_clarification(
         for value in filter_entry.get("selected_values") or []
         if isinstance(value, str) and value.strip()
     ]
-    previous_question = str(last_query_frame.get("question") or "").strip()
+    previous_question = _get_query_frame_question_text(last_query_frame)
 
     message_parts = []
     if previous_question:
@@ -2503,7 +2629,16 @@ def build_remember_query_result_callback(
                     recent_refinement,
                 )
                 if recent_refinement is not None:
+                    rewritten_question = _rewrite_question_from_recent_refinement(
+                        source_query_frame,
+                        recent_refinement,
+                    )
+                    if rewritten_question:
+                        last_query_frame["question"] = rewritten_question
                     last_query_frame["recent_refinement"] = recent_refinement
+                    refreshed_topic_context = _build_query_frame_topic_context(last_query_frame)
+                    if refreshed_topic_context:
+                        last_query_frame["topic_context"] = refreshed_topic_context
                 _set_last_query_frame_state(tool_context.state, last_query_frame)
                 _print_clarification_debug(
                     active_settings,
@@ -2626,6 +2761,9 @@ def build_normalize_clarification_after_model_callback(
                 pending_clarification["topic_context"] = topic_context.strip()
             if isinstance(query_context, str) and query_context.strip():
                 pending_clarification["query_context"] = query_context.strip()
+            base_query_frame = _get_last_query_frame(callback_context.state)
+            if isinstance(base_query_frame, dict):
+                pending_clarification["base_query_frame"] = copy.deepcopy(base_query_frame)
             _set_pending_clarification_state(callback_context.state, pending_clarification)
             _print_clarification_debug(
                 active_settings,
@@ -2816,7 +2954,7 @@ def build_combined_before_model_callback(
                             callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
                                 base_query_frame
                             )
-                        topic_context = pending_clarification.get("topic_context")
+                        topic_context = _select_pending_clarification_topic_text(pending_clarification)
                         if isinstance(topic_context, str) and topic_context.strip():
                             callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
                         _print_clarification_debug(
@@ -2862,7 +3000,7 @@ def build_combined_before_model_callback(
                                 callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
                                     base_query_frame
                                 )
-                            topic_context = pending_clarification.get("topic_context")
+                            topic_context = _select_pending_clarification_topic_text(pending_clarification)
                             if isinstance(topic_context, str) and topic_context.strip():
                                 callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
                             _print_clarification_debug(
@@ -2935,7 +3073,7 @@ def build_combined_before_model_callback(
                         callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
                             last_query_frame
                         )
-                        previous_question = str(last_query_frame.get("question") or "").strip()
+                        previous_question = _get_query_frame_question_text(last_query_frame)
                         if previous_question:
                             callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_question
                         _print_clarification_debug(
