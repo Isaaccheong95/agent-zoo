@@ -61,10 +61,8 @@ SQL_PUBLIC_RESULT_STATE_KEY = "temp:sql_public_result"
 SQL_PUBLIC_RESULT_RENDERED_STATE_KEY = "temp:sql_public_result_rendered"
 SQL_INTERNAL_RESULT_REF_STATE_KEY = "temp:sql_internal_result_ref"
 SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
-SQL_PENDING_CLARIFICATION_STATE_KEY = "sql_pending_clarification"
 SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
-SQL_LAST_QUERY_FRAME_STATE_KEY = "sql_last_query_frame"
 SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_frame"
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
@@ -143,26 +141,12 @@ def _clear_pending_clarification_state(state: Any) -> None:
 
 def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
     pending = _get_sql_working_memory_value(state, SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY)
-    if isinstance(pending, dict):
-        return pending
-    if state is None or not hasattr(state, "get"):
-        return None
-    pending = state.get(SQL_PENDING_CLARIFICATION_STATE_KEY)
-    if not isinstance(pending, dict):
-        return None
-    return pending
+    return pending if isinstance(pending, dict) else None
 
 
 def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
     query_frame = _get_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY)
-    if isinstance(query_frame, dict):
-        return query_frame
-    if state is None or not hasattr(state, "get"):
-        return None
-    query_frame = state.get(SQL_LAST_QUERY_FRAME_STATE_KEY)
-    if not isinstance(query_frame, dict):
-        return None
-    return query_frame
+    return query_frame if isinstance(query_frame, dict) else None
 
 
 def _get_sql_working_memory_value(state: Any, field_name: str) -> Any:
@@ -178,15 +162,6 @@ def _set_pending_clarification_state(
     clarification: dict[str, Any] | None,
 ) -> None:
     _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY, clarification)
-    if state is None:
-        return
-    if clarification is None:
-        if hasattr(state, "pop"):
-            state.pop(SQL_PENDING_CLARIFICATION_STATE_KEY, None)
-        elif SQL_PENDING_CLARIFICATION_STATE_KEY in state:
-            state[SQL_PENDING_CLARIFICATION_STATE_KEY] = None
-        return
-    state[SQL_PENDING_CLARIFICATION_STATE_KEY] = copy.deepcopy(clarification)
 
 
 def _set_last_query_frame_state(
@@ -194,15 +169,6 @@ def _set_last_query_frame_state(
     query_frame: dict[str, Any] | None,
 ) -> None:
     _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY, query_frame)
-    if state is None:
-        return
-    if query_frame is None:
-        if hasattr(state, "pop"):
-            state.pop(SQL_LAST_QUERY_FRAME_STATE_KEY, None)
-        elif SQL_LAST_QUERY_FRAME_STATE_KEY in state:
-            state[SQL_LAST_QUERY_FRAME_STATE_KEY] = None
-        return
-    state[SQL_LAST_QUERY_FRAME_STATE_KEY] = copy.deepcopy(query_frame)
 
 
 def _ordered_unique_values(values: list[str]) -> list[str]:
