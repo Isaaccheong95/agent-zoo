@@ -22,6 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent_zoo.sql_agent.callbacks import (
     SQL_ACTIVE_QUERY_TOPIC_STATE_KEY,
+    SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY,
     SQL_INTERNAL_QUERY_RESULT_STATE_KEY,
     SQL_INTERNAL_RESULT_REF_STATE_KEY,
     SQL_LAST_USER_TEXT_STATE_KEY,
@@ -2425,6 +2426,60 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             base_query_frame,
         )
 
+    def test_after_model_callback_skips_base_query_frame_context_for_fresh_topic(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        base_query_frame = {
+            "question": "number of lades who smoke and drink",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE socsmk = 'Yes' AND socalc = 'Occasionally' AND gender = 'Female'",
+            "categorical_filters": [
+                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                {"column": "socsmk", "selected_values": ["Yes"], "available_values": ["No", "Unknown", "Yes"]},
+                {
+                    "column": "socalc",
+                    "selected_values": ["Occasionally"],
+                    "available_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                },
+            ],
+            "topic_context": (
+                "Current committed dataset question/topic: number of lades who smoke and drink\n\n"
+                "Current committed categorical filters:\n- gender = Female\n- socsmk = Yes\n- socalc = Occasionally"
+            ),
+        }
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "how many men are working",
+            SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY: True,
+        }
+        set_sql_current_query_frame(state, base_query_frame)
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"I will use the following filters as a starting point: - gender = Male - sococc = Employed",'
+                                '"options":["gender = Male","sococc = Employed"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(
+            pending_clarification["topic_context"],
+            "how many men are working",
+        )
+        self.assertNotIn("query_context", pending_clarification)
+        self.assertNotIn("base_query_frame", pending_clarification)
+        self.assertNotIn(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY, state)
+
     def test_after_model_callback_preserves_interpretation_clarification_options(self) -> None:
         with patch(
             "agent_zoo.sql_agent.callbacks.get_schema_summary",
@@ -4152,6 +4207,190 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(
             pending_clarification["grounded_filters"],
             {"gender": ["Male"]},
+        )
+
+    def test_schema_grounded_clarification_followup_commits_new_topic_instead_of_old_query(self) -> None:
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            return True, None
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {
+                    "gender": ["Male"],
+                    "sococc": ["Employed"],
+                },
+                "candidate_columns": [],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, sococc TEXT, socsmk TEXT, socalc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Gender",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "sococc",
+                                "type": "TEXT",
+                                "source_header": "Occupation status",
+                                "categorical_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "sococc", "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            before_callback = build_combined_before_model_callback(self._settings())
+            after_callback = build_normalize_clarification_after_model_callback(self._settings())
+            remember_callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        previous_query_frame = {
+            "question": "number of lades who smoke and drink",
+            "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE socsmk = 'Yes' AND socalc = 'Occasionally' AND gender = 'Female'",
+            "categorical_filters": [
+                {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                {"column": "socsmk", "selected_values": ["Yes"], "available_values": ["No", "Unknown", "Yes"]},
+                {
+                    "column": "socalc",
+                    "selected_values": ["Occasionally"],
+                    "available_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                },
+            ],
+            "topic_context": (
+                "Current committed dataset question/topic: number of lades who smoke and drink\n\n"
+                "Current committed categorical filters:\n- gender = Female\n- socsmk = Yes\n- socalc = Occasionally"
+            ),
+        }
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(state, previous_query_frame)
+
+        first_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="how many men are working")])]
+        )
+        first_result = before_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=first_request,
+        )
+
+        self.assertIsNone(first_result)
+        self.assertIn(
+            "Original dataset request: how many men are working",
+            first_request.contents[-1].parts[0].text,
+        )
+
+        clarification_result = after_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                '{"response_type":"clarification","user_message":'
+                                '"I will use the following filters as a starting point: - gender = Male - sococc = Employed",'
+                                '"options":["gender = Male","sococc = Employed"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(clarification_result)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(pending_clarification["topic_context"], "how many men are working")
+        self.assertNotIn("base_query_frame", pending_clarification)
+
+        followup_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="1 2")])]
+        )
+        followup_result = before_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=followup_request,
+        )
+
+        self.assertIsNone(followup_result)
+        self.assertNotIn(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY, state)
+        self.assertEqual(
+            state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY],
+            "how many men are working",
+        )
+
+        remember_callback(
+            SimpleNamespace(name="execute_sqlite_read_only"),
+            {
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+                "is_final": True,
+            },
+            SimpleNamespace(state=state),
+            make_query_result(
+                [{"matching_count": 116}],
+                columns=["matching_count"],
+                sql="SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+            ),
+        )
+
+        self.assertEqual(
+            get_sql_current_query_frame(state)["question"],
+            "how many men are working",
+        )
+        self.assertIn(
+            "Current committed dataset question/topic: how many men are working",
+            get_sql_current_query_frame(state)["topic_context"],
         )
 
     def test_combined_before_model_callback_still_uses_scope_gate_when_schema_grounding_has_no_action(self) -> None:

@@ -64,6 +64,7 @@ SQL_INTERNAL_QUERY_RESULT_STATE_KEY = "temp:sql_internal_query_result"
 SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
 SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_frame"
+SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY = "temp:sql_fresh_topic_clarification"
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
 SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
@@ -136,6 +137,29 @@ def _clear_private_result_state(state: Any) -> None:
 
 def _clear_pending_clarification_state(state: Any) -> None:
     _set_pending_clarification_state(state, None)
+
+
+def _clear_fresh_topic_clarification_state(state: Any) -> None:
+    if state is None:
+        return
+    if hasattr(state, "pop"):
+        state.pop(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY, None)
+    elif SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY in state:
+        state[SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY] = None
+
+
+def _mark_fresh_topic_clarification_state(state: Any) -> None:
+    if state is None:
+        return
+    state[SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY] = True
+
+
+def _consume_fresh_topic_clarification_state(state: Any) -> bool:
+    if state is None or not hasattr(state, "get"):
+        return False
+    is_fresh_topic = bool(state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY))
+    _clear_fresh_topic_clarification_state(state)
+    return is_fresh_topic
 
 
 def _get_pending_clarification(state: Any) -> dict[str, Any] | None:
@@ -2673,6 +2697,12 @@ def build_normalize_clarification_after_model_callback(
         llm_response: LlmResponse | None = None,
         **kwargs,
     ) -> LlmResponse | None:
+        is_fresh_topic_clarification = False
+        if callback_context is not None:
+            is_fresh_topic_clarification = _consume_fresh_topic_clarification_state(
+                callback_context.state
+            )
+
         if llm_response is None or _llm_response_has_function_call(llm_response):
             return None
 
@@ -2711,7 +2741,8 @@ def build_normalize_clarification_after_model_callback(
             topic_context = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
             if not isinstance(topic_context, str):
                 topic_context = None
-            query_context = _select_clarification_query_context(callback_context.state)
+            if not is_fresh_topic_clarification:
+                query_context = _select_clarification_query_context(callback_context.state)
         clarification = _prune_topic_context_option(clarification, topic_context)
         _print_clarification_debug(active_settings, "after-model-normalized", clarification)
 
@@ -2721,7 +2752,9 @@ def build_normalize_clarification_after_model_callback(
                 pending_clarification["topic_context"] = topic_context.strip()
             if isinstance(query_context, str) and query_context.strip():
                 pending_clarification["query_context"] = query_context.strip()
-            base_query_frame = _get_last_query_frame(callback_context.state)
+            base_query_frame = None
+            if not is_fresh_topic_clarification:
+                base_query_frame = _get_last_query_frame(callback_context.state)
             if isinstance(base_query_frame, dict):
                 pending_clarification["base_query_frame"] = copy.deepcopy(base_query_frame)
             _set_pending_clarification_state(callback_context.state, pending_clarification)
@@ -2875,6 +2908,7 @@ def build_combined_before_model_callback(
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
+            _clear_fresh_topic_clarification_state(callback_context.state)
             raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             topic_text = ""
             if user_text:
@@ -2940,6 +2974,7 @@ def build_combined_before_model_callback(
                             "before-model-topic-router-decision",
                             "TOPIC_CHANGE",
                         )
+                        _mark_fresh_topic_clarification_state(callback_context.state)
                         _clear_pending_clarification_state(callback_context.state)
                     else:
                         _print_clarification_debug(
@@ -2993,6 +3028,8 @@ def build_combined_before_model_callback(
                     refinement_resolution,
                 )
                 refinement_type = refinement_resolution.get("resolution_type")
+                if refinement_type == "topic_change":
+                    _mark_fresh_topic_clarification_state(callback_context.state)
                 if refinement_type == "needs_clarification":
                     clarification = _build_result_refinement_clarification(
                         last_query_frame,
