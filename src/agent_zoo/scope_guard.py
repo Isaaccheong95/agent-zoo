@@ -588,6 +588,8 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
         "- candidate_columns must represent only unresolved field interpretations after applying any grounded_filters. Do not include fields already grounded to a specific value or filter.\n"
         "- Use resolution_type='needs_clarification' only when two or more provided schema columns remain plausible interpretations of the user's wording and the request does not clearly choose one.\n"
         "- Use resolution_type='proceed' when the request is already specific enough, when no nearby competing schema interpretation exists, or when any ambiguity is only about values within a single chosen column.\n"
+        "- Do not return proceed merely because one part of the request was grounded if another substantive part of the request still appears unresolved.\n"
+        "- If one concept in the request grounds cleanly but another concept could still refer to two or more remaining schema columns, use needs_clarification for those remaining columns.\n"
         "- candidate_columns must contain only exact identifiers from the provided schema column list and must be ordered best-first.\n"
         "- When resolution_type='needs_clarification', include 2 to 4 candidate_columns.\n"
         "- When resolution_type='proceed', candidate_columns must be empty.\n"
@@ -595,6 +597,239 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
         "- This resolver is only for schema interpretation ambiguity, not for value-level ambiguity inside one chosen column.\n"
         "- Output JSON only. No markdown fences or extra text."
     )
+
+    review_system_prompt = (
+        "You are a strict unresolved-request reviewer for a dataset SQL agent.\n"
+        "A first schema-grounding pass may already have grounded part of the user's request.\n"
+        "Your job is to decide whether another substantive part of the same request still needs a field-level clarification before SQL is generated.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"proceed|needs_clarification","candidate_columns":["..."]}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='needs_clarification' when, after applying the already grounded filters, another substantive part of the user request could still refer to two or more remaining schema columns.\n"
+        "- Use resolution_type='proceed' only when the already grounded filters fully cover the user's request or when only one remaining schema column is plausibly implied.\n"
+        "- Do not treat grounded filters as covering the whole request if another noun, verb, behavior, condition, or outcome in the request is still unresolved.\n"
+        "- Return the smallest sufficient clarification set, not every loosely related remaining column.\n"
+        "- Exclude columns that are only tangentially related or that introduce a different concept from the unresolved part of the request.\n"
+        "- candidate_columns must contain only exact identifiers from the provided remaining schema columns and must be ordered best-first.\n"
+        "- When resolution_type='needs_clarification', include 2 to 4 candidate_columns.\n"
+        "- When resolution_type='proceed', candidate_columns must be empty.\n"
+        "- Prefer clarification over silently dropping an unresolved concept from the request.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    reduction_system_prompt = (
+        "You are a strict clarification-set reducer for a dataset SQL agent.\n"
+        "A previous review step produced a candidate set of schema columns for one unresolved part of the user's request.\n"
+        "Your job is to keep only the smallest sufficient subset of those columns for a useful clarification.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"candidate_columns":["..."]}\n\n'
+        "Rules:\n"
+        "- Return only columns from the provided candidate set.\n"
+        "- Keep only columns that directly compete as interpretations of the same unresolved concept in the user's request.\n"
+        "- Exclude columns that are tangential, generic, or that introduce a different concept than the unresolved part of the request.\n"
+        "- Return the smallest sufficient subset. Prefer 2 columns when that is enough for a useful clarification.\n"
+        "- Return candidate_columns ordered best-first.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    selection_system_prompt = (
+        "You are a strict final field-resolution judge for a dataset SQL agent.\n"
+        "A previous review step has already narrowed one unresolved part of the user's request to a small candidate set of schema columns.\n"
+        "Your job is to decide whether the user's wording already makes one candidate clearly best, or whether user clarification is still required.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"resolution_type":"proceed|needs_clarification","selected_column":"..."}\n\n'
+        "Rules:\n"
+        "- Use resolution_type='proceed' only when exactly one candidate column is clearly the intended interpretation of the unresolved concept.\n"
+        "- Use resolution_type='needs_clarification' when two or more candidate columns remain genuinely plausible.\n"
+        "- selected_column must be one exact identifier from the provided candidate set when resolution_type='proceed'.\n"
+        "- When resolution_type='needs_clarification', selected_column must be empty.\n"
+        "- Prefer proceed when one candidate is materially more natural and the others are only loosely related to the user's wording.\n"
+        "- Prefer needs_clarification when the request is underspecified or could reasonably refer to multiple candidate columns.\n"
+        "- Use the already grounded filters, field labels, and value previews as context, but only choose from the provided candidate columns.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def _review_unresolved_request(
+        user_text: str,
+        schema_context: str,
+        grounded_filters: dict[str, list[str]],
+        remaining_candidate_columns: list[str],
+    ) -> list[str]:
+        if not user_text or not user_text.strip() or len(remaining_candidate_columns) < 2:
+            return []
+
+        grounded_lines: list[str] = []
+        for column_name, selected_values in grounded_filters.items():
+            normalized_values = [
+                value
+                for value in selected_values or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if not column_name or not normalized_values:
+                continue
+            grounded_lines.append(f"- {column_name} = {', '.join(normalized_values)}")
+
+        classifier_input = (
+            "Latest user request:\n"
+            + user_text.strip()
+            + "\n\nAlready grounded filters:\n"
+            + ("\n".join(grounded_lines) or "[none]")
+            + "\n\nRemaining schema column identifiers you may return:\n"
+            + "\n".join(f"- {identifier}" for identifier in remaining_candidate_columns)
+            + "\n\nSchema columns and previews:\n"
+            + schema_context.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            review_system_prompt,
+            classifier_input,
+            max_tokens=400,
+            debug_label="schema-grounding-review" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return []
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-review",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return []
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        normalized_candidate_columns = _normalize_selected_identifiers(
+            parsed_response.get("candidate_columns"),
+            remaining_candidate_columns,
+        )
+        if resolution_type == "needs_clarification" and len(normalized_candidate_columns) >= 2:
+            return normalized_candidate_columns[:4]
+        return []
+
+    def _reduce_review_candidate_columns(
+        user_text: str,
+        schema_context: str,
+        grounded_filters: dict[str, list[str]],
+        candidate_columns_to_reduce: list[str],
+    ) -> list[str]:
+        if not user_text or not user_text.strip() or len(candidate_columns_to_reduce) < 3:
+            return candidate_columns_to_reduce
+
+        grounded_lines: list[str] = []
+        for column_name, selected_values in grounded_filters.items():
+            normalized_values = [
+                value
+                for value in selected_values or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if not column_name or not normalized_values:
+                continue
+            grounded_lines.append(f"- {column_name} = {', '.join(normalized_values)}")
+
+        classifier_input = (
+            "Latest user request:\n"
+            + user_text.strip()
+            + "\n\nAlready grounded filters:\n"
+            + ("\n".join(grounded_lines) or "[none]")
+            + "\n\nCandidate columns to reduce:\n"
+            + "\n".join(f"- {identifier}" for identifier in candidate_columns_to_reduce)
+            + "\n\nSchema columns and previews:\n"
+            + schema_context.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            reduction_system_prompt,
+            classifier_input,
+            max_tokens=300,
+            debug_label="schema-grounding-reduction" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return candidate_columns_to_reduce
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-reduction",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return candidate_columns_to_reduce
+
+        normalized_candidate_columns = _normalize_selected_identifiers(
+            parsed_response.get("candidate_columns"),
+            candidate_columns_to_reduce,
+        )
+        if len(normalized_candidate_columns) >= 2:
+            return normalized_candidate_columns[:4]
+        return candidate_columns_to_reduce
+
+    def _select_best_review_candidate(
+        user_text: str,
+        schema_context: str,
+        grounded_filters: dict[str, list[str]],
+        candidate_columns_to_judge: list[str],
+    ) -> str:
+        if not user_text or not user_text.strip() or len(candidate_columns_to_judge) < 2:
+            return ""
+
+        grounded_lines: list[str] = []
+        for column_name, selected_values in grounded_filters.items():
+            normalized_values = [
+                value
+                for value in selected_values or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if not column_name or not normalized_values:
+                continue
+            grounded_lines.append(f"- {column_name} = {', '.join(normalized_values)}")
+
+        classifier_input = (
+            "Latest user request:\n"
+            + user_text.strip()
+            + "\n\nAlready grounded filters:\n"
+            + ("\n".join(grounded_lines) or "[none]")
+            + "\n\nCandidate columns to judge:\n"
+            + "\n".join(f"- {identifier}" for identifier in candidate_columns_to_judge)
+            + "\n\nSchema columns and previews:\n"
+            + schema_context.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            selection_system_prompt,
+            classifier_input,
+            max_tokens=250,
+            debug_label="schema-grounding-selection" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return ""
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-selection",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return ""
+
+        resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
+        selected_column = _normalize_selected_identifier(
+            parsed_response.get("selected_column"),
+            candidate_columns_to_judge,
+        )
+        if resolution_type == "proceed" and selected_column:
+            return selected_column
+        return ""
 
     def resolve(
         user_text: str,
@@ -674,8 +909,8 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             parsed_response.get("candidate_columns"),
             candidate_columns,
         )
+        grounded_columns = set(normalized_grounded_filters)
         if normalized_grounded_filters:
-            grounded_columns = set(normalized_grounded_filters)
             normalized_candidate_columns = [
                 identifier
                 for identifier in normalized_candidate_columns
@@ -688,6 +923,45 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 "grounded_filters": normalized_grounded_filters,
                 "candidate_columns": normalized_candidate_columns[:4],
             }
+
+        if normalized_grounded_filters and not normalized_candidate_columns:
+            remaining_candidate_columns = [
+                identifier
+                for identifier in candidate_columns
+                if identifier not in grounded_columns
+            ]
+            review_candidate_columns = _review_unresolved_request(
+                user_text,
+                schema_context,
+                normalized_grounded_filters,
+                remaining_candidate_columns,
+            )
+            if len(review_candidate_columns) >= 3:
+                review_candidate_columns = _reduce_review_candidate_columns(
+                    user_text,
+                    schema_context,
+                    normalized_grounded_filters,
+                    review_candidate_columns,
+                )
+            if len(review_candidate_columns) >= 2:
+                selected_review_column = _select_best_review_candidate(
+                    user_text,
+                    schema_context,
+                    normalized_grounded_filters,
+                    review_candidate_columns,
+                )
+                if selected_review_column:
+                    return {
+                        "resolution_type": "proceed",
+                        "grounded_filters": normalized_grounded_filters,
+                        "candidate_columns": [],
+                        "resolved_columns": [selected_review_column],
+                    }
+                return {
+                    "resolution_type": "needs_clarification",
+                    "grounded_filters": normalized_grounded_filters,
+                    "candidate_columns": review_candidate_columns,
+                }
 
         return {
             "resolution_type": "proceed",

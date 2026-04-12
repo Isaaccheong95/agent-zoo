@@ -1851,6 +1851,9 @@ def _apply_grounded_filter_followup(
     llm_request,
     user_text: str,
     grounded_filters: dict[str, list[str]],
+    *,
+    resolved_columns: list[str] | None = None,
+    option_labels: dict[str, str] | None = None,
 ) -> bool:
     if not user_text:
         return False
@@ -1873,8 +1876,27 @@ def _apply_grounded_filter_followup(
         "Answer the user's current dataset question below. This is the current question for this turn, not background context.",
         f"Current dataset question: {user_text}",
         "Grounded categorical filters already implied by the same question:\n" + "\n".join(grounded_lines),
-        "Use these grounded filters when answering the current dataset question.",
     ]
+
+    resolved_field_lines: list[str] = []
+    for column_name in resolved_columns or []:
+        if not isinstance(column_name, str) or not column_name.strip():
+            continue
+        normalized_column_name = column_name.strip()
+        resolved_label = str((option_labels or {}).get(normalized_column_name) or "").strip()
+        if resolved_label and resolved_label != normalized_column_name:
+            resolved_field_lines.append(f"- {resolved_label} ({normalized_column_name})")
+        else:
+            resolved_field_lines.append(f"- {normalized_column_name}")
+
+    if resolved_field_lines:
+        rewritten_sections.append(
+            "Resolved schema field already implied by the same question:\n" + "\n".join(resolved_field_lines)
+        )
+
+    rewritten_sections.extend([
+        "Use these grounded filters when answering the current dataset question.",
+    ])
     return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
 
 
@@ -3303,6 +3325,13 @@ def build_combined_before_model_callback(
                     and identifier.strip()
                     and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
                 ]
+                resolved_grounding_columns = [
+                    identifier
+                    for identifier in grounding_resolution.get("resolved_columns") or []
+                    if isinstance(identifier, str)
+                    and identifier.strip()
+                    and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
+                ]
                 _print_clarification_debug(
                     active_settings,
                     "before-model-schema-grounding-resolution",
@@ -3310,6 +3339,7 @@ def build_combined_before_model_callback(
                         **grounding_resolution,
                         "grounded_filters": grounded_filters,
                         "candidate_columns": resolved_candidate_columns,
+                        "resolved_columns": resolved_grounding_columns,
                     },
                 )
                 if grounding_resolution.get("resolution_type") == "needs_clarification" and len(resolved_candidate_columns) >= 2:
@@ -3339,6 +3369,12 @@ def build_combined_before_model_callback(
                         llm_request,
                         user_text,
                         grounded_filters,
+                        resolved_columns=resolved_grounding_columns,
+                        option_labels={
+                            str(identifier): str(label)
+                            for identifier, label in (filtered_schema_grounding_catalog.get("option_labels") or {}).items()
+                            if isinstance(identifier, str) and isinstance(label, str)
+                        },
                     )
                     if grounded_followup:
                         _print_clarification_debug(

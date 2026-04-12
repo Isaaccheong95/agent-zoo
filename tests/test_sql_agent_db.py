@@ -877,6 +877,142 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             },
         )
 
+    def test_schema_grounding_resolver_proceeds_after_review_when_one_field_is_clearly_best(self) -> None:
+        captured_system_prompts: list[str] = []
+        captured_user_prompts: list[str] = []
+        responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
+                '{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk"]}',
+                '{"resolution_type":"proceed","selected_column":"socalc"}',
+            ]
+        )
+
+        def completion(**kwargs):
+            captured_system_prompts.append(kwargs["messages"][0]["content"])
+            captured_user_prompts.append(kwargs["messages"][1]["content"])
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(responses))
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many women drink",
+                "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male\n"
+                "- socalc (TEXT): field label = Alcohol consumption status; categorical values = Never, Occasionally, Regularly, Unknown\n"
+                "- socsmk (TEXT): field label = Smoking status; categorical values = No, Unknown, Yes",
+                [
+                    {
+                        "column": "gender",
+                        "candidate_value": "Female",
+                        "field_label": "Sex of patient",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "gender",
+                        "candidate_value": "Male",
+                        "field_label": "Sex of patient",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Occasionally",
+                        "field_label": "Alcohol consumption status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socsmk",
+                        "candidate_value": "Yes",
+                        "field_label": "Smoking status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                ],
+                ["gender", "socalc", "socsmk"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "proceed",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": [],
+                "resolved_columns": ["socalc"],
+            },
+        )
+        self.assertEqual(len(captured_system_prompts), 3)
+        self.assertIn("Do not return proceed merely because one part of the request was grounded", captured_system_prompts[0])
+        self.assertIn("strict unresolved-request reviewer", captured_system_prompts[1])
+        self.assertIn("Already grounded filters:", captured_user_prompts[1])
+        self.assertIn("- gender = Female", captured_user_prompts[1])
+        self.assertIn("strict final field-resolution judge", captured_system_prompts[2])
+        self.assertIn("Candidate columns to judge:", captured_user_prompts[2])
+
+    def test_schema_grounding_resolver_reduces_overbroad_review_candidates(self) -> None:
+        captured_system_prompts: list[str] = []
+        responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
+                '{"resolution_type":"needs_clarification","candidate_columns":["socsmk","socalc","sococc"]}',
+                '{"candidate_columns":["socalc","socsmk"]}',
+                '{"resolution_type":"needs_clarification","selected_column":""}',
+            ]
+        )
+
+        def completion(**kwargs):
+            captured_system_prompts.append(kwargs["messages"][0]["content"])
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(responses))
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many women drink",
+                "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male\n"
+                "- socalc (TEXT): field label = Alcohol consumption status; categorical values = Never, Occasionally, Regularly, Unknown\n"
+                "- socsmk (TEXT): field label = Smoking status; categorical values = No, Unknown, Yes\n"
+                "- sococc (TEXT): field label = Occupation status; categorical values = Employed, Retired, Student, Unemployed, Unknown",
+                [
+                    {"column": "gender", "candidate_value": "Female", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                    {"column": "gender", "candidate_value": "Male", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                    {"column": "socalc", "candidate_value": "Occasionally", "field_label": "Alcohol consumption status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                    {"column": "socsmk", "candidate_value": "Yes", "field_label": "Smoking status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                    {"column": "sococc", "candidate_value": "Employed", "field_label": "Occupation status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                ],
+                ["gender", "socalc", "socsmk", "sococc"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": ["socalc", "socsmk"],
+            },
+        )
+        self.assertEqual(len(captured_system_prompts), 4)
+        self.assertIn("strict clarification-set reducer", captured_system_prompts[2])
+        self.assertIn("strict final field-resolution judge", captured_system_prompts[3])
+
 
 class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -4124,6 +4260,112 @@ Which category or combination should I use for \"alcoholic\"?
             pending_clarification["grounded_filters"],
             {"gender": ["Female"]},
         )
+
+    def test_combined_before_model_callback_resolves_partially_grounded_drink_request_without_clarification(self) -> None:
+        scope_gate_calls: list[str] = []
+        litellm_responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
+                '{"resolution_type":"needs_clarification","candidate_columns":["age","race","socsmk","socalc"]}',
+                '{"candidate_columns":["socalc","socsmk"]}',
+                '{"resolution_type":"proceed","selected_column":"socalc"}',
+            ]
+        )
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(litellm_responses))
+                    )
+                ]
+            )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(age TEXT, gender TEXT, race TEXT, socalc TEXT, socsmk TEXT, sococc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "age",
+                                "type": "TEXT",
+                                "source_header": "Age at diagnosis in years",
+                                "categorical_values": [],
+                            },
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "race",
+                                "type": "TEXT",
+                                "source_header": "Race/Ethnicity",
+                                "categorical_values": ["Chinese", "Indian", "Malay", "Others"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption status",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "sococc",
+                                "type": "TEXT",
+                                "source_header": "Occupation status",
+                                "categorical_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            callback = build_combined_before_model_callback(self._settings())
+
+            state: dict[str, object] = {}
+            llm_request = SimpleNamespace(
+                contents=[types.Content(role="user", parts=[types.Part(text="how many women drink")])]
+            )
+
+            result = callback(
+                callback_context=SimpleNamespace(state=state),
+                llm_request=llm_request,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(scope_gate_calls, [])
+            rewritten_text = llm_request.contents[-1].parts[0].text
+            self.assertIn("Current dataset question: how many women drink", rewritten_text)
+            self.assertIn("- gender = Female", rewritten_text)
+            self.assertIn("Resolved schema field already implied by the same question:", rewritten_text)
+            self.assertIn("- Alcohol consumption status (socalc)", rewritten_text)
+            self.assertIsNone(get_sql_pending_clarification(state))
 
     def test_combined_before_model_callback_uses_request_glossary_and_excludes_grounded_gender(self) -> None:
         scope_gate_calls: list[str] = []
