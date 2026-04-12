@@ -2532,6 +2532,69 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             "interpretation",
         )
 
+    def test_after_model_callback_preserves_embedded_interpretation_options_despite_reasoning_values(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {
+                        "column": "parent_category",
+                        "values": [
+                            "B-cell lymphoma",
+                            "Hodgkin lymphoma",
+                            "Other/Unclassified",
+                            "T/NK-cell lymphoma",
+                        ],
+                    },
+                    {
+                        "column": "lymsub",
+                        "values": [
+                            "Classical Hodgkin lymphoma",
+                            "Diffuse large B-cell lymphoma (DLBCL)",
+                        ],
+                    },
+                ],
+            },
+        ):
+            callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "number of women for each diagnosed cancer type",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "The previous query used parent_category and produced rows such as B-cell lymphoma and Hodgkin lymphoma. "
+                                "If the user means a more specific grouping, lymsub would be more granular.\n"
+                                '{"response_type":"clarification","user_message":"When you refer to \'cancer types\', are you asking to group the results by the broader \'Parent lymphoma category\' or the more specific \'Lymphoma subtype\'?","options":["Parent lymphoma category","Lymphoma subtype"]}'
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("When you refer to 'cancer types'", response_text)
+        self.assertIn("1. Parent lymphoma category", response_text)
+        self.assertIn("2. Lymphoma subtype", response_text)
+        self.assertNotIn("1. B-cell lymphoma", response_text)
+        self.assertNotIn("2. Hodgkin lymphoma", response_text)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(
+            pending_clarification["options"],
+            ["Parent lymphoma category", "Lymphoma subtype"],
+        )
+
+
     def test_after_model_callback_prunes_topic_context_echo_from_options(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
         state: dict[str, object] = {
@@ -4392,6 +4455,182 @@ Which category or combination should I use for \"alcoholic\"?
             "Current committed dataset question/topic: how many men are working",
             get_sql_current_query_frame(state)["topic_context"],
         )
+
+    def test_combined_before_model_callback_reuses_interpretation_options_after_result_for_numeric_reply(self) -> None:
+        scope_gate_calls: list[str] = []
+        refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            refinement_resolver_calls.append((frame, user_text))
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "topic_change",
+                "grounded_filters": {},
+                "candidate_columns": [],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, lymsub TEXT, parent_category TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "lymsub",
+                                "type": "TEXT",
+                                "source_header": "Lymphoma subtype",
+                                "categorical_values": [
+                                    "Classical Hodgkin lymphoma",
+                                    "Diffuse large B-cell lymphoma (DLBCL)",
+                                ],
+                            },
+                            {
+                                "name": "parent_category",
+                                "type": "TEXT",
+                                "source_header": "Parent lymphoma category",
+                                "categorical_values": [
+                                    "B-cell lymphoma",
+                                    "Hodgkin lymphoma",
+                                    "Other/Unclassified",
+                                    "T/NK-cell lymphoma",
+                                ],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {
+                        "column": "lymsub",
+                        "values": [
+                            "Classical Hodgkin lymphoma",
+                            "Diffuse large B-cell lymphoma (DLBCL)",
+                        ],
+                    },
+                    {
+                        "column": "parent_category",
+                        "values": [
+                            "B-cell lymphoma",
+                            "Hodgkin lymphoma",
+                            "Other/Unclassified",
+                            "T/NK-cell lymphoma",
+                        ],
+                    },
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            before_callback = build_combined_before_model_callback(self._settings())
+            remember_callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        state: dict[str, object] = {}
+        set_sql_pending_clarification(
+            state,
+            {
+                "topic_context": "number of women for each diagnosed cancer type",
+                "user_message": "I found more than one nearby schema field for this request. Which one do you mean?",
+                "options": ["Sex of patient", "Lymphoma subtype", "Parent lymphoma category"],
+                "clarification_kind": "interpretation",
+                "option_columns": {
+                    "Sex of patient": "gender",
+                    "Lymphoma subtype": "lymsub",
+                    "Parent lymphoma category": "parent_category",
+                },
+            },
+        )
+
+        first_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="1 and 3")])]
+        )
+        first_result = before_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=first_request,
+        )
+
+        self.assertIsNone(first_result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(refinement_resolver_calls, [])
+        self.assertEqual(schema_grounding_calls, [])
+
+        remember_callback(
+            SimpleNamespace(name="execute_sqlite_read_only"),
+            {
+                "sql": "SELECT parent_category, COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' GROUP BY parent_category",
+                "is_final": True,
+            },
+            SimpleNamespace(state=state),
+            make_query_result(
+                [{"parent_category": "B-cell lymphoma", "matching_count": 102}],
+                columns=["parent_category", "matching_count"],
+                sql="SELECT parent_category, COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' GROUP BY parent_category",
+            ),
+        )
+
+        second_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="1 and 2")])]
+        )
+        second_result = before_callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=second_request,
+        )
+
+        self.assertIsNone(second_result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(refinement_resolver_calls, [])
+        self.assertEqual(schema_grounding_calls, [])
+        rewritten_text = second_request.contents[-1].parts[0].text
+        self.assertIn(
+            "Clarification question: I found more than one nearby schema field for this request. Which one do you mean?",
+            rewritten_text,
+        )
+        self.assertIn(
+            "Matched options from the reply: Sex of patient, Lymphoma subtype",
+            rewritten_text,
+        )
+        self.assertIn(
+            "Resolved schema fields from the reply: gender, lymsub",
+            rewritten_text,
+        )
+        self.assertIn("User clarification reply: 1 and 2", rewritten_text)
 
     def test_combined_before_model_callback_still_uses_scope_gate_when_schema_grounding_has_no_action(self) -> None:
         scope_gate_calls: list[str] = []

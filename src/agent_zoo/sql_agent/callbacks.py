@@ -68,6 +68,7 @@ SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY = "temp:sql_fresh_topic_clarification"
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
 SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
+SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY = "recent_interpretation_clarification"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -172,6 +173,14 @@ def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
     return query_frame if isinstance(query_frame, dict) else None
 
 
+def _get_recent_interpretation_clarification(state: Any) -> dict[str, Any] | None:
+    clarification = _get_sql_working_memory_value(
+        state,
+        SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY,
+    )
+    return clarification if isinstance(clarification, dict) else None
+
+
 def _get_sql_working_memory_value(state: Any, field_name: str) -> Any:
     return get_agent_working_memory_value(state, SQL_WORKING_MEMORY_NAMESPACE, field_name)
 
@@ -192,6 +201,17 @@ def _set_last_query_frame_state(
     query_frame: dict[str, Any] | None,
 ) -> None:
     _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY, query_frame)
+
+
+def _set_recent_interpretation_clarification_state(
+    state: Any,
+    clarification: dict[str, Any] | None,
+) -> None:
+    _set_sql_working_memory_value(
+        state,
+        SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY,
+        clarification,
+    )
 
 
 def _ordered_unique_values(values: list[str]) -> list[str]:
@@ -383,6 +403,56 @@ def _select_pending_clarification_topic_text(clarification: dict[str, Any]) -> s
     if isinstance(topic_context, str) and topic_context.strip():
         return topic_context.strip()
     return None
+
+
+def _build_recent_interpretation_clarification(
+    clarification: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(clarification, dict):
+        return None
+
+    clarification_kind = str(clarification.get("clarification_kind") or "").strip().lower()
+    if clarification_kind != CLARIFICATION_KIND_INTERPRETATION:
+        return None
+
+    options = [
+        option
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    ]
+    if not options:
+        return None
+
+    recent_clarification: dict[str, Any] = {
+        "options": options,
+        "clarification_kind": CLARIFICATION_KIND_INTERPRETATION,
+    }
+
+    user_message = str(clarification.get("user_message") or "").strip()
+    if user_message:
+        recent_clarification["user_message"] = user_message
+
+    topic_context = _select_pending_clarification_topic_text(clarification)
+    if topic_context:
+        recent_clarification["topic_context"] = topic_context
+
+    query_context = clarification.get("query_context")
+    if isinstance(query_context, str) and query_context.strip():
+        recent_clarification["query_context"] = query_context.strip()
+
+    option_columns = clarification.get("option_columns")
+    if isinstance(option_columns, dict) and option_columns:
+        recent_clarification["option_columns"] = copy.deepcopy(option_columns)
+
+    grounded_filters = clarification.get("grounded_filters")
+    if isinstance(grounded_filters, dict) and grounded_filters:
+        recent_clarification["grounded_filters"] = copy.deepcopy(grounded_filters)
+
+    base_query_frame = clarification.get("base_query_frame")
+    if isinstance(base_query_frame, dict):
+        recent_clarification["base_query_frame"] = copy.deepcopy(base_query_frame)
+
+    return recent_clarification
 
 
 def _build_recent_refinement(
@@ -1262,6 +1332,23 @@ def _prune_topic_context_option(
     normalized_clarification = dict(clarification)
     normalized_clarification["options"] = pruned_options
     return normalized_clarification
+
+
+def _build_clarification_guidance_match_text(clarification: dict[str, Any]) -> str:
+    if not isinstance(clarification, dict):
+        return ""
+
+    text_parts: list[str] = []
+    user_message = str(clarification.get("user_message") or "").strip()
+    if user_message:
+        text_parts.append(user_message)
+
+    text_parts.extend(
+        option.strip()
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    )
+    return "\n".join(text_parts).strip()
 
 
 def _match_clarification_values_to_schema_guidance(
@@ -2729,9 +2816,10 @@ def build_normalize_clarification_after_model_callback(
                 "low_confidence_normalization",
             )
 
+        clarification_match_text = _build_clarification_guidance_match_text(clarification) or response_text
         clarification = _match_clarification_values_to_schema_guidance(
             clarification,
-            response_text,
+            clarification_match_text,
             categorical_value_guidance,
         )
 
@@ -2956,6 +3044,14 @@ def build_combined_before_model_callback(
                             "before-model-followup-rewritten",
                             _extract_last_user_text(llm_request),
                         )
+                        recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                            pending_clarification
+                        )
+                        if recent_interpretation_clarification is not None:
+                            _set_recent_interpretation_clarification_state(
+                                callback_context.state,
+                                recent_interpretation_clarification,
+                            )
                         _clear_pending_clarification_state(callback_context.state)
                 else:
                     clarification_resolution = _resolve_pending_clarification_reply(
@@ -3003,6 +3099,15 @@ def build_combined_before_model_callback(
                                 "before-model-followup-rewritten",
                                 _extract_last_user_text(llm_request),
                             )
+                            if clarification_resolution.get("selected_options"):
+                                recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                                    pending_clarification
+                                )
+                                if recent_interpretation_clarification is not None:
+                                    _set_recent_interpretation_clarification_state(
+                                        callback_context.state,
+                                        recent_interpretation_clarification,
+                                    )
                             _clear_pending_clarification_state(callback_context.state)
             if clarification_followup:
                 _print_clarification_debug(
@@ -3011,6 +3116,56 @@ def build_combined_before_model_callback(
                     "continuing clarification flow without scope gate",
                 )
                 return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+            recent_interpretation_clarification = _get_recent_interpretation_clarification(
+                callback_context.state
+            )
+            if recent_interpretation_clarification is not None:
+                recent_options = [
+                    option
+                    for option in recent_interpretation_clarification.get("options") or []
+                    if isinstance(option, str) and option.strip()
+                ]
+                matched_recent_options = _extract_matching_clarification_options(
+                    user_text,
+                    recent_options,
+                )
+                if matched_recent_options:
+                    _print_clarification_debug(
+                        active_settings,
+                        "before-model-option-matches",
+                        matched_recent_options,
+                    )
+                    clarification_followup = _apply_pending_clarification_followup_with_resolution(
+                        llm_request,
+                        recent_interpretation_clarification,
+                        user_text,
+                        matched_options=matched_recent_options,
+                    )
+                    if clarification_followup:
+                        base_query_frame = recent_interpretation_clarification.get("base_query_frame")
+                        if isinstance(base_query_frame, dict):
+                            callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                base_query_frame
+                            )
+                        topic_context = _select_pending_clarification_topic_text(
+                            recent_interpretation_clarification
+                        )
+                        if isinstance(topic_context, str) and topic_context.strip():
+                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-followup-rewritten",
+                            _extract_last_user_text(llm_request),
+                        )
+                        _set_recent_interpretation_clarification_state(callback_context.state, None)
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-branch",
+                            "continuing clarification flow without scope gate",
+                        )
+                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+                _set_recent_interpretation_clarification_state(callback_context.state, None)
 
             last_query_frame = _get_last_query_frame(callback_context.state)
             if last_query_frame is not None:
