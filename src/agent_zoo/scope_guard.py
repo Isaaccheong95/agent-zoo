@@ -182,6 +182,37 @@ def _normalize_grounded_filters(
     return normalized_filters
 
 
+def _has_positive_grounding_value_evidence(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+
+    matched_user_phrase = str(entry.get("matched_user_phrase") or "").strip()
+    if matched_user_phrase:
+        return True
+
+    try:
+        confidence = float(entry.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return confidence > 0.0
+
+
+def _filter_supported_grounded_values(
+    selected_values: list[str],
+    value_evidence_by_value: dict[str, dict[str, Any]],
+) -> list[str]:
+    supported_values: list[str] = []
+    seen_values: set[str] = set()
+    for value in selected_values:
+        if value in seen_values:
+            continue
+        if not _has_positive_grounding_value_evidence(value_evidence_by_value.get(value)):
+            continue
+        seen_values.add(value)
+        supported_values.append(value)
+    return supported_values
+
+
 def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
     return {
         "resolution_type": "custom_rule",
@@ -649,6 +680,22 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
         "- Output JSON only. No markdown fences or extra text."
     )
 
+    value_grounding_review_system_prompt = (
+        "You are a strict categorical-value grounding reviewer for a dataset SQL agent.\n"
+        "A previous schema-grounding pass selected one categorical column and a tentative set of stored values for it.\n"
+        "Your job is to keep only the stored values that are clearly supported by the user's wording for that one column.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"selected_values":["..."]}\n\n'
+        "Rules:\n"
+        "- selected_values must contain only exact stored values from the provided available_values list.\n"
+        "- Keep only values clearly supported by the user's request for this one column.\n"
+        "- Do not keep a value merely because it was not excluded.\n"
+        "- If the request combines a positive concept with an exclusion, preserve the positive concept meaning and then apply the exclusion.\n"
+        "- Remove values that contradict the positive concept in the user's wording even if they are part of the tentative set.\n"
+        "- If no exact stored values are clearly supported yet, return an empty array.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
     def _review_unresolved_request(
         user_text: str,
         schema_context: str,
@@ -831,6 +878,60 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             return selected_column
         return ""
 
+    def _review_multi_value_grounded_filter(
+        user_text: str,
+        schema_context: str,
+        column_name: str,
+        field_label: str,
+        selected_values: list[str],
+        available_values: list[str],
+    ) -> list[str]:
+        if not user_text or not user_text.strip() or len(selected_values) < 2 or len(available_values) < 2:
+            return selected_values
+
+        classifier_input = (
+            "Latest user request:\n"
+            + user_text.strip()
+            + "\n\nSelected column:\n- "
+            + column_name
+            + (f" ({field_label})" if field_label else "")
+            + "\n\nTentative selected stored values:\n"
+            + "\n".join(f"- {value}" for value in selected_values)
+            + "\n\nAll available stored values for this column:\n"
+            + "\n".join(f"- {value}" for value in available_values)
+            + "\n\nSchema columns and previews:\n"
+            + schema_context.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            value_grounding_review_system_prompt,
+            classifier_input,
+            max_tokens=250,
+            debug_label="schema-grounding-value-review" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return selected_values
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-value-review",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None or not isinstance(parsed_response.get("selected_values"), list):
+            return selected_values
+
+        reviewed_values = _normalize_selected_options(
+            parsed_response.get("selected_values"),
+            available_values,
+        )
+        if reviewed_values and len(reviewed_values) < len(available_values):
+            return reviewed_values
+        return []
+
     def resolve(
         user_text: str,
         schema_context: str,
@@ -845,6 +946,8 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             }
 
         candidate_value_map: dict[str, list[str]] = {}
+        candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]] = {}
+        candidate_field_labels: dict[str, str] = {}
         grounding_candidate_lines: list[str] = []
         for entry in grounding_candidates or []:
             if not isinstance(entry, dict):
@@ -853,9 +956,41 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             candidate_value = str(entry.get("candidate_value") or "").strip()
             if not column_name or not candidate_value:
                 continue
+            field_label = str(
+                entry.get("field_label")
+                or entry.get("source_header")
+                or entry.get("request_field_label")
+                or column_name
+            ).strip()
+            if field_label and column_name not in candidate_field_labels:
+                candidate_field_labels[column_name] = field_label
             column_values = candidate_value_map.setdefault(column_name, [])
             if candidate_value not in column_values:
                 column_values.append(candidate_value)
+            column_value_evidence = candidate_value_evidence_by_column.setdefault(column_name, {})
+            existing_value_evidence = column_value_evidence.get(candidate_value)
+            candidate_confidence = entry.get("confidence")
+            existing_confidence = existing_value_evidence.get("confidence") if isinstance(existing_value_evidence, dict) else None
+            try:
+                normalized_candidate_confidence = float(candidate_confidence or 0.0)
+            except (TypeError, ValueError):
+                normalized_candidate_confidence = 0.0
+            try:
+                normalized_existing_confidence = float(existing_confidence or 0.0)
+            except (TypeError, ValueError):
+                normalized_existing_confidence = 0.0
+            if (
+                existing_value_evidence is None
+                or normalized_candidate_confidence > normalized_existing_confidence
+                or (
+                    str(entry.get("matched_user_phrase") or "").strip()
+                    and not str(existing_value_evidence.get("matched_user_phrase") or "").strip()
+                )
+            ):
+                column_value_evidence[candidate_value] = {
+                    "matched_user_phrase": str(entry.get("matched_user_phrase") or "").strip(),
+                    "confidence": normalized_candidate_confidence,
+                }
             grounding_candidate_lines.append(json.dumps(entry, sort_keys=True))
 
         classifier_input = (
@@ -905,30 +1040,76 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             candidate_columns,
             candidate_value_map,
         )
+        reviewed_grounded_filters: dict[str, list[str]] = {}
+        resolved_grounded_columns: list[str] = []
+        for column_name, selected_values in normalized_grounded_filters.items():
+            available_values = [
+                value
+                for value in candidate_value_map.get(column_name) or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if len(selected_values) < 2 or len(available_values) < 2:
+                reviewed_grounded_filters[column_name] = selected_values
+                continue
+
+            reviewed_values = _review_multi_value_grounded_filter(
+                user_text,
+                schema_context,
+                column_name,
+                candidate_field_labels.get(column_name, column_name),
+                selected_values,
+                available_values,
+            )
+            if not reviewed_values:
+                if column_name not in resolved_grounded_columns:
+                    resolved_grounded_columns.append(column_name)
+                continue
+
+            supported_reviewed_values = _filter_supported_grounded_values(
+                reviewed_values,
+                candidate_value_evidence_by_column.get(column_name, {}),
+            )
+            if supported_reviewed_values:
+                reviewed_grounded_filters[column_name] = supported_reviewed_values
+                continue
+
+            if column_name not in resolved_grounded_columns:
+                resolved_grounded_columns.append(column_name)
+
+        normalized_grounded_filters = reviewed_grounded_filters
         normalized_candidate_columns = _normalize_selected_identifiers(
             parsed_response.get("candidate_columns"),
             candidate_columns,
         )
         grounded_columns = set(normalized_grounded_filters)
-        if normalized_grounded_filters:
+        resolved_columns = [
+            column_name
+            for column_name in resolved_grounded_columns
+            if column_name and column_name not in grounded_columns
+        ]
+        committed_columns = grounded_columns | set(resolved_columns)
+        if committed_columns:
             normalized_candidate_columns = [
                 identifier
                 for identifier in normalized_candidate_columns
-                if identifier not in grounded_columns
+                if identifier not in committed_columns
             ]
 
         if resolution_type == "needs_clarification" and len(normalized_candidate_columns) >= 2:
-            return {
+            result = {
                 "resolution_type": "needs_clarification",
                 "grounded_filters": normalized_grounded_filters,
                 "candidate_columns": normalized_candidate_columns[:4],
             }
+            if resolved_columns:
+                result["resolved_columns"] = resolved_columns
+            return result
 
-        if normalized_grounded_filters and not normalized_candidate_columns:
+        if committed_columns and not normalized_candidate_columns:
             remaining_candidate_columns = [
                 identifier
                 for identifier in candidate_columns
-                if identifier not in grounded_columns
+                if identifier not in committed_columns
             ]
             review_candidate_columns = _review_unresolved_request(
                 user_text,
@@ -951,22 +1132,31 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                     review_candidate_columns,
                 )
                 if selected_review_column:
+                    final_resolved_columns = list(resolved_columns)
+                    if selected_review_column not in final_resolved_columns:
+                        final_resolved_columns.append(selected_review_column)
                     return {
                         "resolution_type": "proceed",
                         "grounded_filters": normalized_grounded_filters,
                         "candidate_columns": [],
-                        "resolved_columns": [selected_review_column],
+                        "resolved_columns": final_resolved_columns,
                     }
-                return {
+                result = {
                     "resolution_type": "needs_clarification",
                     "grounded_filters": normalized_grounded_filters,
                     "candidate_columns": review_candidate_columns,
                 }
+                if resolved_columns:
+                    result["resolved_columns"] = resolved_columns
+                return result
 
-        return {
+        result = {
             "resolution_type": "proceed",
             "grounded_filters": normalized_grounded_filters,
             "candidate_columns": [],
         }
+        if resolved_columns:
+            result["resolved_columns"] = resolved_columns
+        return result
 
     return resolve

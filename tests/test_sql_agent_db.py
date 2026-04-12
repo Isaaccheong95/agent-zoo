@@ -420,6 +420,17 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(result.get("display_sql"), result["sql"])
         self.assertNotIn("!=", result["display_sql"])
 
+    def test_execute_sqlite_query_rewrites_multiple_categorical_negations_to_explicit_values(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS matching_count FROM visits WHERE city != 'Tokyo' AND city != 'Paris'",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["rows"], [{"matching_count": 2}])
+        self.assertNotIn("!=", result["display_sql"])
+        self.assertIn("city IN", result["display_sql"])
+
     def test_build_agent_instruction_mentions_clarifying_near_matches(self) -> None:
         instruction = build_agent_instruction(
             SQLAgentSettings(
@@ -1028,6 +1039,99 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(len(captured_system_prompts), 4)
         self.assertIn("strict clarification-set reducer", captured_system_prompts[2])
         self.assertIn("strict final field-resolution judge", captured_system_prompts[3])
+
+    def test_schema_grounding_resolver_reviews_multi_value_filter_for_drink_excluding_unknown(self) -> None:
+        captured_system_prompts: list[str] = []
+        responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]},{"column":"socalc","selected_values":["Never","Occasionally","Regularly"]}],"candidate_columns":[]}',
+                '{"selected_values":["Never","Occasionally","Regularly"]}',
+                '{"resolution_type":"proceed","candidate_columns":[]}',
+            ]
+        )
+
+        def completion(**kwargs):
+            captured_system_prompts.append(kwargs["messages"][0]["content"])
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(responses))
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many women drink, exclude unk",
+                "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male\n"
+                "- socalc (TEXT): field label = Alcohol consumption status; categorical values = Never, Occasionally, Regularly, Unknown\n"
+                "- socsmk (TEXT): field label = Smoking status; categorical values = No, Unknown, Yes",
+                [
+                    {
+                        "column": "gender",
+                        "candidate_value": "Female",
+                        "field_label": "Sex of patient",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "gender",
+                        "candidate_value": "Male",
+                        "field_label": "Sex of patient",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Never",
+                        "field_label": "Alcohol consumption status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Occasionally",
+                        "field_label": "Alcohol consumption status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Regularly",
+                        "field_label": "Alcohol consumption status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                    {
+                        "column": "socalc",
+                        "candidate_value": "Unknown",
+                        "field_label": "Alcohol consumption status",
+                        "matched_user_phrase": "",
+                        "confidence": 0.0,
+                        "evidence_sources": ["candidate_value"],
+                    },
+                ],
+                ["gender", "socalc", "socsmk"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "proceed",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": [],
+                "resolved_columns": ["socalc"],
+            },
+        )
+        self.assertEqual(len(captured_system_prompts), 2)
+        self.assertIn("strict categorical-value grounding reviewer", captured_system_prompts[1])
 
 
 class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
@@ -4447,6 +4551,95 @@ Which category or combination should I use for \"alcoholic\"?
             rewritten_text = llm_request.contents[-1].parts[0].text
             self.assertIn("Current dataset question: how many women drink", rewritten_text)
             self.assertIn("- gender = Female", rewritten_text)
+            self.assertIn("Resolved schema field already implied by the same question:", rewritten_text)
+            self.assertIn("- Alcohol consumption status (socalc)", rewritten_text)
+            self.assertIsNone(get_sql_pending_clarification(state))
+
+    def test_combined_before_model_callback_prunes_never_from_drink_exclude_unknown(self) -> None:
+        scope_gate_calls: list[str] = []
+        litellm_responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]},{"column":"socalc","selected_values":["Never","Occasionally","Regularly"]}],"candidate_columns":[]}',
+                '{"selected_values":["Never","Occasionally","Regularly"]}',
+                '{"resolution_type":"proceed","candidate_columns":[]}',
+            ]
+        )
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(litellm_responses))
+                    )
+                ]
+            )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT, socsmk TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption status",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            callback = build_combined_before_model_callback(self._settings())
+
+            state: dict[str, object] = {}
+            llm_request = SimpleNamespace(
+                contents=[types.Content(role="user", parts=[types.Part(text="how many women drink, exclude unk")])]
+            )
+
+            result = callback(
+                callback_context=SimpleNamespace(state=state),
+                llm_request=llm_request,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(scope_gate_calls, [])
+            rewritten_text = llm_request.contents[-1].parts[0].text
+            self.assertIn("Current dataset question: how many women drink, exclude unk", rewritten_text)
+            self.assertIn("- gender = Female", rewritten_text)
+            self.assertNotIn("- socalc = Never, Occasionally, Regularly", rewritten_text)
+            self.assertNotIn("- socalc = Occasionally, Regularly", rewritten_text)
             self.assertIn("Resolved schema field already implied by the same question:", rewritten_text)
             self.assertIn("- Alcohol consumption status (socalc)", rewritten_text)
             self.assertIsNone(get_sql_pending_clarification(state))
