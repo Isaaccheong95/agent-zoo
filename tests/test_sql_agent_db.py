@@ -685,6 +685,100 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             },
         )
 
+    def test_result_refinement_resolver_marks_standalone_dataset_question_as_topic_change(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_type":"topic_change","target_column":"","selected_values":[],"refinement_request":""}'
+                        )
+                    )
+                ]
+            )
+
+        resolver = build_llm_result_refinement_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                {
+                    "question": "total non-working",
+                    "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE sococc = 'Unemployed'",
+                    "categorical_filters": [
+                        {
+                            "column": "sococc",
+                            "selected_values": ["Unemployed"],
+                            "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                        }
+                    ],
+                },
+                "give me the avg age of females",
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            },
+        )
+        self.assertIn("fresh dataset question", captured["system_prompt"])
+        self.assertIn("give me the avg age of females", captured["user_prompt"])
+
+    def test_result_refinement_resolver_preserves_mixed_selected_values_and_refinement_request(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=(
+                                '{"resolution_type":"refine_query","target_column":"gender",'
+                                '"selected_values":["Female"],"refinement_request":"average age only below 34"}'
+                            )
+                        )
+                    )
+                ]
+            )
+
+        resolver = build_llm_result_refinement_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                {
+                    "question": "how many males work",
+                    "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                        {
+                            "column": "sococc",
+                            "selected_values": ["Employed"],
+                            "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                        },
+                    ],
+                },
+                "make it females and give me the average age only below 34",
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "refine_query",
+                "target_column": "gender",
+                "selected_values": ["Female"],
+                "refinement_request": "average age only below 34",
+            },
+        )
+        self.assertIn("selected_values may coexist with refinement_request", captured["system_prompt"])
+
     def test_schema_grounding_resolver_includes_schema_context(self) -> None:
         captured: dict[str, str] = {}
 
@@ -3739,6 +3833,58 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIn("Previous dataset question: how many males dont work", rewritten_text)
         self.assertIn("Use this updated value set for sococc: Retired, Student, Unemployed", rewritten_text)
 
+    def test_combined_before_model_callback_rewrites_result_refinement_followup_with_mixed_request(self) -> None:
+        scope_gate_calls: list[str] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda frame, user_text: {
+                "resolution_type": "refine_query",
+                "target_column": "gender",
+                "selected_values": ["Female"],
+                "refinement_request": "average age only below 34",
+            },
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "how many males work",
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Male' AND sococc = 'Employed'",
+                "categorical_filters": [
+                    {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Employed"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    },
+                ],
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="make it females and average age only below 34")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Use this updated value set for gender: Female", rewritten_text)
+        self.assertIn("Latest same-query refinement request: average age only below 34", rewritten_text)
+
     def test_combined_before_model_callback_restores_recently_removed_value_without_llm(self) -> None:
         scope_gate_calls: list[str] = []
         refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
@@ -4174,8 +4320,11 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(scope_gate_calls, [])
         self.assertEqual(len(schema_grounding_calls), 1)
         rewritten_text = llm_request.contents[-1].parts[0].text
-        self.assertIn("The user's dataset request already grounds some categorical filters", rewritten_text)
-        self.assertIn("Original dataset request: how many guys drink", rewritten_text)
+        self.assertIn(
+            "Answer the user's current dataset question below. This is the current question for this turn, not background context.",
+            rewritten_text,
+        )
+        self.assertIn("Current dataset question: how many guys drink", rewritten_text)
         self.assertIn("- gender = Male", rewritten_text)
         self.assertIsNone(get_sql_pending_clarification(state))
 
@@ -4390,7 +4539,7 @@ Which category or combination should I use for \"alcoholic\"?
 
         self.assertIsNone(first_result)
         self.assertIn(
-            "Original dataset request: how many men are working",
+            "Current dataset question: how many men are working",
             first_request.contents[-1].parts[0].text,
         )
 
@@ -4815,6 +4964,216 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(result.content.parts[0].text, "blocked")
         self.assertEqual(scope_gate_calls, ["what was my first qn"])
         self.assertEqual(schema_grounding_calls, [])
+
+    def test_combined_before_model_callback_routes_fresh_dataset_query_to_schema_grounding(self) -> None:
+        scope_gate_calls: list[str] = []
+        refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            refinement_resolver_calls.append((frame, user_text))
+            return {
+                "resolution_type": "topic_change",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "",
+            }
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "topic_change",
+                "grounded_filters": {},
+                "candidate_columns": [],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(age TEXT, gender TEXT, sococc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {"name": "age", "type": "TEXT", "source_header": "Age"},
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "sococc",
+                                "type": "TEXT",
+                                "source_header": "Occupation status",
+                                "categorical_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "sococc", "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"]},
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "total non-working",
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE sococc = 'Unemployed'",
+                "categorical_filters": [
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Unemployed"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    }
+                ],
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="give me the avg age of females")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(refinement_resolver_calls), 1)
+        self.assertEqual(scope_gate_calls, ["give me the avg age of females"])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        self.assertEqual(schema_grounding_calls[0][0], "give me the avg age of females")
+        self.assertEqual(
+            llm_request.contents[-1].parts[0].text,
+            "give me the avg age of females",
+        )
+
+    def test_combined_before_model_callback_rewrites_grounded_fresh_dataset_question_as_current_question(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "proceed",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": [],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(age TEXT, gender TEXT, sococc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {"name": "age", "type": "TEXT", "source_header": "Age"},
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "sococc",
+                                "type": "TEXT",
+                                "source_header": "Occupation status",
+                                "categorical_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "sococc", "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"]},
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "total non-working",
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE sococc IN ('Retired', 'Student', 'Unemployed')",
+                "categorical_filters": [
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Retired", "Student", "Unemployed"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    }
+                ],
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="give me the avg age of females")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, ["give me the avg age of females"])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Current dataset question: give me the avg age of females", rewritten_text)
+        self.assertIn("- gender = Female", rewritten_text)
+        self.assertNotIn("Original dataset request", rewritten_text)
 
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()

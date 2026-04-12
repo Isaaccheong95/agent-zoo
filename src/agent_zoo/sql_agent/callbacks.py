@@ -1870,10 +1870,10 @@ def _apply_grounded_filter_followup(
         return False
 
     rewritten_sections = [
-        "The user's dataset request already grounds some categorical filters from the original wording.",
-        f"Original dataset request: {user_text}",
-        "Grounded categorical filters:\n" + "\n".join(grounded_lines),
-        "Use these grounded filters directly when interpreting the dataset request and continue from there.",
+        "Answer the user's current dataset question below. This is the current question for this turn, not background context.",
+        f"Current dataset question: {user_text}",
+        "Grounded categorical filters already implied by the same question:\n" + "\n".join(grounded_lines),
+        "Use these grounded filters when answering the current dataset question.",
     ]
     return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
 

@@ -372,11 +372,15 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
         "Reply with exactly one JSON object using this schema:\n"
         '{"resolution_type":"refine_query|needs_clarification|topic_change","target_column":"...","selected_values":["..."],"refinement_request":"..."}\n\n'
         "Rules:\n"
-        "- Use resolution_type='refine_query' when the latest reply is still about refining or modifying the previous dataset query.\n"
+        "- Use resolution_type='refine_query' only when the latest reply is clearly refining or modifying the previous dataset query.\n"
         "- Use resolution_type='needs_clarification' when the latest reply is still about the previous dataset query but wants to change a categorical filter without specifying an exact final set of dataset values.\n"
-        "- Use resolution_type='topic_change' only when the latest reply starts a different request or is unrelated to the previous dataset query.\n"
+        "- Use resolution_type='topic_change' when the latest reply starts a fresh dataset question that should be answered from scratch, or when it is unrelated to the previous dataset query. A fresh dataset question can still be fully in scope.\n"
+        "- Treat a complete standalone dataset question as topic_change even if it overlaps with the previous subject. Example: previous question = 'total non-working'; latest reply = 'give me the avg age of females' => topic_change.\n"
+        "- Treat short or long multi-part edit requests as refine_query when they are clearly modifying the previous dataset query. Example: 'remove unk, include males only below 34' => refine_query.\n"
+        "- Do not inherit previous filters or SQL unless the latest reply is clearly refining the previous dataset query.\n"
         "- target_column must be one of the provided categorical filter columns or an empty string.\n"
         "- selected_values must contain only exact dataset values available for target_column and should represent the full updated set of values to use when resolution_type='refine_query'.\n"
+        "- When the user both changes exact categorical values and requests another same-query modification, keep both: put the categorical values in selected_values and keep the remaining same-query modification in refinement_request. selected_values may coexist with refinement_request for refine_query.\n"
         "- When resolution_type='needs_clarification', selected_values must be empty.\n"
         "- When resolution_type='topic_change', target_column must be empty, selected_values must be empty, and refinement_request must be empty.\n"
         "- Use refinement_request for the same-query change when the user is refining the previous query but not by selecting exact categorical values.\n"
@@ -520,7 +524,7 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
                     "resolution_type": "refine_query",
                     "target_column": target_column,
                     "selected_values": selected_values,
-                    "refinement_request": "",
+                    "refinement_request": normalized_refinement_request,
                 }
             if normalized_refinement_request:
                 return {
@@ -535,7 +539,7 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
                 "resolution_type": "refine_query",
                 "target_column": target_column,
                 "selected_values": selected_values,
-                "refinement_request": "",
+                "refinement_request": normalized_refinement_request,
             }
         if target_column:
             return {
