@@ -4716,6 +4716,106 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(len(schema_grounding_calls), 1)
         self.assertEqual(scope_gate_calls, ["tell me a joke"])
 
+    def test_combined_before_model_callback_blocks_topic_change_before_schema_grounding(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {},
+                "candidate_columns": ["Redcap_SLS_ID", "dtfol", "dtodhfol1", "dtr2fol1"],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(Redcap_SLS_ID TEXT, dtfol TEXT, dtodhfol1 TEXT, dtr2fol1 TEXT, gender TEXT, sococc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {"name": "Redcap_SLS_ID", "type": "TEXT", "source_header": "Redcap SLS ID"},
+                            {"name": "dtfol", "type": "TEXT", "source_header": "Date of last follow-up"},
+                            {"name": "dtodhfol1", "type": "TEXT", "source_header": "Date of death"},
+                            {"name": "dtr2fol1", "type": "TEXT", "source_header": "Date of relapse event"},
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "sococc",
+                                "type": "TEXT",
+                                "source_header": "Occupation status",
+                                "categorical_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "sococc", "values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"]},
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "avg age of working females",
+                "sql": "SELECT AVG(age) AS average_age, COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc IN ('Employed', 'Student')",
+                "categorical_filters": [
+                    {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Employed", "Student"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    },
+                ],
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="what was my first qn")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.content.parts[0].text, "blocked")
+        self.assertEqual(scope_gate_calls, ["what was my first qn"])
+        self.assertEqual(schema_grounding_calls, [])
+
     def test_debug_output_redacts_tool_response_in_privacy_mode(self) -> None:
         settings = self._settings()
         event = SimpleNamespace(

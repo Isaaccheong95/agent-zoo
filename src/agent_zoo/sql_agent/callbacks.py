@@ -2994,6 +2994,7 @@ def build_combined_before_model_callback(
     finalize = build_finalize_after_query_before_model_callback()
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        scope_gate_prechecked = False
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
             _clear_fresh_topic_clarification_state(callback_context.state)
@@ -3240,6 +3241,16 @@ def build_combined_before_model_callback(
                         )
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
+            if bool(callback_context.state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
+                scope_result = scope_gate(
+                    callback_context=callback_context,
+                    llm_request=llm_request,
+                    **kwargs,
+                )
+                scope_gate_prechecked = True
+                if scope_result is not None:
+                    return scope_result
+
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             if user_text:
                 topic_text = str(
@@ -3342,9 +3353,10 @@ def build_combined_before_model_callback(
                         )
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-        result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
-        if result is not None:
-            return result
+        if not scope_gate_prechecked:
+            result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
+            if result is not None:
+                return result
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined
