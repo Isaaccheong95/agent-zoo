@@ -50,6 +50,7 @@ Rules:
 - If the request is ambiguous or cannot be grounded in the schema, ask for clarification instead of guessing.
 - If more than one nearby schema concept could fit, ask which one the user means before querying.
 - If the schema snapshot includes relevant categorical value guidance, prefer those exact stored SQLite values before issuing exploratory SQL.
+- For schema-backed categorical columns, do not express complements with `!=`, `<>`, or `NOT IN`; enumerate the retained stored values explicitly with `=` or `IN`.
 - If you need exploratory SQL, keep it narrow, set `is_final=False`, use the result to resolve the ambiguity, and then issue one final answering query with the default `is_final=True`.
 - Do not stop after an exploratory query.
 - When clarification is needed before querying, do not call any tools yet.

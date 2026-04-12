@@ -405,6 +405,21 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(result["row_count"], 0)
         self.assertIn("no such column", result["error"].lower())
 
+    def test_execute_sqlite_query_rewrites_categorical_negation_to_explicit_values(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT COUNT(*) AS matching_count FROM visits WHERE city != 'Tokyo'",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["rows"], [{"matching_count": 3}])
+        self.assertEqual(
+            result["sql"],
+            "SELECT COUNT(*) AS matching_count FROM visits WHERE city IN ('Paris', 'Singapore')",
+        )
+        self.assertEqual(result.get("display_sql"), result["sql"])
+        self.assertNotIn("!=", result["display_sql"])
+
     def test_build_agent_instruction_mentions_clarifying_near_matches(self) -> None:
         instruction = build_agent_instruction(
             SQLAgentSettings(
@@ -418,6 +433,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn('"response_type":"clarification"', instruction)
         self.assertIn("available category values", instruction)
         self.assertIn("choose one or more options or describe their own rule", instruction)
+        self.assertIn("do not express complements with `!=`, `<>`, or `NOT IN`", instruction)
 
     def test_build_agent_instruction_includes_categorical_value_guidance_and_exploratory_flag(self) -> None:
         instruction = build_agent_instruction(
@@ -1465,6 +1481,74 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         public_result = state[SQL_PUBLIC_RESULT_STATE_KEY]
         self.assertEqual(public_result["display_sql"], rewritten_sql)
         self.assertIn("Unknown / Null", public_result["display_sql"])
+
+    def test_remember_query_result_uses_rewritten_display_sql_for_categorical_filters(self) -> None:
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                    {"column": "socalc", "values": ["Never", "Occasionally", "Regularly", "Unknown"]},
+                ],
+            },
+        ):
+            callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(
+            state={
+                SQL_ACTIVE_QUERY_TOPIC_STATE_KEY: "how many ladeis smoke and drink alcohol",
+            }
+        )
+        rewritten_sql = (
+            "SELECT COUNT(*) AS matching_count FROM filtered_dataset "
+            "WHERE gender = 'Female' AND socsmk = 'Yes' "
+            "AND socalc IN ('Occasionally', 'Regularly', 'Unknown')"
+        )
+
+        callback(
+            tool,
+            {
+                "sql": "SELECT COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND socsmk = 'Yes' AND socalc != 'Never'",
+                "is_final": True,
+            },
+            tool_context,
+            make_query_result(
+                [{"matching_count": 32}],
+                columns=["matching_count"],
+                sql=rewritten_sql,
+                display_sql=rewritten_sql,
+            ),
+        )
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(public_result["display_sql"], rewritten_sql)
+
+        query_frame = get_sql_current_query_frame(tool_context.state)
+        self.assertIsNotNone(query_frame)
+        self.assertEqual(
+            query_frame.get("categorical_filters"),
+            [
+                {
+                    "column": "gender",
+                    "selected_values": ["Female"],
+                    "available_values": ["Female", "Male"],
+                },
+                {
+                    "column": "socsmk",
+                    "selected_values": ["Yes"],
+                    "available_values": ["No", "Unknown", "Yes"],
+                },
+                {
+                    "column": "socalc",
+                    "selected_values": ["Occasionally", "Regularly", "Unknown"],
+                    "available_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                },
+            ],
+        )
+        self.assertNotIn("comparison_filters", query_frame)
 
     def test_remember_query_result_stores_last_query_frame_for_final_query(self) -> None:
         with patch(

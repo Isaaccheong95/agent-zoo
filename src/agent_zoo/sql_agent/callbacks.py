@@ -1196,7 +1196,9 @@ def _build_last_query_frame(
     if not isinstance(active_query_topic, str) or not active_query_topic.strip():
         return None
 
-    raw_sql = args.get("sql") if isinstance(args, dict) else None
+    raw_sql = tool_response.get("display_sql")
+    if not isinstance(raw_sql, str) or not raw_sql.strip():
+        raw_sql = args.get("sql") if isinstance(args, dict) else None
     if not isinstance(raw_sql, str) or not raw_sql.strip():
         raw_sql = tool_response.get("sql")
     if not isinstance(raw_sql, str) or not raw_sql.strip():

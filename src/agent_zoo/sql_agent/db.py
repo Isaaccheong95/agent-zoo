@@ -685,6 +685,129 @@ def _escape_sql_string_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
+    return [
+        match.group(1).replace("''", "'")
+        for match in re.finditer(r"'((?:''|[^'])*)'", sql_fragment)
+    ]
+
+
+def _normalize_sql_literal(value: str) -> str:
+    literal = value.strip()
+    if literal.startswith("'") and literal.endswith("'") and len(literal) >= 2:
+        literal = literal[1:-1].replace("''", "'")
+    return literal.strip()
+
+
+def _normalize_categorical_values(
+    values: Iterable[str],
+    allowed_values: list[str],
+) -> list[str]:
+    value_lookup: dict[str, str] = {}
+    for allowed_value in allowed_values:
+        normalized_allowed_value = _normalize_whitespace(str(allowed_value or "")).casefold()
+        if normalized_allowed_value and normalized_allowed_value not in value_lookup:
+            value_lookup[normalized_allowed_value] = str(allowed_value)
+
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+    for value in values:
+        canonical_value = value_lookup.get(_normalize_whitespace(str(value or "")).casefold())
+        if canonical_value and canonical_value not in seen_values:
+            seen_values.add(canonical_value)
+            normalized_values.append(canonical_value)
+    return normalized_values
+
+
+def _render_explicit_categorical_predicate(column_sql: str, selected_values: list[str]) -> str:
+    literal_values = [f"'{_escape_sql_string_literal(value)}'" for value in selected_values]
+    if len(literal_values) == 1:
+        return f"{column_sql} = {literal_values[0]}"
+    return f"{column_sql} IN ({', '.join(literal_values)})"
+
+
+def _rewrite_categorical_negation_sql(
+    sql: str,
+    categorical_value_guidance: list[dict[str, Any]],
+) -> str | None:
+    normalized_sql = _normalized_statement(sql)
+    if not normalized_sql or not re.search(r"!=|<>|\bNOT\s+IN\b", normalized_sql, flags=re.IGNORECASE):
+        return None
+
+    allowed_values_by_column: dict[str, list[str]] = {}
+    for entry in categorical_value_guidance:
+        column_name = str(entry.get("column") or "").strip()
+        allowed_values = [
+            value.strip()
+            for value in entry.get("values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if column_name and allowed_values:
+            allowed_values_by_column[column_name.casefold()] = allowed_values
+
+    if not allowed_values_by_column:
+        return None
+
+    identifier_pattern = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))*'
+    replacements: list[tuple[int, int, str]] = []
+
+    for match in re.finditer(
+        rf'(?P<column>{identifier_pattern})\s+NOT\s+IN\s*\((?P<values>[^)]*)\)',
+        normalized_sql,
+        flags=re.IGNORECASE,
+    ):
+        column_sql = match.group("column")
+        column_name = _normalize_sql_reference(column_sql)
+        allowed_values = allowed_values_by_column.get(column_name.casefold())
+        if not allowed_values:
+            continue
+
+        excluded_values = _normalize_categorical_values(
+            _extract_sql_string_literals(match.group("values")),
+            allowed_values,
+        )
+        if not excluded_values or len(excluded_values) >= len(allowed_values):
+            continue
+
+        selected_values = [value for value in allowed_values if value not in excluded_values]
+        if not selected_values:
+            continue
+        replacements.append(
+            (match.start(), match.end(), _render_explicit_categorical_predicate(column_sql, selected_values))
+        )
+
+    for match in re.finditer(
+        rf'(?P<column>{identifier_pattern})\s*(?P<operator><>|!=)\s*(?P<value>\'(?:(?:\'\')|[^\'])*\')',
+        normalized_sql,
+        flags=re.IGNORECASE,
+    ):
+        column_sql = match.group("column")
+        column_name = _normalize_sql_reference(column_sql)
+        allowed_values = allowed_values_by_column.get(column_name.casefold())
+        if not allowed_values:
+            continue
+
+        excluded_values = _normalize_categorical_values(
+            [_normalize_sql_literal(match.group("value"))],
+            allowed_values,
+        )
+        if len(excluded_values) != 1:
+            continue
+
+        selected_values = [value for value in allowed_values if value not in excluded_values]
+        if not selected_values:
+            continue
+        replacements.append(
+            (match.start(), match.end(), _render_explicit_categorical_predicate(column_sql, selected_values))
+        )
+
+    if not replacements:
+        return None
+
+    rewritten_sql = _replace_sql_ranges(normalized_sql, replacements)
+    return _normalized_statement(rewritten_sql)
+
+
 def _infer_case_missing_probe_expression(expression: str) -> str | None:
     if not re.match(r"^\s*CASE\b", expression, flags=re.IGNORECASE):
         return None
@@ -1249,6 +1372,42 @@ def execute_sqlite_query(
                 ),
             }, display_sql)
         effective_sql = rewritten_validation.get("normalized_sql") or _normalized_statement(rewritten_group_sql)
+        display_sql = effective_sql
+
+    rewritten_categorical_sql: str | None = None
+    if re.search(r"!=|<>|\bNOT\s+IN\b", effective_sql, flags=re.IGNORECASE):
+        schema_summary = get_schema_summary(
+            db_path,
+            include_categorical_value_guidance=True,
+            max_categorical_values=DEFAULT_MAX_CATEGORICAL_VALUES,
+        )
+        if schema_summary.get("status") == "success":
+            rewritten_categorical_sql = _rewrite_categorical_negation_sql(
+                effective_sql,
+                [
+                    entry
+                    for entry in schema_summary.get("categorical_value_guidance") or []
+                    if isinstance(entry, dict)
+                ],
+            )
+    if rewritten_categorical_sql and rewritten_categorical_sql != effective_sql:
+        rewritten_validation = validate_sql_read_only(rewritten_categorical_sql, db_path)
+        if not rewritten_validation["is_valid"]:
+            return _attach_display_sql({
+                "status": "error",
+                "db_path": rewritten_validation["db_path"],
+                "sql": normalized_sql,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "preview_row_count": 0,
+                "truncated": False,
+                "error": (
+                    "Categorical filter normalization could not rewrite the query safely: "
+                    f"{rewritten_validation['reason']}"
+                ),
+            }, display_sql)
+        effective_sql = rewritten_validation.get("normalized_sql") or _normalized_statement(rewritten_categorical_sql)
         display_sql = effective_sql
 
     if object_order_column and not object_id_column:
