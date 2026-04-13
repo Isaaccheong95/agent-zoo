@@ -871,6 +871,49 @@ def _iter_schema_grounding_columns(schema_summary: dict[str, Any]) -> list[tuple
     return schema_columns
 
 
+def _build_scope_gate_schema_context(schema_summary: dict[str, Any]) -> str:
+    context_sections: list[str] = []
+
+    schema_text = str(schema_summary.get("schema_text") or "").strip()
+    if schema_text:
+        context_sections.append(schema_text)
+
+    semantic_lines: list[str] = []
+    for identifier, column_name, column in _iter_schema_grounding_columns(schema_summary):
+        declared_type = str(column.get("type") or "TEXT").strip() or "TEXT"
+        field_label = _humanize_schema_label(str(column.get("source_header") or ""))
+        if not field_label:
+            field_label = _humanize_schema_label(column_name) or identifier
+
+        details = [f"field label = {field_label}"]
+        categorical_values = [
+            value.strip()
+            for value in column.get("categorical_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if categorical_values:
+            preview_values = categorical_values[:4]
+            values_text = ", ".join(preview_values)
+            if len(categorical_values) > len(preview_values):
+                values_text += ", ..."
+            details.append(f"categorical values = {values_text}")
+
+        semantic_lines.append(f"- {identifier} ({declared_type}): " + "; ".join(details))
+
+    if semantic_lines:
+        context_sections.append("Schema columns and semantic labels:\n" + "\n".join(semantic_lines))
+
+    categorical_value_guidance_text = str(
+        schema_summary.get("categorical_value_guidance_text") or ""
+    ).strip()
+    if categorical_value_guidance_text:
+        context_sections.append(
+            "Stored categorical value guidance:\n" + categorical_value_guidance_text
+        )
+
+    return "\n\n".join(section for section in context_sections if section).strip()
+
+
 def _normalize_schema_grounding_filters(
     grounded_filters: Any,
     candidate_values_by_column: dict[str, list[str]],
@@ -2999,8 +3042,8 @@ def build_combined_before_model_callback(
         include_categorical_value_guidance=active_settings.include_categorical_value_guidance,
         max_categorical_values=active_settings.max_categorical_values,
     )
-    schema_text = schema_summary.get("schema_text") or ""
-    classifier = build_llm_scope_gate(active_settings.model, schema_text)
+    scope_gate_schema_context = _build_scope_gate_schema_context(schema_summary)
+    classifier = build_llm_scope_gate(active_settings.model, scope_gate_schema_context)
     clarification_resolver = build_llm_clarification_resolver(
         active_settings.model,
         debug=active_settings.debug,
@@ -3266,14 +3309,23 @@ def build_combined_before_model_callback(
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
             if bool(callback_context.state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
-                scope_result = scope_gate(
-                    callback_context=callback_context,
-                    llm_request=llm_request,
-                    **kwargs,
-                )
+                topic_change_scope_text = raw_user_text or user_text
+                if active_settings.debug:
+                    print(f"[debug][sql-scope-gate][user-prompt]\n{topic_change_scope_text}")
+                allow, refusal = classifier(topic_change_scope_text)
+                if active_settings.debug:
+                    verdict = "IN_SCOPE" if allow else "OUT_OF_SCOPE"
+                    print(f"[debug][sql-scope-gate][verdict] {verdict}")
+                    if refusal:
+                        print(f"[debug][sql-scope-gate][refusal]\n{refusal}")
                 scope_gate_prechecked = True
-                if scope_result is not None:
-                    return scope_result
+                if not allow:
+                    return LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=refusal)],
+                        )
+                    )
 
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             if user_text:

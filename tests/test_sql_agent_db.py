@@ -502,6 +502,229 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("schema-adjacent wording", captured["system_prompt"])
         self.assertIn("near-match", captured["system_prompt"])
 
+    def test_combined_before_model_callback_builds_richer_scope_gate_context(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_build_llm_scope_gate(model: str, schema_context: str, refusal_message: str | None = None):
+            captured["schema_context"] = schema_context
+
+            def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+                return True, None
+
+            return fake_scope_gate
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption status",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"table": "filtered_dataset", "column": "gender", "values": ["Female", "Male"]},
+                    {
+                        "table": "filtered_dataset",
+                        "column": "socalc",
+                        "values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                    },
+                ],
+                "categorical_value_guidance_text": (
+                    '- filtered_dataset.gender: Stored SQLite values seen in the dataset: "Female", "Male"\n'
+                    '- filtered_dataset.socalc: Stored SQLite values seen in the dataset: "Never", "Occasionally", "Regularly", "Unknown"'
+                ),
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            side_effect=fake_build_llm_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "proceed", "grounded_filters": {}, "candidate_columns": []},
+        ):
+            build_combined_before_model_callback(
+                SQLAgentSettings(
+                    db_path=self.db_path,
+                    model="test-model",
+                )
+            )
+
+        self.assertIn("filtered_dataset(gender TEXT, socalc TEXT)", captured["schema_context"])
+        self.assertIn("Schema columns and semantic labels:", captured["schema_context"])
+        self.assertIn("field label = Sex of patient", captured["schema_context"])
+        self.assertIn("field label = Alcohol consumption status", captured["schema_context"])
+        self.assertIn("categorical values = Female, Male", captured["schema_context"])
+        self.assertIn("Stored categorical value guidance:", captured["schema_context"])
+
+    def test_combined_before_model_callback_topic_change_uses_wrapped_prompt_for_scope_gate(self) -> None:
+        scope_gate_calls: list[str] = []
+        schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
+        captured: dict[str, str] = {}
+
+        def fake_build_llm_scope_gate(model: str, schema_context: str, refusal_message: str | None = None):
+            captured["schema_context"] = schema_context
+
+            def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+                scope_gate_calls.append(user_text)
+                if (
+                    "Field glossary:" in user_text
+                    and "User question:\nhow many ladies drink" in user_text
+                    and "Sex of patient" in schema_context
+                    and "Alcohol consumption status" in schema_context
+                ):
+                    return True, None
+                return False, "blocked"
+
+            return fake_scope_gate
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            schema_grounding_calls.append((user_text, schema_context, grounding_candidates, candidate_columns))
+            return {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": ["socalc", "socsmk"],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socsmk TEXT, socalc TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption status",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                    {"column": "socsmk", "values": ["No", "Unknown", "Yes"]},
+                    {
+                        "column": "socalc",
+                        "values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                    },
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            side_effect=fake_build_llm_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(
+                SQLAgentSettings(
+                    db_path=self.db_path,
+                    model="test-model",
+                )
+            )
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "what is the max age of working professionals",
+                "sql": "SELECT MAX(age) AS maximum_age, COUNT(*) AS matching_count FROM filtered_dataset WHERE sococc = 'Employed'",
+                "categorical_filters": [
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Employed"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    }
+                ],
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "The SQLite database is a snapshot of the current filtered cohort from the web app.\n"
+                                "Use only the table `filtered_dataset`.\n\n"
+                                "Field glossary:\n"
+                                "- gender: Sex of patient (categorical)\n"
+                                "- socsmk: Smoking status (categorical)\n"
+                                "- socalc: Alcohol consumption status (categorical)\n\n"
+                                "User question:\n"
+                                "how many ladies drink"
+                            )
+                        )
+                    ],
+                )
+            ]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(scope_gate_calls), 1)
+        self.assertIn("Field glossary:", scope_gate_calls[0])
+        self.assertIn("User question:\nhow many ladies drink", scope_gate_calls[0])
+        self.assertEqual(len(schema_grounding_calls), 1)
+        self.assertIn("Sex of patient", captured["schema_context"])
+        self.assertIn("Alcohol consumption status", captured["schema_context"])
+        response_text = result.content.parts[0].text
+        self.assertIn("Which one do you mean?", response_text)
+        self.assertIn("1. Alcohol consumption status", response_text)
+        self.assertIn("2. Smoking status", response_text)
+
     def test_clarification_resolver_includes_current_topic_context(self) -> None:
         captured: dict[str, str] = {}
 
