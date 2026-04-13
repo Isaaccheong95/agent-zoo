@@ -399,12 +399,13 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
     system_prompt = (
         "You are a strict post-result refinement resolver for a dataset SQL agent.\n"
         "You will receive the previous dataset question, the previous SQL query, any categorical filters used in that query, "
-        "and the latest user reply.\n\n"
+        "any grouping columns used in that query, and the latest user reply.\n\n"
         "Reply with exactly one JSON object using this schema:\n"
         '{"resolution_type":"refine_query|needs_clarification|topic_change","target_column":"...","selected_values":["..."],"refinement_request":"..."}\n\n'
         "Rules:\n"
         "- Use resolution_type='refine_query' only when the latest reply is clearly refining or modifying the previous dataset query.\n"
         "- Use resolution_type='needs_clarification' when the latest reply is still about the previous dataset query but wants to change a categorical filter without specifying an exact final set of dataset values.\n"
+        "- Use resolution_type='needs_clarification' with target_column='' when the latest reply is still about the previous dataset query but is asking to change the grouping dimension or grouped structure without naming a final exact dataset field.\n"
         "- Use resolution_type='topic_change' when the latest reply starts a fresh dataset question that should be answered from scratch, or when it is unrelated to the previous dataset query. A fresh dataset question can still be fully in scope.\n"
         "- Treat a complete standalone dataset question as topic_change even if it overlaps with the previous subject. Example: previous question = 'total non-working'; latest reply = 'give me the avg age of females' => topic_change.\n"
         "- Treat short or long multi-part edit requests as refine_query when they are clearly modifying the previous dataset query. Example: 'remove unk, include males only below 34' => refine_query.\n"
@@ -412,7 +413,7 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
         "- target_column must be one of the provided categorical filter columns or an empty string.\n"
         "- selected_values must contain only exact dataset values available for target_column and should represent the full updated set of values to use when resolution_type='refine_query'.\n"
         "- When the user both changes exact categorical values and requests another same-query modification, keep both: put the categorical values in selected_values and keep the remaining same-query modification in refinement_request. selected_values may coexist with refinement_request for refine_query.\n"
-        "- When resolution_type='needs_clarification', selected_values must be empty.\n"
+        "- When resolution_type='needs_clarification', selected_values must be empty. Put the ambiguous user request in refinement_request if it helps the caller build the clarification.\n"
         "- When resolution_type='topic_change', target_column must be empty, selected_values must be empty, and refinement_request must be empty.\n"
         "- Use refinement_request for the same-query change when the user is refining the previous query but not by selecting exact categorical values.\n"
         "- Output JSON only. No markdown fences or extra text."
@@ -470,6 +471,12 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
                     f"- {column_name}: previous = {previous_values}; current = {current_values}; added = {added_values}; removed = {removed_values}"
                 )
         refinement_history_text = "\n".join(refinement_history_lines) if refinement_history_lines else "[none]"
+        grouping_columns = [
+            str(column).strip()
+            for column in (last_query_frame.get("group_columns") or [])
+            if isinstance(column, str) and str(column).strip()
+        ]
+        grouping_text = ", ".join(grouping_columns) if grouping_columns else "[none]"
 
         classifier_input = (
             "Current committed dataset question/topic:\n"
@@ -480,6 +487,8 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
             f"{previous_sql}\n\n"
             "Categorical filters from the current committed query:\n"
             f"{filter_text}\n\n"
+            "Grouping columns from the current committed query:\n"
+            f"{grouping_text}\n\n"
             "Recent categorical refinement history:\n"
             f"{refinement_history_text}\n\n"
             "Latest user reply:\n"
@@ -542,12 +551,12 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
                 "selected_values": [],
                 "refinement_request": "",
             }
-        if resolution_type == "needs_clarification" and target_column:
+        if resolution_type == "needs_clarification":
             return {
                 "resolution_type": "needs_clarification",
                 "target_column": target_column,
                 "selected_values": [],
-                "refinement_request": "",
+                "refinement_request": normalized_refinement_request,
             }
         if resolution_type == "refine_query":
             if target_column and selected_values:
@@ -577,7 +586,14 @@ def build_llm_result_refinement_resolver(model: str, *, debug: bool = False):
                 "resolution_type": "needs_clarification",
                 "target_column": target_column,
                 "selected_values": [],
-                "refinement_request": "",
+                "refinement_request": normalized_refinement_request,
+            }
+        if grouping_columns and normalized_refinement_request:
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": normalized_refinement_request,
             }
         if normalized_refinement_request:
             return {

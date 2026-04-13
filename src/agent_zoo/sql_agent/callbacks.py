@@ -417,6 +417,18 @@ def _build_query_frame_topic_context(query_frame: dict[str, Any]) -> str:
             "Current committed comparison filters:\n" + "\n".join(comparison_lines)
         )
 
+    group_columns = [
+        column
+        for column in query_frame.get("group_columns") or []
+        if isinstance(column, str) and column.strip()
+    ]
+    if group_columns:
+        context_sections.append(
+            "Current committed grouping columns:\n" + "\n".join(
+                f"- {column}" for column in group_columns
+            )
+        )
+
     return "\n\n".join(context_sections).strip()
 
 
@@ -1303,6 +1315,23 @@ def _build_last_query_frame(
     )
     if comparison_filters:
         query_frame["comparison_filters"] = comparison_filters
+    group_columns = [
+        str(column).strip()
+        for column in (tool_response.get("group_columns") or [])
+        if isinstance(column, str) and str(column).strip()
+    ]
+    if not group_columns and _sql_has_top_level_group_by(raw_sql):
+        group_columns = [
+            column
+            for column in (tool_response.get("columns") or [])
+            if isinstance(column, str)
+            and column.strip()
+            and not _is_count_column(column)
+            and not _is_safe_aggregate_column(column)
+        ]
+    if group_columns:
+        query_frame["is_grouped"] = True
+        query_frame["group_columns"] = _ordered_unique_values(group_columns)
     topic_context = _build_query_frame_topic_context(query_frame)
     if topic_context:
         query_frame["topic_context"] = topic_context
@@ -1720,7 +1749,16 @@ def _resolve_pending_clarification_reply(
 def _build_result_refinement_clarification(
     last_query_frame: dict[str, Any],
     target_column: str,
+    refinement_request: str = "",
 ) -> dict[str, Any] | None:
+    grouped_clarification = _build_result_refinement_grouping_change_clarification(
+        last_query_frame,
+        refinement_request,
+        target_column=target_column,
+    )
+    if grouped_clarification is not None:
+        return grouped_clarification
+
     if not target_column:
         return None
 
@@ -1770,6 +1808,52 @@ def _build_result_refinement_clarification(
     if query_context:
         clarification["query_context"] = query_context
     clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
+    return clarification
+
+
+def _build_result_refinement_grouping_change_clarification(
+    last_query_frame: dict[str, Any],
+    refinement_request: str,
+    *,
+    target_column: str = "",
+) -> dict[str, Any] | None:
+    if target_column:
+        return None
+
+    group_columns = [
+        column
+        for column in (last_query_frame.get("group_columns") or [])
+        if isinstance(column, str) and column.strip()
+    ]
+    if not group_columns or not bool(last_query_frame.get("is_grouped")):
+        return None
+
+    previous_question = _get_query_frame_question_text(last_query_frame)
+    quoted_group_columns = ", ".join(group_columns)
+    normalized_request = str(refinement_request or "").strip()
+
+    message_parts = []
+    if previous_question:
+        message_parts.append(f"Your previous question was: {previous_question}.")
+    message_parts.append(
+        "I understood this as a request to change what the grouped result is grouped by, "
+        f"but the previous query was grouped by {quoted_group_columns}."
+    )
+    if normalized_request:
+        message_parts.append(f"Latest grouping change request: {normalized_request}.")
+    message_parts.append("Which exact field or category should I group by instead?")
+
+    clarification = build_clarification_response(
+        " ".join(message_parts),
+        clarification_kind=CLARIFICATION_KIND_GENERIC,
+    )
+    if previous_question:
+        clarification["topic_context"] = previous_question
+    query_context = str(last_query_frame.get("topic_context") or "").strip()
+    if query_context:
+        clarification["query_context"] = query_context
+    clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
+    clarification["grouping_change_request"] = normalized_request
     return clarification
 
 
@@ -3312,7 +3396,17 @@ def build_combined_before_model_callback(
                     clarification = _build_result_refinement_clarification(
                         last_query_frame,
                         str(refinement_resolution.get("target_column") or "").strip(),
+                        str(refinement_resolution.get("refinement_request") or "").strip(),
                     )
+                    if clarification is None:
+                        clarification = build_fallback_clarification_response()
+                        previous_question = _get_query_frame_question_text(last_query_frame)
+                        if previous_question:
+                            clarification["topic_context"] = previous_question
+                        query_context = str(last_query_frame.get("topic_context") or "").strip()
+                        if query_context:
+                            clarification["query_context"] = query_context
+                        clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
                     if clarification is not None:
                         _set_pending_clarification_state(callback_context.state, clarification)
                         topic_context = clarification.get("topic_context")

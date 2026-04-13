@@ -900,6 +900,57 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             captured["user_prompt"],
         )
 
+    def test_result_refinement_resolver_preserves_grouping_clarification_request(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=(
+                                '{"resolution_type":"needs_clarification","target_column":"",'
+                                '"selected_values":[],"refinement_request":"use other categories instead"}'
+                            )
+                        )
+                    )
+                ]
+            )
+
+        resolver = build_llm_result_refinement_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                {
+                    "question": "number of males for each diagnosed cancer type",
+                    "sql": (
+                        "SELECT parent_category, COUNT(*) AS matching_count "
+                        "FROM filtered_dataset WHERE gender = 'Male' GROUP BY parent_category"
+                    ),
+                    "categorical_filters": [
+                        {"column": "gender", "selected_values": ["Male"], "available_values": ["Male", "Female"]},
+                    ],
+                    "is_grouped": True,
+                    "group_columns": ["parent_category"],
+                },
+                "use other categories instead",
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "needs_clarification",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "use other categories instead",
+            },
+        )
+        self.assertIn("change the grouping dimension", captured["system_prompt"])
+        self.assertIn("Grouping columns from the current committed query", captured["user_prompt"])
+        self.assertIn("parent_category", captured["user_prompt"])
+
     def test_result_refinement_resolver_fails_closed_on_invalid_output(self) -> None:
         def completion(**kwargs):
             return SimpleNamespace(
@@ -3475,6 +3526,41 @@ I need clarification on your question. Could you please specify which category o
             "how many males are not working",
         )
 
+    def test_after_model_callback_falls_back_for_grouping_prose_option_debris(self) -> None:
+        callback = build_normalize_clarification_after_model_callback(self._settings())
+        state: dict[str, object] = {
+            SQL_LAST_USER_TEXT_STATE_KEY: "use other categories instead",
+        }
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_response=SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "Clarification needed.\n"
+                                "- previous query grouped by parent_category\n"
+                                "- SELECT parent_category, COUNT(*) FROM filtered_dataset GROUP BY parent_category\n"
+                                "- latest user reply"
+                            )
+                        )
+                    ],
+                )
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertEqual(
+            response_text,
+            "I need clarification before I can run the query. Please specify the exact category, value, or rule you want me to use.",
+        )
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(pending_clarification["options"], [])
+
     def test_after_model_callback_recovers_from_truncated_clarification_json(self) -> None:
         callback = build_normalize_clarification_after_model_callback(self._settings())
         raw_response = """Which category do you mean by 'alcoholics'?\",\"options\":[\"Regularly (regular alcohol consumption)\",\"Occasionally (occasional drinking)\",\"Never (no alcohol)\",\"Unknown (missing data)\"]}
@@ -5579,6 +5665,15 @@ Which category or combination should I use for \"alcoholic\"?
             ),
         )
 
+        current_query_frame = get_sql_current_query_frame(state)
+        self.assertIsNotNone(current_query_frame)
+        self.assertTrue(current_query_frame["is_grouped"])
+        self.assertEqual(current_query_frame["group_columns"], ["parent_category"])
+        self.assertIn(
+            "Current committed grouping columns:\n- parent_category",
+            current_query_frame["topic_context"],
+        )
+
         second_request = SimpleNamespace(
             contents=[types.Content(role="user", parts=[types.Part(text="1 and 2")])]
         )
@@ -5605,6 +5700,89 @@ Which category or combination should I use for \"alcoholic\"?
             rewritten_text,
         )
         self.assertIn("User clarification reply: 1 and 2", rewritten_text)
+
+    def test_combined_before_model_callback_returns_grouping_change_clarification(self) -> None:
+        scope_gate_calls: list[str] = []
+        refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def fake_result_refinement_resolver(frame: dict[str, object], user_text: str) -> dict[str, object]:
+            refinement_resolver_calls.append((frame, user_text))
+            return {
+                "resolution_type": "needs_clarification",
+                "target_column": "",
+                "selected_values": [],
+                "refinement_request": "use other categories instead",
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, parent_category TEXT, lymsub TEXT)",
+                "tables": [],
+                "categorical_value_guidance": [
+                    {"column": "gender", "values": ["Female", "Male"]},
+                ],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=fake_result_refinement_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "number of males for each diagnosed cancer type",
+                "sql": (
+                    "SELECT parent_category, COUNT(*) AS matching_count "
+                    "FROM filtered_dataset WHERE gender = 'Male' GROUP BY parent_category"
+                ),
+                "categorical_filters": [
+                    {"column": "gender", "selected_values": ["Male"], "available_values": ["Female", "Male"]},
+                ],
+                "is_grouped": True,
+                "group_columns": ["parent_category"],
+                "topic_context": (
+                    "Current committed dataset question/topic: number of males for each diagnosed cancer type\n\n"
+                    "Current committed categorical filters:\n- gender = Male\n\n"
+                    "Current committed grouping columns:\n- parent_category"
+                ),
+            },
+        )
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="use other categories instead")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(len(refinement_resolver_calls), 1)
+        response_text = result.content.parts[0].text
+        self.assertIn("Which exact field or category should I group by instead?", response_text)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(pending_clarification["options"], [])
+        self.assertEqual(
+            pending_clarification["grouping_change_request"],
+            "use other categories instead",
+        )
 
     def test_combined_before_model_callback_skips_scope_gate_when_fresh_topic_router_marks_dataset_question(self) -> None:
         scope_gate_calls: list[str] = []
