@@ -112,6 +112,10 @@ def _clean_option_text(value: str, *, clarification_kind: str | None = None) -> 
     if clarification_kind == CLARIFICATION_KIND_INTERPRETATION:
         if any(char in candidate for char in "{}[]"):
             return None
+        if "`" in candidate or "|" in candidate:
+            return None
+        if re.search(r"\b(?:select|from|where|group\s+by|order\s+by|having|limit)\b", candidate, flags=re.IGNORECASE):
+            return None
         if candidate.endswith(("?", ".", ":", ";")):
             return None
         if len(candidate.split()) > 12 or len(candidate) > 120:
@@ -130,6 +134,16 @@ def _clean_option_text(value: str, *, clarification_kind: str | None = None) -> 
             candidate = base_candidate
 
     if any(char in candidate for char in "{}[]"):
+        return None
+    if "`" in candidate or "|" in candidate or ":" in candidate:
+        return None
+    if re.search(
+        r"\b(?:select|from|where|group\s+by|order\s+by|having|limit|previous\s+query|latest\s+request|current\s+query|user\s+reply)\b",
+        candidate,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    if re.match(r"^(?:the|if|when|use|current|previous|latest)\b", candidate, flags=re.IGNORECASE):
         return None
     if candidate.endswith(("?", ".", ":", ";")):
         return None

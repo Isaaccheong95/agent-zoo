@@ -43,6 +43,7 @@ try:
     from ..scope_guard import (
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_fresh_topic_relevance_router,
         build_llm_result_refinement_resolver,
         build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
@@ -51,6 +52,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
     from scope_guard import (  # type: ignore[no-redef]
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_fresh_topic_relevance_router,
         build_llm_result_refinement_resolver,
         build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
@@ -65,9 +67,15 @@ SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
 SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_frame"
 SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY = "temp:sql_fresh_topic_clarification"
+SQL_META_OR_CONVERSATIONAL_MESSAGE = (
+    "I can help with questions about the current dataset. If you want to continue, "
+    "ask a dataset question about the filtered cohort, its schema, filters, SQL "
+    "queries, or aggregated results."
+)
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
 SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
+SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY = "recent_interpretation_clarification"
 SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -148,6 +156,15 @@ def _clear_fresh_topic_clarification_state(state: Any) -> None:
         state[SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY] = None
 
 
+def _clear_refinement_source_query_frame_state(state: Any) -> None:
+    if state is None:
+        return
+    if hasattr(state, "pop"):
+        state.pop(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY, None)
+    elif SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY in state:
+        state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = None
+
+
 def _mark_fresh_topic_clarification_state(state: Any) -> None:
     if state is None:
         return
@@ -172,6 +189,14 @@ def _get_last_query_frame(state: Any) -> dict[str, Any] | None:
     return query_frame if isinstance(query_frame, dict) else None
 
 
+def _get_recent_interpretation_clarification(state: Any) -> dict[str, Any] | None:
+    clarification = _get_sql_working_memory_value(
+        state,
+        SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY,
+    )
+    return clarification if isinstance(clarification, dict) else None
+
+
 def _get_sql_working_memory_value(state: Any, field_name: str) -> Any:
     return get_agent_working_memory_value(state, SQL_WORKING_MEMORY_NAMESPACE, field_name)
 
@@ -192,6 +217,40 @@ def _set_last_query_frame_state(
     query_frame: dict[str, Any] | None,
 ) -> None:
     _set_sql_working_memory_value(state, SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY, query_frame)
+
+
+def _set_recent_interpretation_clarification_state(
+    state: Any,
+    clarification: dict[str, Any] | None,
+) -> None:
+    _set_sql_working_memory_value(
+        state,
+        SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY,
+        clarification,
+    )
+
+
+def _restore_topic_state(
+    state: Any,
+    previous_last_user_text: str | None,
+    previous_active_query_topic: str | None,
+) -> None:
+    if state is None:
+        return
+
+    if previous_last_user_text and previous_last_user_text.strip():
+        state[SQL_LAST_USER_TEXT_STATE_KEY] = previous_last_user_text.strip()
+    elif hasattr(state, "pop"):
+        state.pop(SQL_LAST_USER_TEXT_STATE_KEY, None)
+    elif SQL_LAST_USER_TEXT_STATE_KEY in state:
+        state[SQL_LAST_USER_TEXT_STATE_KEY] = None
+
+    if previous_active_query_topic and previous_active_query_topic.strip():
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_active_query_topic.strip()
+    elif hasattr(state, "pop"):
+        state.pop(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY, None)
+    elif SQL_ACTIVE_QUERY_TOPIC_STATE_KEY in state:
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = None
 
 
 def _ordered_unique_values(values: list[str]) -> list[str]:
@@ -358,6 +417,18 @@ def _build_query_frame_topic_context(query_frame: dict[str, Any]) -> str:
             "Current committed comparison filters:\n" + "\n".join(comparison_lines)
         )
 
+    group_columns = [
+        column
+        for column in query_frame.get("group_columns") or []
+        if isinstance(column, str) and column.strip()
+    ]
+    if group_columns:
+        context_sections.append(
+            "Current committed grouping columns:\n" + "\n".join(
+                f"- {column}" for column in group_columns
+            )
+        )
+
     return "\n\n".join(context_sections).strip()
 
 
@@ -383,6 +454,56 @@ def _select_pending_clarification_topic_text(clarification: dict[str, Any]) -> s
     if isinstance(topic_context, str) and topic_context.strip():
         return topic_context.strip()
     return None
+
+
+def _build_recent_interpretation_clarification(
+    clarification: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(clarification, dict):
+        return None
+
+    clarification_kind = str(clarification.get("clarification_kind") or "").strip().lower()
+    if clarification_kind != CLARIFICATION_KIND_INTERPRETATION:
+        return None
+
+    options = [
+        option
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    ]
+    if not options:
+        return None
+
+    recent_clarification: dict[str, Any] = {
+        "options": options,
+        "clarification_kind": CLARIFICATION_KIND_INTERPRETATION,
+    }
+
+    user_message = str(clarification.get("user_message") or "").strip()
+    if user_message:
+        recent_clarification["user_message"] = user_message
+
+    topic_context = _select_pending_clarification_topic_text(clarification)
+    if topic_context:
+        recent_clarification["topic_context"] = topic_context
+
+    query_context = clarification.get("query_context")
+    if isinstance(query_context, str) and query_context.strip():
+        recent_clarification["query_context"] = query_context.strip()
+
+    option_columns = clarification.get("option_columns")
+    if isinstance(option_columns, dict) and option_columns:
+        recent_clarification["option_columns"] = copy.deepcopy(option_columns)
+
+    grounded_filters = clarification.get("grounded_filters")
+    if isinstance(grounded_filters, dict) and grounded_filters:
+        recent_clarification["grounded_filters"] = copy.deepcopy(grounded_filters)
+
+    base_query_frame = clarification.get("base_query_frame")
+    if isinstance(base_query_frame, dict):
+        recent_clarification["base_query_frame"] = copy.deepcopy(base_query_frame)
+
+    return recent_clarification
 
 
 def _build_recent_refinement(
@@ -801,6 +922,49 @@ def _iter_schema_grounding_columns(schema_summary: dict[str, Any]) -> list[tuple
     return schema_columns
 
 
+def _build_scope_gate_schema_context(schema_summary: dict[str, Any]) -> str:
+    context_sections: list[str] = []
+
+    schema_text = str(schema_summary.get("schema_text") or "").strip()
+    if schema_text:
+        context_sections.append(schema_text)
+
+    semantic_lines: list[str] = []
+    for identifier, column_name, column in _iter_schema_grounding_columns(schema_summary):
+        declared_type = str(column.get("type") or "TEXT").strip() or "TEXT"
+        field_label = _humanize_schema_label(str(column.get("source_header") or ""))
+        if not field_label:
+            field_label = _humanize_schema_label(column_name) or identifier
+
+        details = [f"field label = {field_label}"]
+        categorical_values = [
+            value.strip()
+            for value in column.get("categorical_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if categorical_values:
+            preview_values = categorical_values[:4]
+            values_text = ", ".join(preview_values)
+            if len(categorical_values) > len(preview_values):
+                values_text += ", ..."
+            details.append(f"categorical values = {values_text}")
+
+        semantic_lines.append(f"- {identifier} ({declared_type}): " + "; ".join(details))
+
+    if semantic_lines:
+        context_sections.append("Schema columns and semantic labels:\n" + "\n".join(semantic_lines))
+
+    categorical_value_guidance_text = str(
+        schema_summary.get("categorical_value_guidance_text") or ""
+    ).strip()
+    if categorical_value_guidance_text:
+        context_sections.append(
+            "Stored categorical value guidance:\n" + categorical_value_guidance_text
+        )
+
+    return "\n\n".join(section for section in context_sections if section).strip()
+
+
 def _normalize_schema_grounding_filters(
     grounded_filters: Any,
     candidate_values_by_column: dict[str, list[str]],
@@ -1126,7 +1290,9 @@ def _build_last_query_frame(
     if not isinstance(active_query_topic, str) or not active_query_topic.strip():
         return None
 
-    raw_sql = args.get("sql") if isinstance(args, dict) else None
+    raw_sql = tool_response.get("display_sql")
+    if not isinstance(raw_sql, str) or not raw_sql.strip():
+        raw_sql = args.get("sql") if isinstance(args, dict) else None
     if not isinstance(raw_sql, str) or not raw_sql.strip():
         raw_sql = tool_response.get("sql")
     if not isinstance(raw_sql, str) or not raw_sql.strip():
@@ -1149,6 +1315,23 @@ def _build_last_query_frame(
     )
     if comparison_filters:
         query_frame["comparison_filters"] = comparison_filters
+    group_columns = [
+        str(column).strip()
+        for column in (tool_response.get("group_columns") or [])
+        if isinstance(column, str) and str(column).strip()
+    ]
+    if not group_columns and _sql_has_top_level_group_by(raw_sql):
+        group_columns = [
+            column
+            for column in (tool_response.get("columns") or [])
+            if isinstance(column, str)
+            and column.strip()
+            and not _is_count_column(column)
+            and not _is_safe_aggregate_column(column)
+        ]
+    if group_columns:
+        query_frame["is_grouped"] = True
+        query_frame["group_columns"] = _ordered_unique_values(group_columns)
     topic_context = _build_query_frame_topic_context(query_frame)
     if topic_context:
         query_frame["topic_context"] = topic_context
@@ -1262,6 +1445,23 @@ def _prune_topic_context_option(
     normalized_clarification = dict(clarification)
     normalized_clarification["options"] = pruned_options
     return normalized_clarification
+
+
+def _build_clarification_guidance_match_text(clarification: dict[str, Any]) -> str:
+    if not isinstance(clarification, dict):
+        return ""
+
+    text_parts: list[str] = []
+    user_message = str(clarification.get("user_message") or "").strip()
+    if user_message:
+        text_parts.append(user_message)
+
+    text_parts.extend(
+        option.strip()
+        for option in clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    )
+    return "\n".join(text_parts).strip()
 
 
 def _match_clarification_values_to_schema_guidance(
@@ -1549,7 +1749,16 @@ def _resolve_pending_clarification_reply(
 def _build_result_refinement_clarification(
     last_query_frame: dict[str, Any],
     target_column: str,
+    refinement_request: str = "",
 ) -> dict[str, Any] | None:
+    grouped_clarification = _build_result_refinement_grouping_change_clarification(
+        last_query_frame,
+        refinement_request,
+        target_column=target_column,
+    )
+    if grouped_clarification is not None:
+        return grouped_clarification
+
     if not target_column:
         return None
 
@@ -1599,6 +1808,52 @@ def _build_result_refinement_clarification(
     if query_context:
         clarification["query_context"] = query_context
     clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
+    return clarification
+
+
+def _build_result_refinement_grouping_change_clarification(
+    last_query_frame: dict[str, Any],
+    refinement_request: str,
+    *,
+    target_column: str = "",
+) -> dict[str, Any] | None:
+    if target_column:
+        return None
+
+    group_columns = [
+        column
+        for column in (last_query_frame.get("group_columns") or [])
+        if isinstance(column, str) and column.strip()
+    ]
+    if not group_columns or not bool(last_query_frame.get("is_grouped")):
+        return None
+
+    previous_question = _get_query_frame_question_text(last_query_frame)
+    quoted_group_columns = ", ".join(group_columns)
+    normalized_request = str(refinement_request or "").strip()
+
+    message_parts = []
+    if previous_question:
+        message_parts.append(f"Your previous question was: {previous_question}.")
+    message_parts.append(
+        "I understood this as a request to change what the grouped result is grouped by, "
+        f"but the previous query was grouped by {quoted_group_columns}."
+    )
+    if normalized_request:
+        message_parts.append(f"Latest grouping change request: {normalized_request}.")
+    message_parts.append("Which exact field or category should I group by instead?")
+
+    clarification = build_clarification_response(
+        " ".join(message_parts),
+        clarification_kind=CLARIFICATION_KIND_GENERIC,
+    )
+    if previous_question:
+        clarification["topic_context"] = previous_question
+    query_context = str(last_query_frame.get("topic_context") or "").strip()
+    if query_context:
+        clarification["query_context"] = query_context
+    clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
+    clarification["grouping_change_request"] = normalized_request
     return clarification
 
 
@@ -1764,6 +2019,9 @@ def _apply_grounded_filter_followup(
     llm_request,
     user_text: str,
     grounded_filters: dict[str, list[str]],
+    *,
+    resolved_columns: list[str] | None = None,
+    option_labels: dict[str, str] | None = None,
 ) -> bool:
     if not user_text:
         return False
@@ -1783,11 +2041,30 @@ def _apply_grounded_filter_followup(
         return False
 
     rewritten_sections = [
-        "The user's dataset request already grounds some categorical filters from the original wording.",
-        f"Original dataset request: {user_text}",
-        "Grounded categorical filters:\n" + "\n".join(grounded_lines),
-        "Use these grounded filters directly when interpreting the dataset request and continue from there.",
+        "Answer the user's current dataset question below. This is the current question for this turn, not background context.",
+        f"Current dataset question: {user_text}",
+        "Grounded categorical filters already implied by the same question:\n" + "\n".join(grounded_lines),
     ]
+
+    resolved_field_lines: list[str] = []
+    for column_name in resolved_columns or []:
+        if not isinstance(column_name, str) or not column_name.strip():
+            continue
+        normalized_column_name = column_name.strip()
+        resolved_label = str((option_labels or {}).get(normalized_column_name) or "").strip()
+        if resolved_label and resolved_label != normalized_column_name:
+            resolved_field_lines.append(f"- {resolved_label} ({normalized_column_name})")
+        else:
+            resolved_field_lines.append(f"- {normalized_column_name}")
+
+    if resolved_field_lines:
+        rewritten_sections.append(
+            "Resolved schema field already implied by the same question:\n" + "\n".join(resolved_field_lines)
+        )
+
+    rewritten_sections.extend([
+        "Use these grounded filters when answering the current dataset question.",
+    ])
     return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
 
 
@@ -2729,9 +3006,10 @@ def build_normalize_clarification_after_model_callback(
                 "low_confidence_normalization",
             )
 
+        clarification_match_text = _build_clarification_guidance_match_text(clarification) or response_text
         clarification = _match_clarification_values_to_schema_guidance(
             clarification,
-            response_text,
+            clarification_match_text,
             categorical_value_guidance,
         )
 
@@ -2887,10 +3165,15 @@ def build_combined_before_model_callback(
         include_categorical_value_guidance=active_settings.include_categorical_value_guidance,
         max_categorical_values=active_settings.max_categorical_values,
     )
-    schema_text = schema_summary.get("schema_text") or ""
-    classifier = build_llm_scope_gate(active_settings.model, schema_text)
+    scope_gate_schema_context = _build_scope_gate_schema_context(schema_summary)
+    classifier = build_llm_scope_gate(active_settings.model, scope_gate_schema_context)
     clarification_resolver = build_llm_clarification_resolver(
         active_settings.model,
+        debug=active_settings.debug,
+    )
+    fresh_topic_router = build_llm_fresh_topic_relevance_router(
+        active_settings.model,
+        scope_gate_schema_context,
         debug=active_settings.debug,
     )
     result_refinement_resolver = build_llm_result_refinement_resolver(
@@ -2906,11 +3189,19 @@ def build_combined_before_model_callback(
     finalize = build_finalize_after_query_before_model_callback()
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
+        scope_gate_prechecked = False
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
             _clear_fresh_topic_clarification_state(callback_context.state)
+            previous_last_user_text = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+            if not isinstance(previous_last_user_text, str):
+                previous_last_user_text = None
+            previous_active_query_topic = callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+            if not isinstance(previous_active_query_topic, str):
+                previous_active_query_topic = None
             raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             topic_text = ""
+            fresh_topic_previous_topic = ""
             if user_text:
                 topic_text = _extract_topic_context_text(user_text)
                 callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
@@ -2956,6 +3247,14 @@ def build_combined_before_model_callback(
                             "before-model-followup-rewritten",
                             _extract_last_user_text(llm_request),
                         )
+                        recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                            pending_clarification
+                        )
+                        if recent_interpretation_clarification is not None:
+                            _set_recent_interpretation_clarification_state(
+                                callback_context.state,
+                                recent_interpretation_clarification,
+                            )
                         _clear_pending_clarification_state(callback_context.state)
                 else:
                     clarification_resolution = _resolve_pending_clarification_reply(
@@ -2973,6 +3272,9 @@ def build_combined_before_model_callback(
                             active_settings,
                             "before-model-topic-router-decision",
                             "TOPIC_CHANGE",
+                        )
+                        fresh_topic_previous_topic = (
+                            _select_pending_clarification_topic_text(pending_clarification) or ""
                         )
                         _mark_fresh_topic_clarification_state(callback_context.state)
                         _clear_pending_clarification_state(callback_context.state)
@@ -3003,6 +3305,15 @@ def build_combined_before_model_callback(
                                 "before-model-followup-rewritten",
                                 _extract_last_user_text(llm_request),
                             )
+                            if clarification_resolution.get("selected_options"):
+                                recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                                    pending_clarification
+                                )
+                                if recent_interpretation_clarification is not None:
+                                    _set_recent_interpretation_clarification_state(
+                                        callback_context.state,
+                                        recent_interpretation_clarification,
+                                    )
                             _clear_pending_clarification_state(callback_context.state)
             if clarification_followup:
                 _print_clarification_debug(
@@ -3011,6 +3322,56 @@ def build_combined_before_model_callback(
                     "continuing clarification flow without scope gate",
                 )
                 return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+            recent_interpretation_clarification = _get_recent_interpretation_clarification(
+                callback_context.state
+            )
+            if recent_interpretation_clarification is not None:
+                recent_options = [
+                    option
+                    for option in recent_interpretation_clarification.get("options") or []
+                    if isinstance(option, str) and option.strip()
+                ]
+                matched_recent_options = _extract_matching_clarification_options(
+                    user_text,
+                    recent_options,
+                )
+                if matched_recent_options:
+                    _print_clarification_debug(
+                        active_settings,
+                        "before-model-option-matches",
+                        matched_recent_options,
+                    )
+                    clarification_followup = _apply_pending_clarification_followup_with_resolution(
+                        llm_request,
+                        recent_interpretation_clarification,
+                        user_text,
+                        matched_options=matched_recent_options,
+                    )
+                    if clarification_followup:
+                        base_query_frame = recent_interpretation_clarification.get("base_query_frame")
+                        if isinstance(base_query_frame, dict):
+                            callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                base_query_frame
+                            )
+                        topic_context = _select_pending_clarification_topic_text(
+                            recent_interpretation_clarification
+                        )
+                        if isinstance(topic_context, str) and topic_context.strip():
+                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-followup-rewritten",
+                            _extract_last_user_text(llm_request),
+                        )
+                        _set_recent_interpretation_clarification_state(callback_context.state, None)
+                        _print_clarification_debug(
+                            active_settings,
+                            "before-model-branch",
+                            "continuing clarification flow without scope gate",
+                        )
+                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+                _set_recent_interpretation_clarification_state(callback_context.state, None)
 
             last_query_frame = _get_last_query_frame(callback_context.state)
             if last_query_frame is not None:
@@ -3029,12 +3390,23 @@ def build_combined_before_model_callback(
                 )
                 refinement_type = refinement_resolution.get("resolution_type")
                 if refinement_type == "topic_change":
+                    fresh_topic_previous_topic = _get_query_frame_question_text(last_query_frame)
                     _mark_fresh_topic_clarification_state(callback_context.state)
                 if refinement_type == "needs_clarification":
                     clarification = _build_result_refinement_clarification(
                         last_query_frame,
                         str(refinement_resolution.get("target_column") or "").strip(),
+                        str(refinement_resolution.get("refinement_request") or "").strip(),
                     )
+                    if clarification is None:
+                        clarification = build_fallback_clarification_response()
+                        previous_question = _get_query_frame_question_text(last_query_frame)
+                        if previous_question:
+                            clarification["topic_context"] = previous_question
+                        query_context = str(last_query_frame.get("topic_context") or "").strip()
+                        if query_context:
+                            clarification["query_context"] = query_context
+                        clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
                     if clarification is not None:
                         _set_pending_clarification_state(callback_context.state, clarification)
                         topic_context = clarification.get("topic_context")
@@ -3084,6 +3456,50 @@ def build_combined_before_model_callback(
                             "continuing result refinement flow without scope gate",
                         )
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+
+            if bool(callback_context.state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
+                _set_recent_interpretation_clarification_state(callback_context.state, None)
+                fresh_topic_routing = fresh_topic_router(raw_user_text or user_text, fresh_topic_previous_topic)
+                routing_type = str(fresh_topic_routing.get("resolution_type") or "dataset_question").strip().lower()
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-fresh-topic-routing",
+                    {
+                        "current_topic": fresh_topic_previous_topic,
+                        "resolution_type": routing_type,
+                        "user_text": raw_user_text or user_text,
+                    },
+                )
+                if routing_type == "out_of_scope":
+                    _restore_topic_state(
+                        callback_context.state,
+                        previous_last_user_text,
+                        previous_active_query_topic,
+                    )
+                    _clear_refinement_source_query_frame_state(callback_context.state)
+                    _clear_fresh_topic_clarification_state(callback_context.state)
+                    return LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=DEFAULT_REFUSAL_MESSAGE)],
+                        )
+                    )
+                if routing_type == "meta_or_conversational":
+                    _restore_topic_state(
+                        callback_context.state,
+                        previous_last_user_text,
+                        previous_active_query_topic,
+                    )
+                    _clear_refinement_source_query_frame_state(callback_context.state)
+                    _clear_fresh_topic_clarification_state(callback_context.state)
+                    return LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=SQL_META_OR_CONVERSATIONAL_MESSAGE)],
+                        )
+                    )
+                _clear_refinement_source_query_frame_state(callback_context.state)
+                scope_gate_prechecked = True
 
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             if user_text:
@@ -3137,6 +3553,13 @@ def build_combined_before_model_callback(
                     and identifier.strip()
                     and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
                 ]
+                resolved_grounding_columns = [
+                    identifier
+                    for identifier in grounding_resolution.get("resolved_columns") or []
+                    if isinstance(identifier, str)
+                    and identifier.strip()
+                    and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
+                ]
                 _print_clarification_debug(
                     active_settings,
                     "before-model-schema-grounding-resolution",
@@ -3144,6 +3567,7 @@ def build_combined_before_model_callback(
                         **grounding_resolution,
                         "grounded_filters": grounded_filters,
                         "candidate_columns": resolved_candidate_columns,
+                        "resolved_columns": resolved_grounding_columns,
                     },
                 )
                 if grounding_resolution.get("resolution_type") == "needs_clarification" and len(resolved_candidate_columns) >= 2:
@@ -3173,6 +3597,12 @@ def build_combined_before_model_callback(
                         llm_request,
                         user_text,
                         grounded_filters,
+                        resolved_columns=resolved_grounding_columns,
+                        option_labels={
+                            str(identifier): str(label)
+                            for identifier, label in (filtered_schema_grounding_catalog.get("option_labels") or {}).items()
+                            if isinstance(identifier, str) and isinstance(label, str)
+                        },
                     )
                     if grounded_followup:
                         _print_clarification_debug(
@@ -3187,9 +3617,10 @@ def build_combined_before_model_callback(
                         )
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-        result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
-        if result is not None:
-            return result
+        if not scope_gate_prechecked:
+            result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
+            if result is not None:
+                return result
         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
     return combined
