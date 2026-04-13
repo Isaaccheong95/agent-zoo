@@ -43,6 +43,7 @@ try:
     from ..scope_guard import (
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_fresh_topic_relevance_router,
         build_llm_result_refinement_resolver,
         build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
@@ -51,6 +52,7 @@ except ImportError:  # Support ADK loading this package as top-level `sql_agent`
     from scope_guard import (  # type: ignore[no-redef]
         DEFAULT_REFUSAL_MESSAGE,
         build_llm_clarification_resolver,
+        build_llm_fresh_topic_relevance_router,
         build_llm_result_refinement_resolver,
         build_llm_schema_grounding_resolver,
         build_llm_scope_gate,
@@ -65,6 +67,11 @@ SQL_LAST_USER_TEXT_STATE_KEY = "temp:sql_last_user_text"
 SQL_ACTIVE_QUERY_TOPIC_STATE_KEY = "temp:sql_active_query_topic"
 SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY = "temp:sql_refinement_source_query_frame"
 SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY = "temp:sql_fresh_topic_clarification"
+SQL_META_OR_CONVERSATIONAL_MESSAGE = (
+    "I can help with questions about the current dataset. If you want to continue, "
+    "ask a dataset question about the filtered cohort, its schema, filters, SQL "
+    "queries, or aggregated results."
+)
 SQL_WORKING_MEMORY_NAMESPACE = "sql_agent"
 SQL_WORKING_MEMORY_PENDING_CLARIFICATION_KEY = "pending_clarification"
 SQL_WORKING_MEMORY_CURRENT_QUERY_FRAME_KEY = "current_query_frame"
@@ -149,6 +156,15 @@ def _clear_fresh_topic_clarification_state(state: Any) -> None:
         state[SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY] = None
 
 
+def _clear_refinement_source_query_frame_state(state: Any) -> None:
+    if state is None:
+        return
+    if hasattr(state, "pop"):
+        state.pop(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY, None)
+    elif SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY in state:
+        state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = None
+
+
 def _mark_fresh_topic_clarification_state(state: Any) -> None:
     if state is None:
         return
@@ -212,6 +228,29 @@ def _set_recent_interpretation_clarification_state(
         SQL_WORKING_MEMORY_RECENT_INTERPRETATION_CLARIFICATION_KEY,
         clarification,
     )
+
+
+def _restore_topic_state(
+    state: Any,
+    previous_last_user_text: str | None,
+    previous_active_query_topic: str | None,
+) -> None:
+    if state is None:
+        return
+
+    if previous_last_user_text and previous_last_user_text.strip():
+        state[SQL_LAST_USER_TEXT_STATE_KEY] = previous_last_user_text.strip()
+    elif hasattr(state, "pop"):
+        state.pop(SQL_LAST_USER_TEXT_STATE_KEY, None)
+    elif SQL_LAST_USER_TEXT_STATE_KEY in state:
+        state[SQL_LAST_USER_TEXT_STATE_KEY] = None
+
+    if previous_active_query_topic and previous_active_query_topic.strip():
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_active_query_topic.strip()
+    elif hasattr(state, "pop"):
+        state.pop(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY, None)
+    elif SQL_ACTIVE_QUERY_TOPIC_STATE_KEY in state:
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = None
 
 
 def _ordered_unique_values(values: list[str]) -> list[str]:
@@ -3048,6 +3087,11 @@ def build_combined_before_model_callback(
         active_settings.model,
         debug=active_settings.debug,
     )
+    fresh_topic_router = build_llm_fresh_topic_relevance_router(
+        active_settings.model,
+        scope_gate_schema_context,
+        debug=active_settings.debug,
+    )
     result_refinement_resolver = build_llm_result_refinement_resolver(
         active_settings.model,
         debug=active_settings.debug,
@@ -3065,8 +3109,15 @@ def build_combined_before_model_callback(
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             _clear_private_result_state(callback_context.state)
             _clear_fresh_topic_clarification_state(callback_context.state)
+            previous_last_user_text = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+            if not isinstance(previous_last_user_text, str):
+                previous_last_user_text = None
+            previous_active_query_topic = callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+            if not isinstance(previous_active_query_topic, str):
+                previous_active_query_topic = None
             raw_user_text, user_text = _extract_user_turn_texts(llm_request)
             topic_text = ""
+            fresh_topic_previous_topic = ""
             if user_text:
                 topic_text = _extract_topic_context_text(user_text)
                 callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
@@ -3137,6 +3188,9 @@ def build_combined_before_model_callback(
                             active_settings,
                             "before-model-topic-router-decision",
                             "TOPIC_CHANGE",
+                        )
+                        fresh_topic_previous_topic = (
+                            _select_pending_clarification_topic_text(pending_clarification) or ""
                         )
                         _mark_fresh_topic_clarification_state(callback_context.state)
                         _clear_pending_clarification_state(callback_context.state)
@@ -3252,6 +3306,7 @@ def build_combined_before_model_callback(
                 )
                 refinement_type = refinement_resolution.get("resolution_type")
                 if refinement_type == "topic_change":
+                    fresh_topic_previous_topic = _get_query_frame_question_text(last_query_frame)
                     _mark_fresh_topic_clarification_state(callback_context.state)
                 if refinement_type == "needs_clarification":
                     clarification = _build_result_refinement_clarification(
@@ -3309,23 +3364,48 @@ def build_combined_before_model_callback(
                         return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
             if bool(callback_context.state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
-                topic_change_scope_text = raw_user_text or user_text
-                if active_settings.debug:
-                    print(f"[debug][sql-scope-gate][user-prompt]\n{topic_change_scope_text}")
-                allow, refusal = classifier(topic_change_scope_text)
-                if active_settings.debug:
-                    verdict = "IN_SCOPE" if allow else "OUT_OF_SCOPE"
-                    print(f"[debug][sql-scope-gate][verdict] {verdict}")
-                    if refusal:
-                        print(f"[debug][sql-scope-gate][refusal]\n{refusal}")
-                scope_gate_prechecked = True
-                if not allow:
+                _set_recent_interpretation_clarification_state(callback_context.state, None)
+                fresh_topic_routing = fresh_topic_router(raw_user_text or user_text, fresh_topic_previous_topic)
+                routing_type = str(fresh_topic_routing.get("resolution_type") or "dataset_question").strip().lower()
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-fresh-topic-routing",
+                    {
+                        "current_topic": fresh_topic_previous_topic,
+                        "resolution_type": routing_type,
+                        "user_text": raw_user_text or user_text,
+                    },
+                )
+                if routing_type == "out_of_scope":
+                    _restore_topic_state(
+                        callback_context.state,
+                        previous_last_user_text,
+                        previous_active_query_topic,
+                    )
+                    _clear_refinement_source_query_frame_state(callback_context.state)
+                    _clear_fresh_topic_clarification_state(callback_context.state)
                     return LlmResponse(
                         content=types.Content(
                             role="model",
-                            parts=[types.Part(text=refusal)],
+                            parts=[types.Part(text=DEFAULT_REFUSAL_MESSAGE)],
                         )
                     )
+                if routing_type == "meta_or_conversational":
+                    _restore_topic_state(
+                        callback_context.state,
+                        previous_last_user_text,
+                        previous_active_query_topic,
+                    )
+                    _clear_refinement_source_query_frame_state(callback_context.state)
+                    _clear_fresh_topic_clarification_state(callback_context.state)
+                    return LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=SQL_META_OR_CONVERSATIONAL_MESSAGE)],
+                        )
+                    )
+                _clear_refinement_source_query_frame_state(callback_context.state)
+                scope_gate_prechecked = True
 
         if callback_context is not None and not _request_ends_with_tool_response(llm_request):
             if user_text:

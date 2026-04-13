@@ -54,6 +54,7 @@ For onboarding, the simplest accurate mental model is:
    - a fresh dataset question
    - a reply to a pending clarification
    - a refinement of the previous final SQL query
+   - a fresh topic change that still needs routing before SQL flow continues
 4. That callback may rewrite the latest user turn, ask for clarification immediately, or refuse the request before the main model ever runs.
 5. The main model either:
    - asks a clarification question
@@ -112,6 +113,7 @@ Code-grounded and test-grounded:
 Code-grounded:
 
 - Out-of-scope questions are refused by the scope gate classifier in `scope_guard.py`.
+- Topic-change replies that arrive during clarification or result-refinement first pass through a dedicated fresh-topic relevance router before they are treated as a new dataset query or refusal.
 - Prompt injection style requests such as persona changes or instruction overrides are treated as out of scope by the scope-gate prompt.
 - Destructive or administrative SQL is blocked by `validate_sql_read_only()` in `db.py`.
 - Privacy-sensitive results can be converted into a count-only fallback or blocked entirely by the public-result shaping logic in `callbacks.py`.
@@ -201,14 +203,15 @@ The table below names the real stages from code. Stage names use actual builder 
 | 4. Pending clarification branch | same callback | Working memory contains `pending_clarification` | Resolves numeric, exact-text, or resolver-based clarification replies; rewrites latest user turn | rewritten latest user message |
 | 5. Recent interpretation replay | same callback | Working memory contains `recent_interpretation_clarification` | Allows one later selection-like reply to reuse interpretation options after a result turn | rewritten latest user message |
 | 6. Result refinement branch | same callback | Working memory contains `current_query_frame` | Decides whether the new turn refines the previous query, needs clarification, or starts a fresh topic | rewritten follow-up or pending clarification |
-| 7. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, either grounds filters or asks interpretation clarification | rewritten question or pending clarification |
-| 8. Scope gate | `build_scope_gate_callback()` via same callback | No earlier short-circuit blocked it | Runs dataset-scope classifier and returns refusal on out-of-scope prompts | refusal `LlmResponse` |
-| 9. Main model step | ADK `LlmAgent` | `before_model_callback` returned `None` | Main model can ask clarification, inspect schema, run exploratory SQL, or run final SQL | plain text or function call |
-| 10. Clarification normalization | `build_normalize_clarification_after_model_callback()` | Main model returned text, not a function call | Converts clarification-like text into deterministic clarification output and stores pending clarification | pending clarification + normalized clarification text |
-| 11. Tool execution | `build_sql_tools()` -> `db.py` | Model issued an ADK tool call | Runs schema inspection or validated SQL execution | tool response dict |
-| 12. Result capture | `build_remember_query_result_callback()` | Tool was `execute_sqlite_read_only` | Builds last query frame, public result, privacy shaping, and optional internal result state | working memory + temp public result |
-| 13. Finalize short-circuit | `build_finalize_after_query_before_model_callback()` | A public result is already present before the next model step | Returns final structured SQL answer without another real model call | rendered final answer |
-| 14. Fallback render | `build_format_final_agent_response_callback()` | Agent finishes and result was not already rendered | Final fallback formatter for the same public result contract | rendered final answer |
+| 7. Fresh-topic relevance router | same callback + `build_llm_fresh_topic_relevance_router()` | A pending clarification or result-refinement reply was classified as `topic_change` | Distinguishes `dataset_question`, `meta_or_conversational`, and `out_of_scope` before fresh SQL flow continues | router decision or immediate response |
+| 8. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, either grounds filters or asks interpretation clarification | rewritten question or pending clarification |
+| 9. Scope gate | `build_scope_gate_callback()` via same callback | No earlier short-circuit blocked it | Runs dataset-scope classifier and returns refusal on out-of-scope prompts | refusal `LlmResponse` |
+| 10. Main model step | ADK `LlmAgent` | `before_model_callback` returned `None` | Main model can ask clarification, inspect schema, run exploratory SQL, or run final SQL | plain text or function call |
+| 11. Clarification normalization | `build_normalize_clarification_after_model_callback()` | Main model returned text, not a function call | Converts clarification-like text into deterministic clarification output and stores pending clarification | pending clarification + normalized clarification text |
+| 12. Tool execution | `build_sql_tools()` -> `db.py` | Model issued an ADK tool call | Runs schema inspection or validated SQL execution | tool response dict |
+| 13. Result capture | `build_remember_query_result_callback()` | Tool was `execute_sqlite_read_only` | Builds last query frame, public result, privacy shaping, and optional internal result state | working memory + temp public result |
+| 14. Finalize short-circuit | `build_finalize_after_query_before_model_callback()` | A public result is already present before the next model step | Returns final structured SQL answer without another real model call | rendered final answer |
+| 15. Fallback render | `build_format_final_agent_response_callback()` | Agent finishes and result was not already rendered | Final fallback formatter for the same public result contract | rendered final answer |
 
 ### What counts as success, pause, and failure
 
@@ -226,6 +229,8 @@ Paused completion waiting for user input:
 
 Failure or refusal completion:
 
+- Fresh-topic router returns `meta_or_conversational` and the callback responds with a deterministic non-SQL guidance message.
+- Fresh-topic router returns `out_of_scope` and the callback returns the standard refusal before schema grounding or the main model run.
 - Scope gate returns out-of-scope refusal.
 - SQL validation fails.
 - SQLite execution fails.
@@ -324,7 +329,7 @@ These keys live directly in `callback_context.state` or `tool_context.state`.
 | `temp:sql_last_user_text` | `build_combined_before_model_callback()` | Last extracted terminal user question text | Session-scoped until overwritten |
 | `temp:sql_active_query_topic` | `build_combined_before_model_callback()` and follow-up paths | Current active query topic after rewrites | Session-scoped until overwritten |
 | `temp:sql_refinement_source_query_frame` | refinement and clarification follow-up paths | Previous query frame used while applying a refinement | Current turn or until consumed |
-| `temp:sql_fresh_topic_clarification` | clarification and refinement topic-change paths | Flag meaning the next clarification belongs to a fresh topic, not the previous query frame | Very short-lived; explicitly consumed and cleared |
+| `temp:sql_fresh_topic_clarification` | clarification and refinement topic-change paths | Flag meaning the current turn has already been reclassified as a fresh topic and should go through fresh-topic routing / fresh-topic clarification handling instead of inheriting the old query frame | Very short-lived; explicitly consumed and cleared |
 
 How these keys are reset:
 
@@ -431,7 +436,8 @@ Code-grounded:
 
 - Starting a fresh turn clears public/internal result temp keys.
 - Resolving a clarification clears `pending_clarification`.
-- Topic change clears `pending_clarification` and marks a fresh-topic flag.
+- Topic change clears `pending_clarification`, marks a fresh-topic flag, and routes the new turn through the fresh-topic relevance router.
+- Fresh-topic replies classified as `meta_or_conversational` or `out_of_scope` restore the earlier topic state instead of promoting the new non-dataset turn as the active query topic.
 - Reusing recent interpretation clarification clears that recent copy.
 - New final queries overwrite `current_query_frame`.
 - New sessions start empty unless the caller preloads session state externally.
@@ -510,6 +516,7 @@ The package also makes separate LiteLLM calls in `scope_guard.py`. These are **n
 | --- | --- | --- |
 | `build_llm_scope_gate()` | schema text + latest effective user text | Decide `IN_SCOPE` vs `OUT_OF_SCOPE` |
 | `build_llm_clarification_resolver()` | topic context, clarification question, options, latest reply | Decide `selected_options`, `custom_rule`, or `topic_change` |
+| `build_llm_fresh_topic_relevance_router()` | schema text, previous committed dataset topic if any, latest reply already classified as `topic_change` | Decide `dataset_question`, `meta_or_conversational`, or `out_of_scope` |
 | `build_llm_result_refinement_resolver()` | previous question, topic context, previous SQL, categorical filters, recent refinement history, latest reply | Decide `refine_query`, `needs_clarification`, or `topic_change` |
 | `build_llm_schema_grounding_resolver()` | latest user request, schema column previews, grounding candidates, candidate column identifiers | Decide grounded categorical filters and unresolved field ambiguity |
 
@@ -632,7 +639,7 @@ Actual transition conditions:
 - If there is no exact or numeric match, it calls `build_llm_clarification_resolver()`.
 - Resolver outcome `selected_options` -> rewrite follow-up and continue.
 - Resolver outcome `custom_rule` -> rewrite follow-up and continue.
-- Resolver outcome `topic_change` -> clear pending clarification, mark fresh topic, and route through scope gate.
+- Resolver outcome `topic_change` -> clear pending clarification, mark fresh topic, and route through the fresh-topic relevance router.
 
 Outputs:
 
@@ -688,13 +695,13 @@ Branch outcomes:
 
 - `needs_clarification` -> build categorical clarification using the previous query's filter column and available values; return that clarification immediately.
 - `refine_query` -> rewrite latest user turn with previous question, previous SQL, previous categorical filters, updated value set, and refinement request text.
-- `topic_change` -> mark fresh-topic flag and let the turn continue as a new dataset question.
+- `topic_change` -> mark fresh-topic flag and let the turn continue through the fresh-topic relevance router before it is treated as a new dataset question or refusal.
 
-### 5. Fresh-topic scope precheck
+### 5. Fresh-topic relevance router
 
 Code path:
 
-- `build_scope_gate_callback()` invoked early only when `temp:sql_fresh_topic_clarification` is set
+- `build_llm_fresh_topic_relevance_router()` invoked only when `temp:sql_fresh_topic_clarification` is set
 
 Entry condition:
 
@@ -702,13 +709,25 @@ Entry condition:
 
 Purpose:
 
-- prevent an off-topic topic-change reply from falling through into schema-grounding logic
+- distinguish a fresh dataset question from conversational/meta turns and true out-of-scope turns before SQL flow continues
+
+Router outcomes:
+
+- `dataset_question` -> continue into fresh-turn schema grounding and skip the binary scope gate for this topic-change branch.
+- `meta_or_conversational` -> return a deterministic non-SQL guidance message and restore the earlier active topic state.
+- `out_of_scope` -> return the standard refusal and restore the earlier active topic state.
+
+What `meta_or_conversational` means in this codebase:
+
+- a turn about the interaction rather than a new dataset request
+- examples include acknowledgements, conversational replies, or questions about the prior conversation rather than the dataset itself
+- it is explicitly **not** treated as a SQL question, but it is also not treated as a hostile or unrelated out-of-scope request
 
 Important nuance:
 
-- This is **not** the normal fresh-turn order.
-- Normal fresh-turn schema grounding happens before scope gate.
-- Fresh-topic replies are a special case.
+- This is **not** the normal first-turn order.
+- Normal first-turn schema grounding still happens before the normal scope gate.
+- The fresh-topic router is a special branch used only after clarification/result-refinement already said `topic_change`.
 
 ### 6. Fresh-turn schema grounding
 
@@ -749,6 +768,11 @@ Code path:
 Entry condition:
 
 - no earlier branch already returned clarification, refusal, or rewrite-only continuation
+
+Important nuance:
+
+- For ordinary fresh user turns, schema grounding still runs before the scope gate.
+- For topic-change turns already classified as `dataset_question` by the fresh-topic router, the callback skips the binary scope gate and continues directly into schema grounding / main-model flow.
 
 Actual transition conditions:
 
@@ -904,6 +928,7 @@ These functions make extra LiteLLM calls, but they are not exposed to the main m
 | --- | --- |
 | `build_llm_scope_gate()` | Dataset-scope classifier |
 | `build_llm_clarification_resolver()` | Clarification-reply classifier |
+| `build_llm_fresh_topic_relevance_router()` | Topic-change router for fresh dataset vs conversational/meta vs out-of-scope turns |
 | `build_llm_result_refinement_resolver()` | Post-result same-query vs topic-change classifier |
 | `build_llm_schema_grounding_resolver()` | Fresh-turn schema interpretation resolver |
 
@@ -940,6 +965,7 @@ The SQL agent mixes deterministic guardrails with prompt-driven recovery. The ta
 | SQL execution failure | `execute_sqlite_query()` | Returns structured error dict; final formatter surfaces the safe error message | Strong code-enforced surfacing, but no forced auto-retry |
 | Empty result | `format_result_payload()` and privacy shaping | If privacy mode is off, empty rows render as `No rows returned.`; with default privacy shaping, zero-match aggregates can be blocked as below-threshold results | Important limitation for user expectations |
 | Out-of-scope request | scope gate | Returns refusal message before main model call | Strong prompt-driven classifier with fail-open behavior on internal classifier error |
+| Topic change during clarification or result refinement | fresh-topic relevance router | Distinguishes a fresh dataset question from conversational/meta turns and true out-of-scope requests before SQL flow continues | Strong prompt-driven routing; still depends on model judgment rather than hardcoded intent rules |
 | Destructive or admin request | model instruction + SQL validation | Model is told not to do it; if it still tries, validation rejects non-read-only SQL | Strong at execution layer, weaker at pre-model refusal layer |
 | Privacy-sensitive row-level detail | instruction + after-tool public result shaping | Detail rows become count-only fallback or privacy-blocked result | Strong code-enforced output shaping |
 | Small grouped buckets | after-tool public result shaping | Unsafe grouped buckets are suppressed or entire grouped result is blocked | Strong code-enforced |

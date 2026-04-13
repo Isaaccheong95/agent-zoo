@@ -46,6 +46,7 @@ from agent_zoo.sql_agent.runtime import _print_debug_event
 from agent_zoo.sql_agent.tools import build_sql_tools
 from agent_zoo.scope_guard import (
     build_llm_clarification_resolver,
+    build_llm_fresh_topic_relevance_router,
     build_llm_result_refinement_resolver,
     build_llm_schema_grounding_resolver,
     build_llm_scope_gate,
@@ -577,26 +578,18 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("categorical values = Female, Male", captured["schema_context"])
         self.assertIn("Stored categorical value guidance:", captured["schema_context"])
 
-    def test_combined_before_model_callback_topic_change_uses_wrapped_prompt_for_scope_gate(self) -> None:
+    def test_combined_before_model_callback_topic_change_uses_fresh_topic_router_before_schema_grounding(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
-        captured: dict[str, str] = {}
 
-        def fake_build_llm_scope_gate(model: str, schema_context: str, refusal_message: str | None = None):
-            captured["schema_context"] = schema_context
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return False, "blocked"
 
-            def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
-                scope_gate_calls.append(user_text)
-                if (
-                    "Field glossary:" in user_text
-                    and "User question:\nhow many ladies drink" in user_text
-                    and "Sex of patient" in schema_context
-                    and "Alcohol consumption status" in schema_context
-                ):
-                    return True, None
-                return False, "blocked"
-
-            return fake_scope_gate
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "dataset_question"}
 
         def fake_schema_grounding_resolver(
             user_text: str,
@@ -653,10 +646,13 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             },
         ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
-            side_effect=fake_build_llm_scope_gate,
+            return_value=fake_scope_gate,
         ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
         ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
@@ -714,12 +710,15 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(len(scope_gate_calls), 1)
-        self.assertIn("Field glossary:", scope_gate_calls[0])
-        self.assertIn("User question:\nhow many ladies drink", scope_gate_calls[0])
+        self.assertEqual(scope_gate_calls, [])
+        self.assertEqual(len(fresh_topic_router_calls), 1)
+        self.assertEqual(
+            fresh_topic_router_calls[0][1],
+            "what is the max age of working professionals",
+        )
+        self.assertIn("Field glossary:", fresh_topic_router_calls[0][0])
+        self.assertIn("User question:\nhow many ladies drink", fresh_topic_router_calls[0][0])
         self.assertEqual(len(schema_grounding_calls), 1)
-        self.assertIn("Sex of patient", captured["schema_context"])
-        self.assertIn("Alcohol consumption status", captured["schema_context"])
         response_text = result.content.parts[0].text
         self.assertIn("Which one do you mean?", response_text)
         self.assertIn("1. Alcohol consumption status", response_text)
@@ -1028,6 +1027,59 @@ class SQLiteHelpersTestCase(unittest.TestCase):
             },
         )
         self.assertIn("selected_values may coexist with refinement_request", captured["system_prompt"])
+
+    def test_fresh_topic_relevance_router_includes_current_topic_context(self) -> None:
+        captured: dict[str, str] = {}
+
+        def completion(**kwargs):
+            captured["system_prompt"] = kwargs["messages"][0]["content"]
+            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_type":"dataset_question"}'
+                        )
+                    )
+                ]
+            )
+
+        router = build_llm_fresh_topic_relevance_router(
+            "test-model",
+            "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male",
+        )
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = router(
+                "how many females are there who are below 45 and smoke and ddrink",
+                "number of males for each diagnosed cancer type",
+            )
+
+        self.assertEqual(resolution, {"resolution_type": "dataset_question"})
+        self.assertIn("dataset_question|meta_or_conversational|out_of_scope", captured["system_prompt"])
+        self.assertIn("Current committed dataset topic", captured["user_prompt"])
+        self.assertIn("number of males for each diagnosed cancer type", captured["user_prompt"])
+        self.assertIn("Latest user reply already classified as a topic change", captured["user_prompt"])
+        self.assertIn(
+            "how many females are there who are below 45 and smoke and ddrink",
+            captured["user_prompt"],
+        )
+
+    def test_fresh_topic_relevance_router_fails_open_on_invalid_output(self) -> None:
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+            )
+
+        router = build_llm_fresh_topic_relevance_router(
+            "test-model",
+            "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male",
+        )
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = router("how many females drink", "how many males work")
+
+        self.assertEqual(resolution, {"resolution_type": "dataset_question"})
 
     def test_schema_grounding_resolver_includes_schema_context(self) -> None:
         captured: dict[str, str] = {}
@@ -4054,6 +4106,7 @@ Which category or combination should I use for \"alcoholic\"?
 
     def test_combined_before_model_callback_uses_rewritten_current_state_for_broader_followup(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
@@ -4068,6 +4121,10 @@ Which category or combination should I use for \"alcoholic\"?
                 "selected_values": [],
                 "refinement_request": "",
             }
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "dataset_question"}
 
         with patch(
             "agent_zoo.sql_agent.callbacks.get_schema_summary",
@@ -4087,6 +4144,9 @@ Which category or combination should I use for \"alcoholic\"?
         with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
         ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=fake_result_refinement_resolver,
@@ -4133,9 +4193,9 @@ Which category or combination should I use for \"alcoholic\"?
             llm_request=llm_request,
         )
 
-        self.assertIsNotNone(result)
-        self.assertEqual(result.content.parts[0].text, "blocked")
-        self.assertEqual(scope_gate_calls, ["number of working adults"])
+        self.assertIsNone(result)
+        self.assertEqual(fresh_topic_router_calls, [("number of working adults", "how many females work")])
+        self.assertEqual(scope_gate_calls, [])
         self.assertEqual(len(refinement_resolver_calls), 1)
         captured_frame, captured_reply = refinement_resolver_calls[0]
         self.assertEqual(captured_reply, "number of working adults")
@@ -4516,10 +4576,15 @@ Which category or combination should I use for \"alcoholic\"?
     def test_combined_before_model_callback_applies_scope_gate_for_topic_change(self) -> None:
         scope_gate_calls: list[str] = []
         resolver_calls: list[tuple[str, str, list[str], str]] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "out_of_scope"}
 
         def fake_resolver(topic_context: str, clarification_question: str, options: list[str], user_reply: str) -> dict[str, object]:
             resolver_calls.append((topic_context, clarification_question, options, user_reply))
@@ -4532,6 +4597,9 @@ Which category or combination should I use for \"alcoholic\"?
         with patch("agent_zoo.sql_agent.callbacks.build_llm_scope_gate", return_value=fake_scope_gate), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=fake_resolver,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
         ):
             callback = build_combined_before_model_callback(self._settings())
 
@@ -4554,7 +4622,7 @@ Which category or combination should I use for \"alcoholic\"?
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result.content.parts[0].text, "blocked")
+        self.assertEqual(result.content.parts[0].text, "I'm a dataset SQL agent. I can only help with questions about the current dataset, its schema, filters, SQL queries, and aggregated results derived from it. I can't answer general non-dataset questions.")
         self.assertEqual(
             resolver_calls,
             [
@@ -4566,7 +4634,8 @@ Which category or combination should I use for \"alcoholic\"?
                 )
             ],
         )
-        self.assertEqual(scope_gate_calls, ["tell me a joke"])
+        self.assertEqual(fresh_topic_router_calls, [("tell me a joke", "how many females are alcoholics")])
+        self.assertEqual(scope_gate_calls, [])
         self.assertIsNone(get_sql_pending_clarification(state))
 
     def test_combined_before_model_callback_creates_schema_grounding_clarification(self) -> None:
@@ -5537,13 +5606,18 @@ Which category or combination should I use for \"alcoholic\"?
         )
         self.assertIn("User clarification reply: 1 and 2", rewritten_text)
 
-    def test_combined_before_model_callback_still_uses_scope_gate_when_schema_grounding_has_no_action(self) -> None:
+    def test_combined_before_model_callback_skips_scope_gate_when_fresh_topic_router_marks_dataset_question(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "dataset_question"}
 
         def fake_schema_grounding_resolver(
             user_text: str,
@@ -5598,6 +5672,9 @@ Which category or combination should I use for \"alcoholic\"?
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
         ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
+        ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
         ), patch(
@@ -5607,6 +5684,21 @@ Which category or combination should I use for \"alcoholic\"?
             callback = build_combined_before_model_callback(self._settings())
 
         state: dict[str, object] = {}
+        set_sql_current_query_frame(
+            state,
+            {
+                "question": "avg age of working females",
+                "sql": "SELECT AVG(age) AS average_age, COUNT(*) AS matching_count FROM filtered_dataset WHERE gender = 'Female' AND sococc IN ('Employed', 'Student')",
+                "categorical_filters": [
+                    {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
+                    {
+                        "column": "sococc",
+                        "selected_values": ["Employed", "Student"],
+                        "available_values": ["Employed", "Retired", "Student", "Unemployed", "Unknown"],
+                    },
+                ],
+            },
+        )
         llm_request = SimpleNamespace(
             contents=[types.Content(role="user", parts=[types.Part(text="tell me a joke")])]
         )
@@ -5616,18 +5708,23 @@ Which category or combination should I use for \"alcoholic\"?
             llm_request=llm_request,
         )
 
-        self.assertIsNotNone(result)
-        self.assertEqual(result.content.parts[0].text, "blocked")
+        self.assertIsNone(result)
+        self.assertEqual(fresh_topic_router_calls, [("tell me a joke", "avg age of working females")])
         self.assertEqual(len(schema_grounding_calls), 1)
-        self.assertEqual(scope_gate_calls, ["tell me a joke"])
+        self.assertEqual(scope_gate_calls, [])
 
     def test_combined_before_model_callback_blocks_topic_change_before_schema_grounding(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return False, "blocked"
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "out_of_scope"}
 
         def fake_schema_grounding_resolver(
             user_text: str,
@@ -5683,6 +5780,9 @@ Which category or combination should I use for \"alcoholic\"?
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
         ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
+        ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
         ), patch(
@@ -5717,12 +5817,14 @@ Which category or combination should I use for \"alcoholic\"?
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result.content.parts[0].text, "blocked")
-        self.assertEqual(scope_gate_calls, ["what was my first qn"])
+        self.assertEqual(result.content.parts[0].text, "I'm a dataset SQL agent. I can only help with questions about the current dataset, its schema, filters, SQL queries, and aggregated results derived from it. I can't answer general non-dataset questions.")
+        self.assertEqual(fresh_topic_router_calls, [("what was my first qn", "avg age of working females")])
+        self.assertEqual(scope_gate_calls, [])
         self.assertEqual(schema_grounding_calls, [])
 
     def test_combined_before_model_callback_routes_fresh_dataset_query_to_schema_grounding(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         refinement_resolver_calls: list[tuple[dict[str, object], str]] = []
         schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
@@ -5738,6 +5840,10 @@ Which category or combination should I use for \"alcoholic\"?
                 "selected_values": [],
                 "refinement_request": "",
             }
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "dataset_question"}
 
         def fake_schema_grounding_resolver(
             user_text: str,
@@ -5790,6 +5896,9 @@ Which category or combination should I use for \"alcoholic\"?
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
         ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
+        ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=fake_result_refinement_resolver,
         ), patch(
@@ -5824,7 +5933,8 @@ Which category or combination should I use for \"alcoholic\"?
 
         self.assertIsNone(result)
         self.assertEqual(len(refinement_resolver_calls), 1)
-        self.assertEqual(scope_gate_calls, ["give me the avg age of females"])
+        self.assertEqual(fresh_topic_router_calls, [("give me the avg age of females", "total non-working")])
+        self.assertEqual(scope_gate_calls, [])
         self.assertEqual(len(schema_grounding_calls), 1)
         self.assertEqual(schema_grounding_calls[0][0], "give me the avg age of females")
         self.assertEqual(
@@ -5834,11 +5944,16 @@ Which category or combination should I use for \"alcoholic\"?
 
     def test_combined_before_model_callback_rewrites_grounded_fresh_dataset_question_as_current_question(self) -> None:
         scope_gate_calls: list[str] = []
+        fresh_topic_router_calls: list[tuple[str, str | None]] = []
         schema_grounding_calls: list[tuple[str, str, list[dict[str, object]], list[str]]] = []
 
         def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
             scope_gate_calls.append(user_text)
             return True, None
+
+        def fake_fresh_topic_router(user_text: str, current_topic: str | None = None) -> dict[str, str]:
+            fresh_topic_router_calls.append((user_text, current_topic))
+            return {"resolution_type": "dataset_question"}
 
         def fake_schema_grounding_resolver(
             user_text: str,
@@ -5891,6 +6006,9 @@ Which category or combination should I use for \"alcoholic\"?
             "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
         ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_fresh_topic_relevance_router",
+            return_value=fake_fresh_topic_router,
+        ), patch(
             "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
             return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
         ), patch(
@@ -5924,7 +6042,8 @@ Which category or combination should I use for \"alcoholic\"?
         )
 
         self.assertIsNone(result)
-        self.assertEqual(scope_gate_calls, ["give me the avg age of females"])
+        self.assertEqual(fresh_topic_router_calls, [("give me the avg age of females", "total non-working")])
+        self.assertEqual(scope_gate_calls, [])
         self.assertEqual(len(schema_grounding_calls), 1)
         rewritten_text = llm_request.contents[-1].parts[0].text
         self.assertIn("Current dataset question: give me the avg age of females", rewritten_text)
