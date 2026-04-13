@@ -97,6 +97,7 @@ Code-grounded and test-grounded:
 - Questions that need clarification between nearby schema fields.
 - Questions that need clarification between categorical values.
 - Follow-up turns such as "include retired and student too" after a previous result.
+- Follow-up turns that want to change the grouping structure of a previous grouped result, such as "use other categories instead".
 
 ### What the SQL agent should clarify
 
@@ -202,7 +203,7 @@ The table below names the real stages from code. Stage names use actual builder 
 | 3. Fresh-turn preamble | `build_combined_before_model_callback()` in `callbacks.py` | Before model call, when request does not end with tool response | Clears old private result state, extracts the effective user question, stores current topic text | `temp:sql_last_user_text`, `temp:sql_active_query_topic` |
 | 4. Pending clarification branch | same callback | Working memory contains `pending_clarification` | Resolves numeric, exact-text, or resolver-based clarification replies; rewrites latest user turn | rewritten latest user message |
 | 5. Recent interpretation replay | same callback | Working memory contains `recent_interpretation_clarification` | Allows one later selection-like reply to reuse interpretation options after a result turn | rewritten latest user message |
-| 6. Result refinement branch | same callback | Working memory contains `current_query_frame` | Decides whether the new turn refines the previous query, needs clarification, or starts a fresh topic | rewritten follow-up or pending clarification |
+| 6. Result refinement branch | same callback | Working memory contains `current_query_frame` | Decides whether the new turn refines the previous query, needs clarification about a categorical filter or grouped structure, or starts a fresh topic | rewritten follow-up or pending clarification |
 | 7. Fresh-topic relevance router | same callback + `build_llm_fresh_topic_relevance_router()` | A pending clarification or result-refinement reply was classified as `topic_change` | Distinguishes `dataset_question`, `meta_or_conversational`, and `out_of_scope` before fresh SQL flow continues | router decision or immediate response |
 | 8. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, either grounds filters or asks interpretation clarification | rewritten question or pending clarification |
 | 9. Scope gate | `build_scope_gate_callback()` via same callback | No earlier short-circuit blocked it | Runs dataset-scope classifier and returns refusal on out-of-scope prompts | refusal `LlmResponse` |
@@ -369,6 +370,8 @@ The saved frame can include these fields:
 | `sql` | User-visible SQL, preferring `display_sql` when present |
 | `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values` and `available_values` |
 | `comparison_filters` | Extracted comparison filters such as `age > 46` |
+| `is_grouped` | Boolean flag showing that the saved query was a grouped query |
+| `group_columns` | Grouping columns inferred from the committed grouped query |
 | `topic_context` | Multi-line text summary built from the frame and reused by refinement logic |
 | `recent_refinement` | Optional summary of recent categorical additions/removals |
 
@@ -391,6 +394,7 @@ The pending clarification payload is a dict. Depending on the path that created 
 | `base_query_frame` | Copy of the prior committed query frame, used when refinement must continue after clarification |
 | `option_columns` | Mapping from displayed interpretation option label back to exact schema column identifier |
 | `grounded_filters` | Already grounded categorical filters from the original request |
+| `grouping_change_request` | Raw grouped-structure change request preserved when a follow-up needs clarification about a new grouping field |
 
 ### What is persistent across turns vs not
 
@@ -517,7 +521,7 @@ The package also makes separate LiteLLM calls in `scope_guard.py`. These are **n
 | `build_llm_scope_gate()` | schema text + latest effective user text | Decide `IN_SCOPE` vs `OUT_OF_SCOPE` |
 | `build_llm_clarification_resolver()` | topic context, clarification question, options, latest reply | Decide `selected_options`, `custom_rule`, or `topic_change` |
 | `build_llm_fresh_topic_relevance_router()` | schema text, previous committed dataset topic if any, latest reply already classified as `topic_change` | Decide `dataset_question`, `meta_or_conversational`, or `out_of_scope` |
-| `build_llm_result_refinement_resolver()` | previous question, topic context, previous SQL, categorical filters, recent refinement history, latest reply | Decide `refine_query`, `needs_clarification`, or `topic_change` |
+| `build_llm_result_refinement_resolver()` | previous question, topic context, previous SQL, categorical filters, grouping columns, recent refinement history, latest reply | Decide `refine_query`, `needs_clarification`, or `topic_change` |
 | `build_llm_schema_grounding_resolver()` | latest user request, schema column previews, grounding candidates, candidate column identifiers | Decide grounded categorical filters and unresolved field ambiguity |
 
 ### Schema-grounding context in particular
@@ -555,7 +559,7 @@ It then:
 - extracts embedded JSON if the model mixed prose with a trailing JSON object
 - falls back to heuristics when needed
 - clamps options to exact dataset categorical values when guidance strongly matches
-- strips topic echo or reasoning pollution from the option list
+- strips topic echo, reasoning pollution, and SQL/prose debris from the option list
 - stores a normalized pending clarification payload
 
 ### Final rendering context
@@ -693,9 +697,15 @@ Actual transition conditions:
 
 Branch outcomes:
 
-- `needs_clarification` -> build categorical clarification using the previous query's filter column and available values; return that clarification immediately.
+- `needs_clarification` -> build a deterministic clarification using the previous query frame. If `target_column` is present, this is a categorical-value clarification over that filter column's available values. If `target_column` is empty but the saved query was grouped, this becomes a grouped-structure clarification asking which exact field or category should replace the previous grouping column. If neither specific clarification can be built, the callback falls back to a fixed generic clarification rather than silently degrading into a same-query rewrite.
 - `refine_query` -> rewrite latest user turn with previous question, previous SQL, previous categorical filters, updated value set, and refinement request text.
 - `topic_change` -> mark fresh-topic flag and let the turn continue through the fresh-topic relevance router before it is treated as a new dataset question or refusal.
+
+Important grouped-query nuance:
+
+- grouped final queries now save their grouping columns inside `current_query_frame`
+- this lets later structural follow-ups stay inside clarification flow instead of collapsing into a malformed generic refinement
+- the current grouped clarification path is intentionally conservative: it asks for the exact replacement grouping field or category instead of inventing menu options from the previous grouped result
 
 ### 5. Fresh-topic relevance router
 
@@ -820,6 +830,11 @@ Actual transition conditions:
 - plain text does not look like a clarification attempt -> do nothing
 - clarification JSON or parseable clarification-like text -> normalize and store pending clarification
 - clarification-like text that cannot be normalized confidently -> fall back to one fixed clarification prompt with no inferred options
+
+Normalization hardening details:
+
+- fallback option extraction intentionally rejects SQL-looking lines, markdown table debris, and generic prose scaffolding such as "previous query" or "latest user reply"
+- this prevents malformed model explanations from turning into junk numbered clarification menus
 
 ### 10. Tool execution
 
