@@ -1,1151 +1,1697 @@
-# SQLite NL-to-SQL Agent
+# SQL Agent
+
+This README describes the actual SQL agent implementation in `src/agent_zoo/sql_agent`.
+
+It is intentionally code-grounded:
+
+- `Code-grounded` means the behavior is directly visible in the current implementation.
+- `Test-grounded` means the behavior is asserted in `tests/test_sql_agent_db.py` or `tests/test_sql_agent_pipeline.py`.
+- `Inference` means the behavior is a careful conclusion from the code path, not an explicit hard-coded branch.
+
+ADK note:
+
+- This package is built on Google ADK's `LlmAgent`, `InMemoryRunner`, session `state`, and callback lifecycle.
+- The ADK-specific descriptions below are based on the local implementation plus the ADK callback, runtime, and session docs.
+- This package does **not** use ADK's long-term `MemoryService`. Its cross-turn memory is a custom structure stored inside session state.
+
+The most important mental model is this:
+
+> This is **not** just a one-shot prompt that asks a model to write SQL.
+>
+> It is a callback-driven ADK agent where the main model is surrounded by deterministic Python logic and several sidecar LLM resolvers.
+>
+> Most of the workflow complexity lives in `callbacks.py`, not in `agent.py` or `instructions.py`.
 
 ## Contents
 
-- [What This Project Is](#what-this-project-is)
-- [The Core Design](#the-core-design)
-- [Repository Map](#repository-map)
+- [Mental Model](#mental-model)
+- [Purpose and Boundaries](#purpose-and-boundaries)
+- [Public Entry Points](#public-entry-points)
 - [High-Level Architecture](#high-level-architecture)
-- [How To Run It](#how-to-run-it)
-  - [One-shot CLI](#one-shot-cli)
-  - [Interactive mode](#interactive-mode)
-  - [Debug mode](#debug-mode)
-  - [ADK-native mode](#adk-native-mode)
-  - [ADK Web UI Preview](#adk-web-ui-preview)
-- [The Exact Request Lifecycle](#the-exact-request-lifecycle)
-  - [1. `cli.py` parses CLI arguments](#1-clipy-parses-cli-arguments)
-  - [2. `config.py` resolves settings and paths](#2-configpy-resolves-settings-and-paths)
-  - [3. `agent.py` builds the ADK `LlmAgent`](#3-agentpy-builds-the-adk-llmagent)
-  - [4. `instructions.py` builds the system prompt](#4-instructionspy-builds-the-system-prompt)
-  - [5. `tools.py` exposes the database helpers as ADK tools](#5-toolspy-exposes-the-database-helpers-as-adk-tools)
-  - [6. `runtime.py` runs the agent with ADK](#6-runtimepy-runs-the-agent-with-adk)
-  - [7. `callbacks.py` captures the tool result and rewrites the final answer](#7-callbackspy-captures-the-tool-result-and-rewrites-the-final-answer)
-  - [8. `formatting.py` builds the user-facing output](#8-formattingpy-builds-the-user-facing-output)
-  - [9. `pipeline.py` contains a deterministic, non-ADK pipeline](#9-pipelinepy-contains-a-deterministic-non-adk-pipeline)
-- [Deep Dive: `db.py`](#deep-dive-dbpy)
-  - [Path handling](#path-handling)
-  - [Read-only SQLite connection](#read-only-sqlite-connection)
-  - [Schema inspection](#schema-inspection)
-  - [SQL scanning](#sql-scanning)
-  - [SQL validation](#sql-validation)
-  - [SQL execution](#sql-execution)
-- [End-to-End Example](#end-to-end-example)
-- [Data Contracts](#data-contracts)
-  - [Schema tool contract](#schema-tool-contract)
-  - [Execution tool contract](#execution-tool-contract)
-  - [Public response contract](#public-response-contract)
-- [Why This Project Uses Callbacks Instead of `output_schema`](#why-this-project-uses-callbacks-instead-of-output_schema)
-- [The Tests](#the-tests)
-  - [`tests/test_sql_agent_db.py`](#test_sql_agent_dbpy)
-  - [`tests/test_sql_agent_pipeline.py`](#test_sql_agent_pipelinepy)
-  - [Run the tests](#run-the-tests)
-- [What Is Live and What Is Test-Only](#what-is-live-and-what-is-test-only)
-  - [Live runtime path](#live-runtime-path)
-  - [Test and support path](#test-and-support-path)
-- [Debugging and Troubleshooting](#debugging-and-troubleshooting)
-  - [The model says the SQLite file does not exist, but the file is there](#the-model-says-the-sqlite-file-does-not-exist-but-the-file-is-there)
-  - [Relative database paths](#relative-database-paths)
-  - [`uv` cache or permission issues](#uv-cache-or-permission-issues)
-  - [Why `adk run` can show more text than the plain CLI](#why-adk-run-can-show-more-text-than-the-plain-cli)
-  - [Why aggregate queries say `Found 1 matching row`](#why-aggregate-queries-say-found-1-matching-row)
-  - [Why the agent might ask for clarification instead of guessing](#why-the-agent-might-ask-for-clarification-instead-of-guessing)
-- [Configuration Reference](#configuration-reference)
-  - [CLI arguments](#cli-arguments)
-  - [Environment variables](#environment-variables)
-  - [Default values](#default-values)
-- [Why The Implementation Is Structured This Way](#why-the-implementation-is-structured-this-way)
-  - [Why the DB logic is plain Python](#why-the-db-logic-is-plain-python)
-  - [Why the tools are thin wrappers](#why-the-tools-are-thin-wrappers)
-  - [Why the prompt contains a schema snapshot and there is also a schema tool](#why-the-prompt-contains-a-schema-snapshot-and-there-is-also-a-schema-tool)
-  - [Why validation happens twice](#why-validation-happens-twice)
-  - [Why the final response is formatted in Python](#why-the-final-response-is-formatted-in-python)
-- [Current Limitations](#current-limitations)
-  - [1. The model still does the semantic SQL generation](#1-the-model-still-does-the-semantic-sql-generation)
-  - [2. Schema context is global](#2-schema-context-is-global)
-  - [3. Summary text is row-oriented, not business-oriented](#3-summary-text-is-row-oriented-not-business-oriented)
-  - [4. Callback-driven final formatting does not suppress earlier streamed text](#4-callback-driven-final-formatting-does-not-suppress-earlier-streamed-text)
-  - [5. The system currently trusts the model to call the schema tool when needed](#5-the-system-currently-trusts-the-model-to-call-the-schema-tool-when-needed)
-- [Good Next Improvements](#good-next-improvements)
-- [Development Notes](#development-notes)
-  - [Dependencies](#dependencies)
-  - [Python version](#python-version)
-- [Quick Mental Model](#quick-mental-model)
+- [Actual Workflow Stages](#actual-workflow-stages)
+- [State Management](#state-management)
+- [Context Management](#context-management)
+- [Workflow Stages and Transition Conditions](#workflow-stages-and-transition-conditions)
+- [Tool Usage](#tool-usage)
+- [Error Handling and Typo Handling](#error-handling-and-typo-handling)
+- [Prompt Examples Mapped to Real Paths](#prompt-examples-mapped-to-real-paths)
+- [File and Module Map](#file-and-module-map)
+- [Diagrams](#diagrams)
+- [Developer Guide](#developer-guide)
+- [Known Limitations](#known-limitations)
+- [Glossary](#glossary)
+- [Quick Run and Test Appendix](#quick-run-and-test-appendix)
 
-This repository contains a Google ADK agent that turns a natural-language question into a safe, read-only SQLite query, executes that query locally, and returns:
+## Mental Model
 
-- the generated SQL
-- a short summary of what it matched
-- the result
+For onboarding, the simplest accurate mental model is:
 
-This README is intentionally detailed. It is meant to explain not just how to run the agent, but how the code is wired together, why each file exists, how data flows through the system, and where the current limitations are.
+1. A caller sends a natural-language question into `SQLAgent.ask(...)` or `runtime.ask_question(...)`.
+2. ADK runs one `LlmAgent` with two actual ADK tools:
+   - `inspect_sqlite_schema`
+   - `execute_sqlite_read_only`
+3. Before the main model call, a large `before_model_callback` decides whether the new turn is:
+   - a fresh dataset question
+   - a reply to a pending clarification
+   - a refinement of the previous final SQL query
+4. That callback may rewrite the latest user turn, ask for clarification immediately, or refuse the request before the main model ever runs.
+5. The main model either:
+   - asks a clarification question
+   - inspects schema
+   - runs exploratory SQL
+   - runs final SQL
+6. After the model and tool calls, more callbacks normalize clarifications, capture tool results, build structured query memory, apply privacy shaping, and render the final answer deterministically.
 
-## What This Project Is
+Three code facts matter more than anything else:
 
-At a high level, the SQL agent is a single-agent Google ADK application built around two ideas:
+- The live runtime path is the ADK path in `agent.py` + `runtime.py`, not `pipeline.py`.
+- The real control plane is `callbacks.py` + `scope_guard.py`.
+- The database safety layer is `db.py`.
 
-1. Let the model write SQL.
-2. Never trust the model blindly.
+## Purpose and Boundaries
 
-The model is responsible for understanding the user's request and proposing SQL. The Python code is responsible for enforcing guardrails:
+### What the SQL agent is for
 
-- introspecting the schema
-- validating that SQL is structurally read-only
-- rejecting write or administrative statements before execution
-- catching hallucinated tables and columns
-- executing against SQLite in read-only mode
-- formatting a predictable final answer
+Code-grounded:
 
-The agent is in `src/agent_zoo/sql_agent`. The canonical CLI entrypoint is `agent_zoo.sql_agent.cli:main`, exposed as `run-sql-agent`. Programmatic imports use `agent_zoo.sql_agent`, for example `from agent_zoo.sql_agent import SQLAgent`, then `agent = SQLAgent()` and `await agent.ask(...)`.
+- The agent description in `agent.py` is: "Converts natural language questions into safe read-only SQLite queries and explains the results."
+- The default instruction in `instructions.py` says the job is to choose the right tool calls and use only read-only SQLite `SELECT` or `WITH` queries.
+- The instruction also says this agent is for **cohort-level aggregate answers** and should not return raw row-level detail unless the answer must degrade to a matching-count fallback.
 
-## The Core Design
+In practical web-app terms, this agent is designed to answer questions like:
 
-The implementation follows a transparent 5-step pipeline:
+- counts of matching rows
+- grouped counts
+- aggregates such as `AVG`, `MIN`, and `MAX`
+- grouped aggregates such as average age by category
+- schema-grounded follow-up refinements of the previous SQL-backed answer
+- clarification requests about nearby fields or categorical value choices
 
-1. Inspect schema
-2. Generate SQL from the user question
-3. Validate the SQL for safety and basic correctness
-4. Execute the SQL
-5. Format the result
+### What the SQL agent is designed to handle well
 
-This is deliberately not a black box. The SQL is always surfaced, and the pieces that touch the database are kept in normal Python functions so they are easy to test outside the model runtime.
+Code-grounded and test-grounded:
 
-## Repository Map
+- Dataset-scoped questions that can be answered from the configured SQLite file.
+- Questions that mention approximate, colloquial, or slightly incorrect dataset terminology.
+- Questions that need clarification between nearby schema fields.
+- Questions that need clarification between categorical values.
+- Follow-up turns such as "include retired and student too" after a previous result.
 
-| Path | Purpose |
-| --- | --- |
-| `src/agent_zoo/sql_agent/cli.py` | Canonical package CLI entrypoint |
-| `src/agent_zoo/sql_agent/__init__.py` | Package exports |
-| `src/agent_zoo/sql_agent/agent.py` | Builds the ADK `LlmAgent` |
-| `src/agent_zoo/sql_agent/config.py` | Loads config from CLI/env and resolves paths |
-| `src/agent_zoo/sql_agent/instructions.py` | Builds the system instruction and schema snapshot |
-| `src/agent_zoo/sql_agent/tools.py` | Wraps database helpers as ADK tools |
-| `src/agent_zoo/sql_agent/db.py` | Schema introspection, SQL scanning, validation, and execution |
-| `src/agent_zoo/sql_agent/runtime.py` | Runs the agent with `InMemoryRunner` |
-| `src/agent_zoo/sql_agent/callbacks.py` | Stores tool output, handles clarification flow, and finalizes or fallback-renders the final response |
-| `src/agent_zoo/sql_agent/formatting.py` | Formats the final user-facing response |
-| `src/agent_zoo/sql_agent/pipeline.py` | Deterministic offline pipeline helper used by tests |
-| `tests/test_sql_agent_db.py` | Unit tests for schema/validation/execution |
-| `tests/test_sql_agent_pipeline.py` | Unit tests for the higher-level pipeline |
+### What the SQL agent should clarify
+
+Code-grounded and test-grounded:
+
+- When the request is still in scope but ambiguous.
+- When more than one nearby schema field could match the request.
+- When a colloquial label like `drink` could mean more than one categorical field.
+- When a user asks to broaden or change a previous categorical filter without naming the exact final value set.
+- When the main model emits clarification-like text instead of a tool call.
+
+### What the SQL agent should refuse or fail
+
+Code-grounded:
+
+- Out-of-scope questions are refused by the scope gate classifier in `scope_guard.py`.
+- Prompt injection style requests such as persona changes or instruction overrides are treated as out of scope by the scope-gate prompt.
+- Destructive or administrative SQL is blocked by `validate_sql_read_only()` in `db.py`.
+- Privacy-sensitive results can be converted into a count-only fallback or blocked entirely by the public-result shaping logic in `callbacks.py`.
+
+### What the SQL agent does not do
+
+Code-grounded:
+
+- It does not write to the database.
+- It does not use cross-session long-term memory.
+- It does not guarantee automatic correction of typos via deterministic fuzzy matching.
+- It does not implement a built-in handoff to another agent.
+- It does not contain a custom orchestrator for routing off-topic requests elsewhere.
+
+Important boundary for your web app:
+
+- This package itself **refuses** out-of-scope requests.
+- It does **not** call `orchestrator_agent` or another agent package when refusal happens.
+- If you want off-topic questions handed to another subsystem, that handoff must happen outside this package.
+
+## Public Entry Points
+
+The package exposes several surfaces, but only some are part of the live runtime.
+
+| Surface | Code | Role in the real system |
+| --- | --- | --- |
+| `SQLAgent.ask(question, **kwargs)` | `agent.py` | Thin wrapper that delegates to `runtime.ask_question(...)`. This is the cleanest programmatic integration point for a web app. |
+| `ask_question(question, settings, runner=None, session_id=None)` | `runtime.py` | Real single-question runtime helper. Creates or reuses an `InMemoryRunner`, creates an ADK session if needed, streams events, and returns the final text. |
+| `run_interactive_loop(settings)` | `runtime.py` | REPL-like local loop that deliberately reuses one runner and one session across turns. Useful for debugging multi-turn behavior. |
+| `build_root_agent(settings)` | `agent.py` | Constructs the ADK `LlmAgent` with model, instruction, tools, and callbacks. |
+| `root_agent` | `agent.py` | Import-time ADK-discoverable root agent object. Useful for `adk run` and `adk web`. |
+| `run-sql-agent` CLI | `cli.py` | Thin shell over `load_settings(...)`, `ask_question(...)`, and `run_interactive_loop(...)`. |
+| `run_nl_to_sql_pipeline(...)` | `pipeline.py` | Deterministic helper used by tests and support workflows. It is **not** the main live ADK runtime. |
+
+Two integration details matter for a web app:
+
+1. `SQLAgent.ask(...)` only preserves multi-turn context if the same runner/session is reused under the hood.
+2. `runtime.ask_question(...)` caches runners by a settings-derived key and reuses the session id from settings unless the caller overrides it.
+
+That means:
+
+- same settings + same session id -> conversation state can survive
+- different settings or a different session id -> state is effectively reset
+- process restart -> all in-memory session state is lost
 
 ## High-Level Architecture
 
-```text
-User question
-    |
-    v
-run-sql-agent / cli.py
-    |
-    v
-load_settings(...)
-    |
-    v
-build_root_agent(settings)
-    |
-    +--> build_agent_instruction(settings)
-    |       |
-    |       +--> get_schema_summary(db_path)
-    |
-    +--> build_sql_tools(settings)
-            |
-            +--> inspect_sqlite_schema(...)
-            +--> execute_sqlite_read_only(...)
-                        |
-                        +--> validate_sql_read_only(...)
-                        +--> execute_sqlite_query(...)
-
-ADK InMemoryRunner
-    |
-    v
-LLM chooses tools and writes SQL
-    |
-    v
-after_tool_callback stores last SQL result
-    |
-    v
-before_model_callback finalizes SQL result when a public result already exists
-  |
-  v
-after_agent_callback acts as a guarded fallback renderer
-    |
-    v
-User sees:
-- Generated SQL
-- What I matched
-- Result
-
-When a categorical filter matched only a subset of a column's known low-cardinality stored values,
-the `What I matched` section also shows a labeled `Stored values for <column>:` line for that same
-column so users can see other stored categories without changing the executed query.
+```mermaid
+flowchart TD
+    U[User or web app] --> R[runtime.ask_question or SQLAgent.ask]
+    R --> S[ADK InMemoryRunner and session]
+    S --> A[build_root_agent -> LlmAgent]
+    A --> BM[before_model callback chain]
+    BM --> SG[Scope and grounding resolvers in scope_guard.py]
+    BM --> M[Main LiteLlm model]
+    M --> AM[after_model callback]
+    AM --> T{Tool call?}
+    T -->|inspect_sqlite_schema| IS[Schema inspection in db.py]
+    T -->|execute_sqlite_read_only| EX[Validation and SQLite execution in db.py]
+    IS --> M
+    EX --> AT[after_tool callback]
+    AT --> ST[Session state and working memory]
+    ST --> BF[before_model finalize short-circuit]
+    BF --> F[format_public_query_result]
+    F --> AF[after_agent fallback renderer]
+    AF --> U
 ```
 
-## How To Run It
+The shortest accurate summary is:
 
-Use the project virtual environment or `uv run`. On this machine, bare `python` is not the project interpreter.
+- `agent.py` wires the system together.
+- `runtime.py` owns sessions and event streaming.
+- `callbacks.py` is the state machine.
+- `scope_guard.py` is the control-plane classifier layer.
+- `db.py` is the safety and execution layer.
+- `formatting.py` is the deterministic response renderer.
 
-### One-shot CLI
+## Actual Workflow Stages
 
-```powershell
-uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite --question "How many female passengers are below 45 years old?"
-```
+The table below names the real stages from code. Stage names use actual builder or helper functions whenever possible.
 
-### Interactive mode
+| Stage | Code location | Entered when | What it does | Main artifacts |
+| --- | --- | --- | --- | --- |
+| 1. Agent construction | `build_root_agent()` in `agent.py` | Agent build time | Creates `LlmAgent`, injects instruction, tools, and four callbacks | `LlmAgent` instance |
+| 2. Session setup | `ask_question()` / `run_interactive_loop()` in `runtime.py` | Each user turn | Reuses or creates `InMemoryRunner`, creates session if needed, wraps user text in ADK `Content` | ADK session, event stream |
+| 3. Fresh-turn preamble | `build_combined_before_model_callback()` in `callbacks.py` | Before model call, when request does not end with tool response | Clears old private result state, extracts the effective user question, stores current topic text | `temp:sql_last_user_text`, `temp:sql_active_query_topic` |
+| 4. Pending clarification branch | same callback | Working memory contains `pending_clarification` | Resolves numeric, exact-text, or resolver-based clarification replies; rewrites latest user turn | rewritten latest user message |
+| 5. Recent interpretation replay | same callback | Working memory contains `recent_interpretation_clarification` | Allows one later selection-like reply to reuse interpretation options after a result turn | rewritten latest user message |
+| 6. Result refinement branch | same callback | Working memory contains `current_query_frame` | Decides whether the new turn refines the previous query, needs clarification, or starts a fresh topic | rewritten follow-up or pending clarification |
+| 7. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, either grounds filters or asks interpretation clarification | rewritten question or pending clarification |
+| 8. Scope gate | `build_scope_gate_callback()` via same callback | No earlier short-circuit blocked it | Runs dataset-scope classifier and returns refusal on out-of-scope prompts | refusal `LlmResponse` |
+| 9. Main model step | ADK `LlmAgent` | `before_model_callback` returned `None` | Main model can ask clarification, inspect schema, run exploratory SQL, or run final SQL | plain text or function call |
+| 10. Clarification normalization | `build_normalize_clarification_after_model_callback()` | Main model returned text, not a function call | Converts clarification-like text into deterministic clarification output and stores pending clarification | pending clarification + normalized clarification text |
+| 11. Tool execution | `build_sql_tools()` -> `db.py` | Model issued an ADK tool call | Runs schema inspection or validated SQL execution | tool response dict |
+| 12. Result capture | `build_remember_query_result_callback()` | Tool was `execute_sqlite_read_only` | Builds last query frame, public result, privacy shaping, and optional internal result state | working memory + temp public result |
+| 13. Finalize short-circuit | `build_finalize_after_query_before_model_callback()` | A public result is already present before the next model step | Returns final structured SQL answer without another real model call | rendered final answer |
+| 14. Fallback render | `build_format_final_agent_response_callback()` | Agent finishes and result was not already rendered | Final fallback formatter for the same public result contract | rendered final answer |
 
-```powershell
-uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite
-```
+### What counts as success, pause, and failure
 
-### Debug mode
+Successful completion:
 
-```powershell
-uv run run-sql-agent --db dataset\\titantic\\titanic.sqlite --debug
-```
+- The model reaches a final `execute_sqlite_read_only(..., is_final=True)` call.
+- `after_tool_callback` stores `temp:sql_public_result`.
+- The finalize path renders `Generated SQL`, `What I matched`, and `Result`.
 
-### ADK-native mode
+Paused completion waiting for user input:
 
-Run this from the `src` directory so ADK can discover the `agent_zoo/sql_agent` agent folder:
+- The main model asks for clarification.
+- `after_model_callback` normalizes it and stores `pending_clarification`.
+- The turn ends with a clarification message instead of a SQL result.
 
-```powershell
-cd src
-adk run agent_zoo/sql_agent
-```
+Failure or refusal completion:
 
-For the local ADK web UI:
+- Scope gate returns out-of-scope refusal.
+- SQL validation fails.
+- SQLite execution fails.
+- Privacy shaping blocks the result.
+- The model produces unusable output and the turn degrades to a fixed clarification or error response.
 
-```powershell
-cd src
-adk web --no-reload
-```
-#### ADK Web UI Preview
+### Where the workflow loops
 
-<p align="center">
-  <img src="../../../assets/adk_webui_sample.png" alt="ADK Web UI Screenshot" width="1000">
-</p>
+There are two real loops, both spanning multiple turns inside the same session.
 
-## The Exact Request Lifecycle
+1. Clarification loop
+   - pending clarification is stored
+   - user replies later
+   - `before_model_callback` rewrites the new user turn as a continuation of the earlier request
+   - the main model continues from there
 
-This section follows a real request through the code.
+2. Result refinement loop
+   - a final query stores `current_query_frame`
+   - a later user turn such as `include retired too` is treated as a modification of the previous SQL-backed question
+   - the callback rewrites the new user turn to include previous question, SQL, and filter context
 
-### 1. `cli.py` parses CLI arguments
+There is **no** general-purpose automatic SQL retry loop in Python code.
 
-`src/agent_zoo/sql_agent/cli.py` is the canonical entrypoint, exposed through the installed `run-sql-agent` command.
+What does retry-like work instead:
 
-It does four important things:
+- multi-step schema grounding inside `build_llm_schema_grounding_resolver()`
+- model-driven follow-up tool calls if the main model chooses to recover after seeing a tool result
 
-1. Defines CLI arguments:
-   - `--db`
-   - `--model`
-   - `--debug`
-   - `--instruction-file`
-   - `--question`
-2. Calls `load_settings(...)` to merge CLI overrides with environment defaults.
-3. Chooses between:
-   - one-shot mode via `ask_question(...)`
-   - interactive mode via `run_interactive_loop(...)`
+## State Management
 
-If `--question` is present, it asks once and exits. Otherwise, it starts a REPL-like loop.
+This is the part of the implementation that most strongly affects correctness.
 
-### 2. `config.py` resolves settings and paths
+### Ownership boundaries
 
-`src/agent_zoo/sql_agent/config.py` is responsible for configuration.
+The SQL agent uses four different kinds of state.
 
-The main pieces are:
+| State bucket | Owned by | Lives where | Lifetime | Purpose |
+| --- | --- | --- | --- | --- |
+| Agent configuration | SQL agent code | `SQLAgentSettings` object | Agent instance / runtime invocation | Static settings such as db path, model, privacy mode, and object-level mode |
+| Session history and session state | ADK runtime | ADK `Session` created by `InMemoryRunner` | One conversation session | Chronological event history plus mutable session state |
+| SQL-agent working memory | Custom helper layer in `working_memory.py` | Nested under `session.state['agent_working_memory']['sql_agent']` | One conversation session | Cross-turn structured memory for clarifications and last query context |
+| Local callback variables | Python call stack | callback/resolver functions | One function call | Temporary decision state such as matched options or grounded filters |
 
-- `load_dotenv()`
-- `PROJECT_ROOT`
-- `DEFAULT_DB_PATH`
-- `DEFAULT_MODEL`
-- `SQLAgentSettings`
-- `load_settings(...)`
+Important distinction:
 
-#### `PROJECT_ROOT`
+- This package uses **ADK session state**.
+- It does **not** use ADK `MemoryService`.
+- The `working memory` here is a custom dict stored inside session state, not a separate ADK memory subsystem.
+
+### Configuration state: `SQLAgentSettings`
+
+`SQLAgentSettings` is the only class-level runtime configuration container in this package.
+
+| Field | Used by | Effect on behavior |
+| --- | --- | --- |
+| `db_path` | `instructions.py`, `tools.py`, `db.py`, `runtime.py` | Chooses the SQLite file used for schema inspection and execution |
+| `model` | `agent.py`, `scope_guard.py` builders | Chooses both the main LiteLLM model and the sidecar resolver model |
+| `openai_api_base` | `agent.py` | Sets `OPENAI_API_BASE` before model construction |
+| `debug` | `runtime.py`, `callbacks.py`, `scope_guard.py` | Enables debug prints and extra resolver debug labeling |
+| `instruction_file` | `instructions.py` | Replaces the default instruction text if present |
+| `preview_rows` | `tools.py`, `db.py` | Caps result previews and affects truncation behavior |
+| `count_aggregates_only` | `callbacks.py`, `runtime.py` | Enables privacy-shaped public results and debug redaction of tool responses |
+| `minimum_aggregate_count` | `callbacks.py` | Sets privacy threshold for scalar and grouped aggregates |
+| `capture_internal_rows` | `callbacks.py` | Stores raw internal query results in temp state |
+| `include_categorical_value_guidance` | `instructions.py`, `tools.py`, `callbacks.py` | Includes low-cardinality stored values in schema summaries and prompts |
+| `max_categorical_values` | `db.py`, `instructions.py`, `tools.py`, `callbacks.py` | Caps how many categorical values are surfaced per column |
+| `object_id_column` | `config.py`, `db.py` | Enables object-level canonicalization of result queries |
+| `object_order_column` | `config.py`, `db.py` | Adds stable ordering to object-level canonicalization |
+| `app_name`, `user_id`, `session_id` | `runtime.py` | Identify the ADK app/session and influence runner reuse |
+
+### ADK session history and what the code relies on
+
+ADK docs describe a `Session` as the current conversation thread containing event history and mutable session state. That is exactly how this package behaves:
+
+- `runtime.ask_question(...)` calls `runner.run_async(...)` with `user_id`, `session_id`, and a new `Content` object.
+- ADK keeps the event history for that session.
+- The SQL agent does **not** manually rebuild older chat turns into a new prompt string on each turn.
+
+Instead, the code relies on a mix of:
+
+- ADK-managed event history
+- session state keys
+- custom working memory
+- explicit rewriting of the latest user turn before the next model call
+
+### Session-state keys used by this package
+
+These keys live directly in `callback_context.state` or `tool_context.state`.
+
+| Key | Set by | Meaning | Typical lifetime |
+| --- | --- | --- | --- |
+| `temp:sql_public_result` | `build_remember_query_result_callback()` | Final public result contract used for deterministic rendering | Current turn, cleared at next fresh-turn preamble |
+| `temp:sql_public_result_rendered` | finalize callbacks | Marks that the public result was already rendered once | Current turn |
+| `temp:sql_internal_result_ref` | `build_remember_query_result_callback()` | Points at which temp key contains internal query data | Current turn |
+| `temp:sql_internal_query_result` | `build_remember_query_result_callback()` when `capture_internal_rows=True` | Raw internal query result dict | Current turn |
+| `temp:sql_last_user_text` | `build_combined_before_model_callback()` | Last extracted terminal user question text | Session-scoped until overwritten |
+| `temp:sql_active_query_topic` | `build_combined_before_model_callback()` and follow-up paths | Current active query topic after rewrites | Session-scoped until overwritten |
+| `temp:sql_refinement_source_query_frame` | refinement and clarification follow-up paths | Previous query frame used while applying a refinement | Current turn or until consumed |
+| `temp:sql_fresh_topic_clarification` | clarification and refinement topic-change paths | Flag meaning the next clarification belongs to a fresh topic, not the previous query frame | Very short-lived; explicitly consumed and cleared |
+
+How these keys are reset:
+
+- `_clear_private_result_state(...)` clears the public/internal result keys at the start of a fresh turn.
+- `_clear_fresh_topic_clarification_state(...)` clears the fresh-topic flag when consumed.
+- `temp:sql_last_user_text` and `temp:sql_active_query_topic` are overwritten every new turn.
+
+### Custom working memory
+
+`working_memory.py` stores one nested snapshot per agent namespace under:
 
 ```python
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+session.state['agent_working_memory']['sql_agent']
 ```
 
-Because `config.py` lives at `src/agent_zoo/sql_agent/config.py`, going up three directories lands at the repo root.
+This package currently uses three fields there.
 
-#### Default database path
+| Working-memory field | Meaning | Set by | Cleared by |
+| --- | --- | --- | --- |
+| `pending_clarification` | The clarification the user still needs to answer | `build_normalize_clarification_after_model_callback()` and some pre-model clarification builders | Cleared after successful follow-up resolution or topic change |
+| `current_query_frame` | Structured summary of the last committed final query | `build_remember_query_result_callback()` | Replaced by the next committed final query or removed manually |
+| `recent_interpretation_clarification` | Short-lived copy of an interpretation clarification that may survive one later selection-like reply | `before_model_callback` after certain follow-up resolutions | Cleared after reuse or when deemed stale |
 
-```python
-DEFAULT_DB_PATH = PROJECT_ROOT / "dataset" / "titantic" / "titanic.sqlite"
-```
+### `current_query_frame`: what exactly is saved
 
-Two details matter here:
+`_build_last_query_frame(...)` constructs the saved query frame from:
 
-- The default database path is repo-relative.
-- The folder name is `titantic`, not `titanic`, because that is how the repository currently names the dataset folder.
+- `SQL_ACTIVE_QUERY_TOPIC_STATE_KEY` or `SQL_LAST_USER_TEXT_STATE_KEY`
+- `tool_response['display_sql']` if present
+- otherwise the tool args SQL or executed SQL
 
-#### `resolve_repo_path(...)`
+The saved frame can include these fields:
 
-This function explains why relative database paths work from the repo root:
+| Field | Meaning |
+| --- | --- |
+| `question` | Current committed dataset question/topic |
+| `sql` | User-visible SQL, preferring `display_sql` when present |
+| `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values` and `available_values` |
+| `comparison_filters` | Extracted comparison filters such as `age > 46` |
+| `topic_context` | Multi-line text summary built from the frame and reused by refinement logic |
+| `recent_refinement` | Optional summary of recent categorical additions/removals |
 
-1. If the incoming path is absolute, return it unchanged.
-2. If it is relative, try `Path.cwd() / path`.
-3. If that does not exist, try `PROJECT_ROOT / path`.
-4. If neither exists yet, return the project-root candidate anyway.
+Two important consequences:
 
-That last behavior is intentional: it gives the rest of the code a normalized path even when the file is missing.
+1. The query frame is **not** the full previous tool result.
+2. It is a structured summary optimized for follow-up refinements and final rendering.
 
-#### Precedence rules
+### `pending_clarification`: what exactly can be saved
 
-`load_settings(...)` merges settings in this order:
+The pending clarification payload is a dict. Depending on the path that created it, it may contain:
 
-1. Explicit CLI overrides
-2. Environment variables
-3. Hardcoded defaults
+| Field | Meaning |
+| --- | --- |
+| `user_message` | User-facing clarification question |
+| `options` | Clarification options after normalization |
+| `clarification_kind` | One of `categorical_values`, `generic`, or `interpretation` |
+| `topic_context` | Current question/topic text |
+| `query_context` | Previous query frame topic summary when a clarification belongs to an earlier committed query |
+| `base_query_frame` | Copy of the prior committed query frame, used when refinement must continue after clarification |
+| `option_columns` | Mapping from displayed interpretation option label back to exact schema column identifier |
+| `grounded_filters` | Already grounded categorical filters from the original request |
 
-Supported environment variables:
+### What is persistent across turns vs not
 
-- `SQL_AGENT_DB_PATH`
-- `SQL_AGENT_MODEL`
-- `SQL_AGENT_DEBUG`
-- `SQL_AGENT_INSTRUCTION_FILE`
-- `SQL_AGENT_PREVIEW_ROWS`
+Persistent across turns in the **same ADK session**:
 
-#### OpenAI-compatible local endpoint support
+- ADK event history
+- `temp:sql_last_user_text`
+- `temp:sql_active_query_topic`
+- custom working memory
+- last committed query frame
+- pending clarification state
 
-The project uses LiteLLM with an OpenAI-compatible backend pattern.
+Not persistent across sessions or process restarts:
 
-`_ensure_local_openai_api_key()` exists because some OpenAI-compatible stacks expect a key to be present even when the server is local. If:
+- all of the above, because `InMemoryRunner` uses in-memory session services in this package
 
-- `OPENAI_API_BASE` exists
-- `OPENAI_API_KEY` does not exist
+Not custom-persisted even within a session:
 
-the code injects a harmless placeholder key:
+- model chain-of-thought
+- a separate transcript of clarification answers
+- a durable cross-session memory store
 
-```python
-os.environ["OPENAI_API_KEY"] = "local-openai-compatible-key"
-```
+### Does the agent store conversation history, schema context, tool results, and intent interpretations?
 
-### 3. `agent.py` builds the ADK `LlmAgent`
+Yes, but not all in the same way.
 
-The live agent is constructed in `src/agent_zoo/sql_agent/agent.py`.
+| Artifact | Stored? | Where |
+| --- | --- | --- |
+| Conversation history | Yes | ADK session events |
+| Last user topic text | Yes | `temp:sql_last_user_text` |
+| Active rewritten topic | Yes | `temp:sql_active_query_topic` |
+| Full raw tool result | Optionally | `temp:sql_internal_query_result` when `capture_internal_rows=True` |
+| Public query result | Yes, for current turn | `temp:sql_public_result` |
+| Previous final query summary | Yes | `current_query_frame` in working memory |
+| Clarification state | Yes | `pending_clarification` in working memory |
+| Recent interpretation menu | Yes, short-lived | `recent_interpretation_clarification` |
+| Schema snapshot | Not as mutable state; rebuilt as needed | instruction text and schema summaries |
+| Intermediate reasoning text | No intentional structured store | callback normalization tries to strip it |
 
-The important function is:
+### How state gets discarded
 
-```python
-def build_root_agent(settings: SQLAgentSettings | None = None) -> LlmAgent:
-```
+Code-grounded:
 
-If no settings are passed, it calls `load_settings()` itself.
+- Starting a fresh turn clears public/internal result temp keys.
+- Resolving a clarification clears `pending_clarification`.
+- Topic change clears `pending_clarification` and marks a fresh-topic flag.
+- Reusing recent interpretation clarification clears that recent copy.
+- New final queries overwrite `current_query_frame`.
+- New sessions start empty unless the caller preloads session state externally.
 
-The returned ADK agent is configured with:
+## Context Management
 
-- a LiteLLM-backed model
-- a name: `sql_agent`
-- a description
-- a dynamically built instruction
-- two tools
-- `temperature=0.0`
-- a `before_model_callback`
-- an `after_model_callback`
-- an `after_tool_callback`
-- an `after_agent_callback`
+This section answers: what does the model see, at which point, and why?
 
-#### Why `temperature=0.0`?
+### Main model context
 
-This reduces randomness and makes SQL generation more stable and testable.
+The main ADK `LlmAgent` model sees a combination of build-time instruction, ADK session history, tool outputs, and the current user turn.
 
-#### `root_agent = build_root_agent()`
+#### Build-time instruction assembled in `instructions.py`
 
-The module also creates:
-
-```python
-root_agent = build_root_agent()
-```
-
-This makes the package easy for ADK to discover in `adk run`, because the agent object exists at import time.
-
-One subtle consequence: if environment variables change after import, `root_agent` will not automatically rebuild itself. The CLI runner avoids that problem by calling `build_root_agent(settings)` with explicit settings for each run.
-
-### 4. `instructions.py` builds the system prompt
-
-`src/agent_zoo/sql_agent/instructions.py` is where the agent instruction is assembled.
-
-It has two layers:
+`build_agent_instruction(settings)` concatenates:
 
 1. `DEFAULT_INSTRUCTION`
-2. runtime context appended by `build_agent_instruction(settings)`
+2. runtime context fields such as db path and preview rows
+3. schema snapshot from `get_schema_summary(...)`
+4. optional categorical value guidance section
 
-`DEFAULT_INSTRUCTION` tells the model to:
+That means the main model starts every session with:
 
-- inspect the schema first
-- use SQLite-compatible SQL
-- avoid inventing tables or columns
-- stay read-only
-- use `LOWER(...)` when appropriate
-- handle grouped or bucketed missing values by mapping `NULL` and blank strings to `Null`
-- use `COUNT(*)` for counts
-- use `LIMIT` for large listings
-- avoid exposing reasoning
-- emit exactly one JSON object when a clarification is needed before querying
-- stop after the final tool call and let Python render the final SQL answer deterministically
-
-`build_agent_instruction(settings)` also appends:
-
-- the default database path
-- the preview row limit
+- rules for tool order and SQL generation
+- the configured database path
+- privacy-related settings
 - a schema snapshot
+- low-cardinality stored values when enabled
 
-That schema snapshot comes from `get_schema_summary(settings.db_path)`.
+This is why the model often does **not** need to call `inspect_sqlite_schema` before its first SQL attempt, even though the instruction tells it to inspect schema when unsure.
 
-The model sees schema context twice:
+#### Current user turn content
 
-1. once in the initial instruction at agent-build time
-2. again at runtime if it calls the `inspect_sqlite_schema` tool
+The current user turn can reach the model in three different shapes.
 
-That duplication is intentional:
+1. Raw fresh question
+   - Example: `how many females drink`
 
-- the snapshot gives the model grounding before it makes any tool decision
-- the tool gives the model a structured way to re-inspect or confirm schema during the turn
+2. Rewritten clarification follow-up
+   - The callback rewrites the latest user turn into a structured continuation of the earlier question.
+   - The rewritten text can include:
+     - the previous clarification question
+     - available options
+     - matched options from numeric or text replies
+     - already grounded filters
+     - resolved schema fields from interpretation replies
+     - the raw user reply
 
-### 5. `tools.py` exposes the database helpers as ADK tools
+3. Rewritten result refinement follow-up
+   - The callback rewrites the latest user turn into a continuation of the previous committed query.
+   - The rewritten text can include:
+     - previous dataset question
+     - previous SQL
+     - prior categorical filters
+     - updated categorical value set
+     - same-query refinement request text
 
-`src/agent_zoo/sql_agent/tools.py` defines `build_sql_tools(settings)`.
+That latest rewritten user message is one of the most important context-construction mechanisms in the package.
 
-It returns two plain Python callables:
+#### ADK session history
 
-- `inspect_sqlite_schema`
-- `execute_sqlite_read_only`
+The code does not manually concatenate previous chat turns into the prompt, but ADK session history still exists for the main model because `run_async(...)` is called against a session id.
 
-These functions are closures over `settings`, which means they automatically use the configured database path and preview limit unless the caller explicitly overrides them.
+What the SQL-agent code itself explicitly depends on, beyond ADK history:
 
-At the bottom of `build_sql_tools(...)` the code explicitly sets:
+- last extracted user topic
+- saved clarification state
+- saved query frame
+- tool response state for the current turn
 
-```python
-inspect_sqlite_schema.__name__ = "inspect_sqlite_schema"
-execute_sqlite_read_only.__name__ = "execute_sqlite_read_only"
-```
+### Secondary resolver context
 
-This matters because ADK uses the function name and docstring as part of the tool metadata shown to the model.
+The package also makes separate LiteLLM calls in `scope_guard.py`. These are **not** ADK tools. They are extra control-plane LLM calls used before the main model or in follow-up routing.
 
-### 6. `runtime.py` runs the agent with ADK
+| Resolver | Inputs it sees | Purpose |
+| --- | --- | --- |
+| `build_llm_scope_gate()` | schema text + latest effective user text | Decide `IN_SCOPE` vs `OUT_OF_SCOPE` |
+| `build_llm_clarification_resolver()` | topic context, clarification question, options, latest reply | Decide `selected_options`, `custom_rule`, or `topic_change` |
+| `build_llm_result_refinement_resolver()` | previous question, topic context, previous SQL, categorical filters, recent refinement history, latest reply | Decide `refine_query`, `needs_clarification`, or `topic_change` |
+| `build_llm_schema_grounding_resolver()` | latest user request, schema column previews, grounding candidates, candidate column identifiers | Decide grounded categorical filters and unresolved field ambiguity |
 
-`src/agent_zoo/sql_agent/runtime.py` is the bridge between the configured agent and the local execution loop.
+### Schema-grounding context in particular
 
-It uses ADK's `InMemoryRunner`.
+Fresh-turn schema grounding is richer than a simple column-name match.
 
-`ask_question(...)`:
+`_build_schema_grounding_catalog(...)` constructs:
 
-1. builds an `InMemoryRunner` if one was not provided
-2. creates a session if needed
-3. wraps the user question in `Content(role="user", parts=[Part(text=question)])`
-4. streams events from `runner.run_async(...)`
-5. optionally prints debug information
-6. captures the final model response text
+- schema column identifiers
+- optional human-readable labels from `source_header`
+- optional field glossary labels parsed from an upstream `Field glossary:` block in the wrapped prompt
+- categorical value candidates from `categorical_values`
+- lexical evidence from `_build_grounding_variants(...)`
 
-`run_interactive_loop(...)` creates one shared runner and one shared session, then reuses them across multiple user turns. That means session state can survive between turns during the same interactive run.
+The grounding variants helper expands text into:
 
-The SQL agent now layers a small per-agent working-memory snapshot on top of that session state. In practice, that means the callback flow can keep the current committed query frame, pending clarification state, and the most recent categorical refinement diff together under one SQL-agent namespace instead of treating every follow-up as only "last user text + last SQL". When a refinement deterministically swaps one stored categorical value for another, the committed query frame also rewrites its question/topic text to stay aligned with the current filter state.
+- the normalized full phrase
+- individual tokens
+- simple singularized token variants
 
-### 7. `callbacks.py` captures the tool result and finalizes the answer
+This matters for colloquial prompts such as `guys`, plural labels, and field glossary terms.
 
-This file is one of the most important implementation details.
+### After-model clarification context
 
-The live agent is not relying only on prompt formatting. It uses ADK callbacks to shape clarification output and to render final SQL answers from structured state.
+When the main model returns clarification-like text instead of a function call, `build_normalize_clarification_after_model_callback()` sees:
 
-For formatting, the important callbacks are:
+- raw model text
+- categorical value guidance from `get_schema_summary(...)`
+- current topic text from `temp:sql_last_user_text`
+- optional query context and base query frame when the clarification belongs to an existing committed query
 
-- `build_remember_query_result_callback(...)`
-- `build_normalize_clarification_after_model_callback(...)`
-- `build_finalize_after_query_before_model_callback(...)`
-- `build_format_final_agent_response_callback(...)`
+It then:
 
-#### `build_remember_query_result_callback(...)`
+- parses JSON if possible
+- extracts embedded JSON if the model mixed prose with a trailing JSON object
+- falls back to heuristics when needed
+- clamps options to exact dataset categorical values when guidance strongly matches
+- strips topic echo or reasoning pollution from the option list
+- stores a normalized pending clarification payload
 
-This builder returns the callback registered as `after_tool_callback`.
+### Final rendering context
 
-It checks the tool name:
+No LLM is involved in final formatting once a public result exists.
 
-```python
-if tool_name == "execute_sqlite_read_only":
-```
+`format_public_query_result(...)` renders from the callback-owned public result dict, which can include:
 
-When that tool runs, the callback builds a public result and stores it into ADK session state under:
+- `display_sql`
+- public rows
+- aggregate column metadata
+- `matched_row_count`
+- `public_result_kind`
+- `grouped_result_suppressed`
+- `query_summary_context`
 
-```python
-temp:sql_public_result
-```
+That is how the final answer stays deterministic even if the model earlier produced messy prose.
 
-If a final query frame exists, it also stores deterministic summary context such as matched categorical filters and comparison filters. The callback now also updates the SQL agent's shared working-memory snapshot with the current committed query frame and, when the current turn was a refinement, a one-step categorical diff describing which values were added or removed. Model-born clarifications also inherit the current committed query frame so later clarification replies can continue from the committed state instead of a transient short phrase. The callback is not formatting the visible answer yet. It is preparing the structured public contract that later rendering uses.
+### What is and is not included at each point
 
-#### `build_normalize_clarification_after_model_callback(...)`
+| Context item | Main model | Scope gate | Clarification resolver | Result refinement resolver | Schema grounding resolver | Final formatter |
+| --- | --- | --- | --- | --- | --- | --- |
+| ADK session history | Yes, ADK-managed | No | No | No | No | No |
+| Static instruction text | Yes | No | No | No | No | No |
+| Schema snapshot | Yes | Yes, as classifier system prompt context | No | No | Yes | No |
+| Categorical value guidance | Yes, in instruction when enabled | No | No | Via saved query frame values only | Yes, via schema summary candidates | Indirectly via `query_summary_context` |
+| Latest user turn | Yes | Yes | Yes | Yes | Yes | No |
+| Previous clarification question/options | Only if pre-model rewrite inserted them | No | Yes | No | No | No |
+| Previous final SQL | Only if pre-model refinement rewrite inserted it | No | No | Yes | No | No |
+| Prior tool errors | Only if present in ADK session history | No | No | No | No | No |
+| Saved query frame | Indirectly, via rewrites | No | Sometimes via `query_context` | Yes | No | Yes, via `query_summary_context` |
+| Public result | Not directly, except through tool response history and later formatter | No | No | No | No | Yes |
 
-This builder returns the callback registered as `after_model_callback`.
+## Workflow Stages and Transition Conditions
 
-It inspects plain-text model output that did not contain a function call. If the text looks like a clarification, it normalizes it into a deterministic clarification structure and renders numbered options in Python.
+This section focuses on the actual branch conditions that move the request from one stage to another.
 
-If the text looks clarification-like but cannot be normalized confidently, it now falls back to one fixed clarification prompt instead of trying to infer unstable option lists from loose prose.
+### 1. Fresh-turn preamble
 
-#### `build_finalize_after_query_before_model_callback(...)`
+Code path:
 
-This builder returns the finalize step used inside the `before_model_callback` chain.
+- `build_combined_before_model_callback()`
 
-When a public SQL result is already present in state, it returns an `LlmResponse(...)` built from the deterministic formatter before the next model call happens. That makes this the authoritative path for final SQL result formatting in the normal success flow.
+Entry condition:
 
-It also marks the result as already rendered in state so later callbacks know they are in fallback territory rather than the main render path.
+- request does **not** end with a tool response
 
-#### `build_format_final_agent_response_callback(...)`
+What enters:
 
-This builder returns the callback registered as `after_agent_callback`.
+- the latest ADK `llm_request`
+- callback session state
 
-It reads the stored result from session state. If it finds a dictionary that has not already been rendered by the before-model finalize path, it returns a new `types.Content(...)` object built from the deterministic formatter.
+What happens:
 
-In other words, `after_agent_callback` is now a guarded fallback renderer. It preserves the same final answer shape if the normal before-model short-circuit path was not the one that produced the visible response.
+- clear stale public/internal result state
+- clear stale fresh-topic flag
+- extract raw latest user text and effective topic text
+- store topic in `temp:sql_last_user_text` and `temp:sql_active_query_topic`
 
-That gives the project two benefits:
+Moves on to:
 
-1. The user always sees the exact SQL that actually ran.
-2. The visible final answer is less dependent on the model's formatting discipline.
+- pending clarification logic if `pending_clarification` exists
+- otherwise recent interpretation reuse, result refinement, schema grounding, or scope gate
 
-#### Important limitation of callback-driven final formatting
+### 2. Pending clarification follow-up resolution
 
-These callbacks only affect the final response they produce. They cannot unsend earlier streamed text. If the model emits reasoning-like text before the final answer and the UI displays it live, callback-based formatting cannot erase that already-streamed content.
+Code path:
 
-That is why:
+- `_get_pending_clarification(...)`
+- `_extract_matching_clarification_options(...)`
+- `_resolve_pending_clarification_reply(...)`
+- `_apply_pending_clarification_followup_with_resolution(...)`
 
-- the plain CLI runner can still be clean, because it only prints the final captured response unless debug is enabled
-- `adk run` can still show intermediate events, depending on how the ADK CLI renders them
-- the before-model finalize short-circuit helps reduce second-turn formatting drift, but it still cannot erase text that has already been streamed earlier in the run
+Entry condition:
 
-### 8. `formatting.py` builds the user-facing output
+- working memory contains `pending_clarification`
 
-`src/agent_zoo/sql_agent/formatting.py` converts structured callback state into the exact response format.
+Actual transition conditions:
 
-#### `format_result_payload(tool_result)`
+- If the reply exactly matches option text or deterministically matches numeric option indexes like `2`, `2 and 3`, or `2,3`, the callback rewrites the latest user turn immediately.
+- If there is no exact or numeric match, it calls `build_llm_clarification_resolver()`.
+- Resolver outcome `selected_options` -> rewrite follow-up and continue.
+- Resolver outcome `custom_rule` -> rewrite follow-up and continue.
+- Resolver outcome `topic_change` -> clear pending clarification, mark fresh topic, and route through scope gate.
 
-Behavior:
+Outputs:
 
-- if execution failed, show the error
-- if no rows returned, say so
-- if there is exactly one row with one column, return the scalar value
-- otherwise JSON-format the rows
+- rewritten latest user turn containing clarification question, matched options or custom rule, and raw reply
+- cleared pending clarification state when successfully resolved
 
-This is why aggregate queries like `SELECT COUNT(*) ...` display just the number rather than a JSON array.
+Notable behavior:
 
-#### `build_sql_result_view_model(tool_result)`
+- selection-like clarification replies bypass the scope gate for that turn
+- query-context is preferred over topic-context when present
 
-This function converts the callback-owned public result dictionary into a small deterministic response contract. The current contract includes:
+### 3. Recent interpretation clarification replay
 
-- the display SQL shown to the user, preferring the original tool-call query when callbacks provide one
-- the rendered result payload
-- the `What I matched` section content
-- the public result kind
-- matched row count when available
-- query summary context when available
-- an optional privacy note
+Code path:
 
-The purpose of this layer is to keep rendering decisions out of the callback code paths.
+- `_get_recent_interpretation_clarification(...)`
 
-#### `render_sql_result_view_model(view_model)`
+Entry condition:
 
-This function renders the final SQL answer from the typed contract.
+- no active pending clarification, but recent interpretation clarification exists
 
-#### `format_public_query_result(...)`
+Actual transition condition:
 
-This is the main callback-facing formatter for final SQL results.
+- if the latest reply matches one or more of those saved interpretation options, the callback rewrites the turn and continues without scope gating
 
-It builds the view model and renders the final structured answer:
+Purpose:
+
+- allow one later numeric selection after a result turn to still resolve a previous interpretation menu
+
+### 4. Result refinement routing
+
+Code path:
+
+- `_get_last_query_frame(...)`
+- `_resolve_recent_refinement_followup(...)`
+- `build_llm_result_refinement_resolver()`
+- `_build_result_refinement_clarification(...)`
+- `_apply_last_query_refinement_followup(...)`
+
+Entry condition:
+
+- working memory contains `current_query_frame`
+
+Actual transition conditions:
+
+- Deterministic refinement helper runs first when it can handle the reply directly.
+- Otherwise the result-refinement resolver returns one of:
+  - `needs_clarification`
+  - `refine_query`
+  - `topic_change`
+
+Branch outcomes:
+
+- `needs_clarification` -> build categorical clarification using the previous query's filter column and available values; return that clarification immediately.
+- `refine_query` -> rewrite latest user turn with previous question, previous SQL, previous categorical filters, updated value set, and refinement request text.
+- `topic_change` -> mark fresh-topic flag and let the turn continue as a new dataset question.
+
+### 5. Fresh-topic scope precheck
+
+Code path:
+
+- `build_scope_gate_callback()` invoked early only when `temp:sql_fresh_topic_clarification` is set
+
+Entry condition:
+
+- a previous clarification or refinement reply was classified as a topic change
+
+Purpose:
+
+- prevent an off-topic topic-change reply from falling through into schema-grounding logic
+
+Important nuance:
+
+- This is **not** the normal fresh-turn order.
+- Normal fresh-turn schema grounding happens before scope gate.
+- Fresh-topic replies are a special case.
+
+### 6. Fresh-turn schema grounding
+
+Code path:
+
+- `_extract_request_field_glossary(...)`
+- `_build_schema_grounding_catalog(...)`
+- `build_llm_schema_grounding_resolver()`
+- `_normalize_schema_grounding_filters(...)`
+- `_build_schema_grounding_clarification(...)`
+- `_apply_grounded_filter_followup(...)`
+
+Entry condition:
+
+- fresh user turn with usable text, no earlier short-circuit
+
+Actual transition conditions:
+
+- Resolver returns `needs_clarification` with at least two candidate columns -> build interpretation clarification and stop.
+- Resolver returns grounded filters and no remaining ambiguity -> rewrite latest user turn with those grounded filters and continue.
+- Resolver returns no action -> fall through to scope gate.
+
+What triggers clarification here:
+
+- unresolved field-level ambiguity between two or more candidate schema columns
+
+What does **not** trigger this clarification:
+
+- pure value-level ambiguity within one already chosen field
+
+### 7. Scope gate
+
+Code path:
+
+- `build_llm_scope_gate()`
+- `build_scope_gate_callback()`
+
+Entry condition:
+
+- no earlier branch already returned clarification, refusal, or rewrite-only continuation
+
+Actual transition conditions:
+
+- classifier returns `OUT_OF_SCOPE` -> callback returns refusal `LlmResponse`
+- classifier returns `IN_SCOPE` or fails open -> allow normal model flow
+
+Important scope-gate behavior from prompt and tests:
+
+- schema-adjacent wording, approximate terms, colloquialisms, and near-match references are intentionally treated as in scope so the main agent can clarify instead of refusing
+
+### 8. Main model step
+
+Code path:
+
+- ADK `LlmAgent` main model call
+
+Entry condition:
+
+- `before_model_callback` returned `None`
+
+Possible next actions:
+
+- ask clarification before querying
+- call `inspect_sqlite_schema`
+- call `execute_sqlite_read_only(..., is_final=False)` for exploratory SQL
+- call `execute_sqlite_read_only(..., is_final=True)` for final SQL
+
+What is code-enforced vs instruction-enforced here:
+
+- tool choice order is mostly instruction-enforced
+- read-only execution safety is code-enforced by `db.py`
+
+### 9. Clarification normalization after model output
+
+Code path:
+
+- `build_normalize_clarification_after_model_callback()`
+
+Entry condition:
+
+- main model returned plain text instead of a function call
+
+Actual transition conditions:
+
+- plain text does not look like a clarification attempt -> do nothing
+- clarification JSON or parseable clarification-like text -> normalize and store pending clarification
+- clarification-like text that cannot be normalized confidently -> fall back to one fixed clarification prompt with no inferred options
+
+### 10. Tool execution
+
+Actual tool branches:
+
+- `inspect_sqlite_schema` -> schema summary dict
+- `execute_sqlite_read_only` -> validated execution result dict
+
+Notable transition condition:
+
+- `is_final=False` marks exploratory SQL; callbacks intentionally do **not** promote that result to final public state
+
+### 11. Result capture after tool execution
+
+Code path:
+
+- `build_remember_query_result_callback()`
+
+Entry condition:
+
+- tool is `execute_sqlite_read_only`
+
+Actual transition conditions:
+
+- if tool result is exploratory (`is_final=False`), do not store final public result; let model continue
+- if final tool result is successful, build `current_query_frame` and `temp:sql_public_result`
+- if privacy mode is on, return the public result dict back into the ADK tool-response flow
+
+### 12. Final answer generation
+
+Code paths:
+
+- primary: `build_finalize_after_query_before_model_callback()`
+- fallback: `build_format_final_agent_response_callback()`
+
+Entry condition:
+
+- `temp:sql_public_result` exists
+
+Actual transition conditions:
+
+- if result already rendered -> fallback callback returns `None`
+- if not rendered yet -> formatter returns deterministic SQL result content
+
+Final answer format:
 
 1. `Generated SQL`
 2. `What I matched`
 3. `Result`
+4. optional privacy note
 
-For categorical filters, `What I matched` may include an indented `Stored values for <column>:`
-line when the executed query used only some of the column's known low-cardinality stored values.
+## Tool Usage
 
-If the public result kind is `detail_count_fallback`, it also appends the privacy note explaining why only the matching count is shown.
+### Actual ADK tools
 
-If a grouped result omits one or more buckets due to the minimum aggregate threshold, it appends a generic privacy note explaining that some grouped results were omitted.
+The SQL agent registers exactly **two** ADK tools in `build_sql_tools(settings)`.
 
-If an initial grouped aggregate result was truncated to preview rows, the callback layer can re-run that grouped SQL with the full grouped row count before applying privacy suppression, so safe buckets are not blocked solely because the first tool response was only a preview.
+| Tool | Inputs | Output | Called during | Why it is called | Failure behavior | Mutates state? |
+| --- | --- | --- | --- | --- | --- | --- |
+| `inspect_sqlite_schema` | `db_path: str | None` | schema summary dict with `status`, `schema_text`, `tables`, optional categorical guidance | main model stage | Let the model confirm table and column names | returns structured error dict if DB missing or unreadable | No, returns data only |
+| `execute_sqlite_read_only` | `sql`, optional `db_path`, optional `preview_rows`, `is_final=True/False` | validated execution dict with `status`, SQL, columns, rows, counts, truncation, error, optional `display_sql` | main model stage | Run read-only SQL safely | returns structured validation or execution error dict | No, returns data only |
 
-#### Clarification fallback behavior
+### Tool output contracts
 
-Clarification rendering is also deterministic. If the model returns a proper clarification JSON object, or text that can be normalized confidently into one, Python renders the numbered clarification message.
+`inspect_sqlite_schema` returns:
 
-If the response only looks clarification-like but normalization is low confidence, the system now falls back to a fixed clarification prompt instead of exposing guessed option lists.
+- `status`
+- `db_path`
+- `schema_text`
+- `tables`
+- `table_count`
+- `categorical_value_guidance`
+- `categorical_value_guidance_text`
 
-### 9. `pipeline.py` contains a deterministic, non-ADK pipeline
+`execute_sqlite_read_only` returns:
 
-`src/agent_zoo/sql_agent/pipeline.py` is not the main live runtime. It exists to keep the core workflow testable without a real model.
+- `status`
+- `db_path`
+- `sql`
+- optional `display_sql`
+- `columns`
+- `rows`
+- `row_count`
+- `preview_row_count`
+- `truncated`
+- `error`
 
-The central function is:
+### Internal helper chain behind `execute_sqlite_read_only`
 
-```python
-run_nl_to_sql_pipeline(question, db_path, sql_generator, preview_rows=20)
-```
+These are not ADK tools, but they are essential parts of the actual workflow.
 
-It performs the same logical steps as the live system:
+| Helper | Role |
+| --- | --- |
+| `validate_sql_read_only()` | Rejects empty, multi-statement, non-`SELECT`/`WITH`, and schema-invalid SQL using `EXPLAIN QUERY PLAN` |
+| `execute_sqlite_query()` | Applies validation, grouped missing-value rewrite, categorical negation rewrite, optional object-level canonicalization, and actual SQLite execution |
+| `_rewrite_grouped_missing_category_sql()` | Rewrites grouped outputs so `NULL` and blank values surface as `Null` |
+| `_rewrite_categorical_negation_sql()` | Rewrites `!=`, `<>`, and `NOT IN` on schema-backed categorical columns into explicit retained values |
+| `count_subset_rows()` | Computes a safe matching-count for privacy enforcement on scalar aggregates |
+| `get_schema_summary()` | Builds schema text, structured table metadata, and optional low-cardinality categorical guidance |
 
-1. inspect schema
-2. call a provided SQL generator
-3. validate SQL
-4. execute SQL
-5. summarize the result
+### Control-plane resolvers that are not ADK tools
 
-The difference is that `sql_generator` is injected as a normal Python callable rather than coming from a live LLM.
+These functions make extra LiteLLM calls, but they are not exposed to the main model as tools.
 
-This makes it easy to write deterministic tests for:
+| Resolver | Role |
+| --- | --- |
+| `build_llm_scope_gate()` | Dataset-scope classifier |
+| `build_llm_clarification_resolver()` | Clarification-reply classifier |
+| `build_llm_result_refinement_resolver()` | Post-result same-query vs topic-change classifier |
+| `build_llm_schema_grounding_resolver()` | Fresh-turn schema interpretation resolver |
 
-- successful SQL generation
-- invalid SQL
-- empty generation
-- hallucinated columns
+### Expected tool sequencing
 
-#### `summarize_execution_result(...)`
+Instruction-enforced, not hard-coded:
 
-A subtle point: this summary is based on `execution_result["row_count"]`, which is the number of rows returned by the SQL result set, not necessarily the semantic meaning of the query.
+1. If the model is not sure about schema, call `inspect_sqlite_schema`.
+2. If the request is still ambiguous, ask clarification instead of querying.
+3. If exploratory SQL is needed, call `execute_sqlite_read_only(..., is_final=False)`.
+4. Once the model is ready to answer, call final `execute_sqlite_read_only()` with default `is_final=True`.
+5. After the final call, stop and let callbacks format the answer.
 
-For example:
+Code-enforced companion behavior:
 
-```sql
-SELECT COUNT(*) AS female_under_45 FROM ...
-```
+- exploratory SQL does not populate final public result state
+- final SQL does
+- final rendering is deterministic in Python
 
-returns one row containing a count value, so the summary says:
+## Error Handling and Typo Handling
+
+The SQL agent mixes deterministic guardrails with prompt-driven recovery. The table below separates them.
+
+| Case | Implemented in | Actual behavior | Strength / limitation |
+| --- | --- | --- | --- |
+| Approximate or colloquial dataset wording | scope-gate prompt + schema-grounding catalog | Kept in scope rather than refused; later clarified or grounded | Mostly prompt-driven plus heuristic grounding |
+| Misspelled value/category names | schema-grounding candidates, clarification resolver prompt, main-model instructions | Often treated as same-topic ambiguity and clarified against exact stored values | No deterministic edit-distance matcher |
+| Misspelled column-like concepts | request field glossary, `source_header`, schema-grounding resolver | Nearby schema fields can be surfaced as interpretation options | Heuristic and resolver-driven |
+| Vague request | main-model instruction + after-model normalization | Main model should ask clarification before tools; callback normalizes the result | Depends on model following instructions |
+| Multiple plausible fields | schema-grounding resolver + interpretation clarification builder | Fresh-turn interpretation clarification with `option_columns` mapping | Strong, because callback stores exact option-to-column mapping |
+| Ambiguous reply to clarification | deterministic numeric matching first, then clarification resolver | Reply becomes selected options, custom rule, or topic change | Strong for numeric replies; weaker for free text |
+| Unknown terms with no clean schema match | main-model instructions + schema grounding + scope gate fail-open behavior | Usually remain in scope and should trigger clarification, but can still depend on model judgment | Limitation: no single deterministic unknown-term rejection rule |
+| Invalid SQL generation | `validate_sql_read_only()` | Rejected before execution; SQLite `EXPLAIN QUERY PLAN` catches hallucinated columns/tables | Strong code-enforced guardrail |
+| SQL execution failure | `execute_sqlite_query()` | Returns structured error dict; final formatter surfaces the safe error message | Strong code-enforced surfacing, but no forced auto-retry |
+| Empty result | `format_result_payload()` and privacy shaping | If privacy mode is off, empty rows render as `No rows returned.`; with default privacy shaping, zero-match aggregates can be blocked as below-threshold results | Important limitation for user expectations |
+| Out-of-scope request | scope gate | Returns refusal message before main model call | Strong prompt-driven classifier with fail-open behavior on internal classifier error |
+| Destructive or admin request | model instruction + SQL validation | Model is told not to do it; if it still tries, validation rejects non-read-only SQL | Strong at execution layer, weaker at pre-model refusal layer |
+| Privacy-sensitive row-level detail | instruction + after-tool public result shaping | Detail rows become count-only fallback or privacy-blocked result | Strong code-enforced output shaping |
+| Small grouped buckets | after-tool public result shaping | Unsafe grouped buckets are suppressed or entire grouped result is blocked | Strong code-enforced |
+
+### Typo handling in more detail
+
+Code-grounded:
+
+- `_build_grounding_variants(...)` builds simple lexical variants for grounding candidates.
+- `_collect_grounding_match_evidence(...)` checks those variants against the normalized user text.
+- `build_llm_scope_gate()` explicitly instructs the scope classifier to keep schema-adjacent, approximate, colloquial, misspelled, and near-match wording **in scope**.
+
+What this means in practice:
+
+- The agent is designed to **clarify** typo-like dataset wording instead of refusing it.
+- The code does **not** implement a strong deterministic fuzzy matcher such as Levenshtein distance.
+- Recovery is therefore a mix of:
+  - heuristic lexical evidence
+  - field glossary labels
+  - schema `source_header`
+  - low-cardinality stored values
+  - sidecar LLM resolver judgment
+
+### Clarification handling in more detail
+
+Three clarification kinds exist in `formatting.py`:
+
+- `categorical_values`
+- `generic`
+- `interpretation`
+
+The callback layer does several deterministic cleanup steps that matter for reliability:
+
+- strips reasoning prose from clarification paths
+- extracts embedded JSON if the model mixed prose and JSON
+- prunes topic-echo options that repeat the whole user question
+- preserves interpretation options instead of clamping them to categorical values
+- clamps categorical clarification options to exact dataset values when schema guidance strongly indicates one column
+- falls back to one fixed clarification prompt if parsing is too uncertain
+
+### Privacy handling in more detail
+
+Default settings matter here:
+
+- `count_aggregates_only=True`
+- `minimum_aggregate_count=5`
+
+So by default:
+
+- scalar counts and aggregates are checked against a minimum threshold
+- grouped results are checked bucket by bucket
+- grouped preview truncation can trigger a re-run of the grouped SQL to inspect all groups safely
+- row-level results are usually collapsed to a count-only fallback
+
+This means the SQL agent is optimized for **cohort-safe summary answers**, not raw data extraction.
+
+## Prompt Examples Mapped to Real Paths
+
+These examples are grounded in current code and tests where possible. Inferred examples are labeled.
+
+### 1. Straightforward valid query
+
+Prompt:
 
 ```text
-Found 1 matching row.
+How many female patients are below 45 years old?
 ```
 
-while the actual answer shown in the `Result` section might be:
+Likely path:
+
+- fresh-turn preamble stores topic text
+- schema grounding may ground `gender = Female`, or the model may answer directly from instruction and schema context
+- main model usually goes straight to final `execute_sqlite_read_only`
+- after-tool callback stores public result and `current_query_frame`
+- finalize short-circuit renders final answer
+
+Typical tools and resolvers:
+
+- maybe `schema_grounding_resolver`
+- `execute_sqlite_read_only`
+
+Response pattern:
+
+- final structured SQL answer with `Generated SQL`, `What I matched`, and `Result`
+
+### 2. Vague request that needs clarification
+
+Prompt:
 
 ```text
-225
+How many people are not working?
 ```
 
-That behavior is correct according to the current implementation, but it is a good example of the difference between:
+Likely path:
 
-- row count of the result set
-- business meaning of the result
+- fresh-turn preamble
+- no hard-coded value mapping in Python for `not working`
+- main model is instructed to clarify instead of guessing which categorical values count as `not working`
+- after-model callback normalizes that clarification and stores `pending_clarification`
 
-## Deep Dive: `db.py`
+Typical tools and resolvers:
 
-`src/agent_zoo/sql_agent/db.py` is the safety-critical part of the project.
+- likely no ADK tool call yet
+- later, clarification reply may be resolved deterministically or by `clarification_resolver`
 
-This file does four jobs:
+Response pattern:
 
-1. normalize and validate database paths
-2. inspect SQLite schema
-3. scan and validate SQL
-4. execute SQL in read-only mode
+- numbered clarification options such as occupation categories
 
-### Path handling
+### 3. Category term that needs field disambiguation
 
-#### `_as_path(db_path)`
-
-Normalizes a string or `Path` into a resolved `Path`.
-
-If no path is provided, it raises:
-
-```python
-FileNotFoundError("No SQLite database path was provided.")
-```
-
-#### `_ensure_database_exists(db_path)`
-
-Calls `_as_path(...)` and then checks `path.exists()`.
-
-If the file is missing, it raises:
-
-```python
-FileNotFoundError(f"SQLite database not found: {path}")
-```
-
-This is the core file-existence check used by the rest of the module.
-
-### Read-only SQLite connection
-
-#### `_read_only_uri(db_path)`
-
-Builds a URI like:
+Prompt:
 
 ```text
-file:///.../titanic.sqlite?mode=ro
+How many females drink?
 ```
 
-#### `_connect_read_only(db_path)`
+Test-grounded path:
 
-Uses:
+- schema grounding identifies `Female` as a likely grounded filter
+- same resolver sees that `drink` could map to more than one nearby categorical field
+- callback builds an interpretation clarification such as `Alcohol consumption` vs `Smoking status`
+- `pending_clarification` stores `grounded_filters` and `option_columns`
 
-```python
-sqlite3.connect(..., uri=True)
-```
+Typical tools and resolvers:
 
-and sets:
+- `schema_grounding_resolver`
+- no ADK tool call yet
 
-```python
-connection.row_factory = sqlite3.Row
-```
+Response pattern:
 
-This gives dictionary-like row objects and enforces read-only mode at the SQLite connection layer.
+- immediate clarification with human-readable field labels, not raw column ids
 
-That means the safety model is not just prompt-based. Even if unsafe SQL slipped through validation, the DB connection itself is read-only.
+### 4. Typo or colloquial value or category term
 
-### Schema inspection
-
-#### `_iter_user_tables(connection)`
-
-This queries `sqlite_master`:
-
-```sql
-SELECT name
-FROM sqlite_master
-WHERE type = 'table'
-  AND name NOT LIKE 'sqlite_%'
-  AND substr(name, 1, 2) != '__'
-ORDER BY name
-```
-
-This filters out:
-
-- SQLite internal tables like `sqlite_sequence`
-- project-internal shadow tables prefixed with `__`
-
-#### `get_schema_summary(...)`
-
-This function:
-
-1. opens a read-only connection
-2. gets all user-facing tables
-3. optionally filters by `table_names`
-4. optionally truncates to `max_tables`
-5. runs `PRAGMA table_info(...)` for each table
-6. builds:
-   - structured table metadata
-   - a compact `schema_text` string for prompt use
-
-The returned dictionary looks like:
-
-```python
-{
-    "status": "success",
-    "db_path": "...",
-    "schema_text": "...",
-    "tables": [...],
-    "table_count": 1,
-}
-```
-
-On failure, it returns a structured error dictionary instead of raising.
-
-### SQL scanning
-
-#### Why `_scan_sql(...)` exists
-
-Simple regex checks are not enough for SQL safety because dangerous keywords can appear:
-
-- inside comments
-- inside string literals
-- inside quoted identifiers
-
-`_scan_sql(...)` is a lightweight state machine that walks through the SQL character by character.
-
-It tracks these states:
-
-- `normal`
-- `line_comment`
-- `block_comment`
-- `single_quote`
-- `double_quote`
-- `backtick`
-- `bracket`
-
-It produces three outputs:
-
-1. `cleaned`
-2. `token_text`
-3. `statements`
-
-#### Why those outputs matter
-
-- `statements` is used to detect multi-statement SQL.
-- `cleaned` and `token_text` preserve a comment-aware and quote-aware scan that later helpers reuse for top-level keyword detection and identifier extraction.
-
-This is the main reason the validator can safely reject things like:
-
-```sql
-SELECT * FROM people; DROP TABLE people;
-```
-
-without misclassifying harmless text inside strings.
-
-### SQL validation
-
-#### `validate_sql_read_only(sql, db_path)`
-
-This function is the heart of the guardrail system.
-
-It validates in layers:
-
-1. Verify the database file exists.
-2. Scan the SQL with `_scan_sql(...)`.
-3. Reject empty SQL.
-4. Reject multi-statement SQL.
-5. Normalize whitespace and strip trailing semicolons.
-6. Require the first keyword to be `SELECT` or `WITH`.
-7. Resolve the effective top-level statement after any optional `WITH` CTEs and require that statement to be `SELECT`.
-8. Run `EXPLAIN QUERY PLAN` on the read-only connection.
-
-#### Why structural validation is used
-
-- Valid read-only expressions such as `CASE ... END` should pass validation.
-- Writable CTE forms such as `WITH filtered AS (...) DELETE FROM ...` should still be rejected.
-- SQLite schema or admin commands such as `PRAGMA`, `ATTACH`, or `VACUUM` should never reach execution.
-
-The validator is intentionally conservative about executable statement kinds, but it is no longer a flat keyword blacklist. It inspects the top-level statement shape so valid read-only SQL features remain usable while write and administrative statements are still blocked.
-
-#### Why `EXPLAIN QUERY PLAN` is used
-
-This is the part that catches schema hallucinations.
-
-If the model invents:
-
-- a missing table
-- a missing column
-- malformed SQL
-
-then SQLite will fail at validation time, before the real query is executed.
-
-That means the agent can return a grounded error like:
+Prompt:
 
 ```text
-SQLite could not validate the query against this schema: no such column: imaginary_column
+How many females are alcoholics?
 ```
 
-instead of crashing.
+Test-grounded path:
 
-### SQL execution
+- scope gate keeps the request in scope
+- main model is likely to ask which stored categories should count as `alcoholics`
+- after-model callback normalizes the clarification and stores pending state
+- numeric or text follow-up such as `2 and 3` is resolved deterministically when possible
 
-#### `execute_sqlite_query(db_path, sql, preview_rows=DEFAULT_PREVIEW_ROWS)`
+Typical tools and resolvers:
 
-This function validates the SQL again even if the caller already validated it.
+- no tool before clarification
+- later `clarification_resolver` only if exact or numeric option matching does not settle it
 
-That is deliberate defense in depth.
+Response pattern:
 
-Execution flow:
+- numbered options from the exact stored categorical values
 
-1. clamp `preview_rows` to at least 1
-2. call `validate_sql_read_only(...)`
-3. if the query has a top-level `GROUP BY`, deterministically rewrite grouped or bucketed category expressions so `NULL` and blank or whitespace values surface as `Null`
-4. validate any rewritten grouped SQL again before execution
-5. if invalid, return a structured error result
-6. open a read-only connection
-7. execute the normalized SQL
-8. extract column names
-9. fetch `preview_rows + 1` rows
-10. if more than `preview_rows` rows exist:
-   - mark the result as truncated
-   - compute full row count with:
+### 5. Typo or colloquial column-like concept
 
-```sql
-SELECT COUNT(*) AS total_count FROM (<query>) AS result_set
-```
-
-11. return a structured result dictionary
-
-The return shape is:
-
-```python
-{
-    "status": "success" | "error",
-    "db_path": "...",
-    "sql": "...",
-    "columns": [...],
-    "rows": [...],
-    "row_count": ...,
-    "preview_row_count": ...,
-    "truncated": ...,
-    "error": None | "...",
-}
-```
-
-#### Why preview rows exist
-
-Without a preview cap, a vague question like:
+Prompt:
 
 ```text
-Show all passengers
+How many guys drink?
 ```
 
-could dump huge outputs. The current design defaults to returning a preview and a row count instead.
+Test-grounded path:
 
-## End-to-End Example
+- schema grounding can infer `Male` from colloquial wording or from a wrapped field glossary
+- if `drink` is still ambiguous, callback returns an interpretation clarification
+- if the resolver can settle the field, callback rewrites the current question with grounded filters and continues
 
-Suppose the user asks:
+Typical tools and resolvers:
+
+- `schema_grounding_resolver`
+- maybe no ADK tool until after clarification or rewrite
+
+Response pattern:
+
+- either interpretation clarification or rewritten same-turn grounded query flow
+
+### 6. Off-topic request
+
+Prompt:
 
 ```text
-How many female passengers are below 45 years old?
+Tell me a joke.
 ```
 
-The intended path is:
+Test-grounded path:
 
-1. The CLI loads settings and resolves `dataset/titantic/titanic.sqlite`.
-2. The agent is built with a schema snapshot that includes the Titanic table.
-3. The model sees the user's question and is instructed to inspect schema first.
-4. The model may call `inspect_sqlite_schema`.
-5. The model generates SQL such as:
+- fresh-turn preamble
+- schema grounding may have no action
+- scope gate classifies the request as out of scope
+- callback returns refusal before the main model runs
 
-```sql
-SELECT COUNT(*) FROM titanic_passengers WHERE sex = 'female' AND age < 45
+Typical tools and resolvers:
+
+- `scope_gate`
+- no ADK tool call
+
+Response pattern:
+
+- refusal message
+
+### 7. Privacy-sensitive row-level request
+
+Prompt:
+
+```text
+Show me the matching rows for females below 34.
 ```
 
-6. The model calls `execute_sqlite_read_only`.
-7. `execute_sqlite_query(...)` validates the SQL:
-   - single statement
-   - starts with `SELECT`
-   - no unsafe tokens
-   - schema-valid according to `EXPLAIN QUERY PLAN`
-8. SQLite executes the query in read-only mode.
-9. The callback stores the tool response in state.
-10. The final callback formats the answer into the structured output.
+Inference grounded in code:
 
-## Data Contracts
+- main model is instructed to prefer cohort-level answers, not row-level detail
+- if the model still executes a detail query, `after_tool_callback` will shape the public result according to privacy mode
+- with default `count_aggregates_only=True`, row detail will usually degrade into a matching-count fallback rather than raw row output
 
-The system uses plain dictionaries for tool results and internal coordination.
+Typical tools and resolvers:
 
-### Schema tool contract
+- `execute_sqlite_read_only`
+- after-tool public result shaping
 
-`inspect_sqlite_schema(...)` returns a dictionary shaped like:
+Response pattern:
 
-```python
-{
-    "status": "success",
-    "db_path": "D:\\personal_projects\\adk_agent\\dataset\\titantic\\titanic.sqlite",
-    "schema_text": "titanic_passengers(passengerid INTEGER PRIMARY KEY, ...)",
-    "tables": [
-        {
-            "name": "titanic_passengers",
-            "columns": [
-                {
-                    "name": "PassengerId",
-                    "type": "INTEGER",
-                    "not_null": False,
-                    "default_value": None,
-                    "primary_key": True,
-                }
-            ]
-        }
-    ],
-    "table_count": 1,
-}
+- matching count only, or privacy-blocked error if below threshold
+
+### 8. Request that yields no matching rows
+
+Prompt:
+
+```text
+How many females are older than 200?
 ```
 
-### Execution tool contract
+Inference grounded in code:
 
-`execute_sqlite_read_only(...)` returns a dictionary shaped like:
+- model likely produces a scalar count query
+- execution result may produce zero matches
+- with default privacy shaping, a zero-match aggregate can be treated as below-threshold and return a privacy-blocked error rather than a visible `0`
 
-```python
-{
-    "status": "success",
-    "db_path": "...",
-    "sql": "SELECT COUNT(*) AS passenger_count FROM ...",
-    "columns": ["passenger_count"],
-    "rows": [{"passenger_count": 225}],
-    "row_count": 1,
-    "preview_row_count": 1,
-    "truncated": False,
-    "error": None,
-}
+Typical tools and resolvers:
+
+- `execute_sqlite_read_only`
+- after-tool privacy shaping
+
+Response pattern:
+
+- under default settings, likely privacy limitation rather than a direct zero result
+
+### 9. Request that requires schema lookup first
+
+Prompt:
+
+```text
+Break this down by parent lymphoma category.
 ```
 
-On error it returns the same structure with `status="error"` and an `error` message.
+Inference grounded in instruction and tool design:
 
-### Public response contract
+- if the model is not confident about the relevant table or column name, it should call `inspect_sqlite_schema`
+- schema tool output becomes part of the ADK tool-response history
+- the model then issues final SQL once grounded
 
-After `after_tool_callback`, the live agent does not render directly from the raw execution-tool dictionary. It first builds a public result contract in callback state.
+Typical tools and resolvers:
 
-The public result dictionary can extend the execution-tool result with fields such as:
+- `inspect_sqlite_schema`
+- `execute_sqlite_read_only`
 
-```python
-{
-  "display_sql": "SELECT COUNT(*) AS passenger_count FROM filtered_dataset WHERE sex = 'female'",
-  "matched_row_count": 225,
-  "public_result_kind": "count_aggregate" | "safe_aggregate" | "detail_count_fallback",
-  "grouped_result_suppressed": False,
-  "query_summary_context": {
-    "question": "how many females are older than 46",
-    "categorical_filters": [
-      {"column": "gender", "selected_values": ["Female"], "available_values": ["Female", "Male"]},
-    ],
-    "comparison_filters": [
-      {"column": "age", "operator": ">", "value": "46"},
-    ],
-  },
-}
+Response pattern:
+
+- normal final structured SQL answer after schema lookup
+
+### 10. Follow-up question that depends on previous context
+
+Prompt sequence:
+
+```text
+User: How many males don't work?
+Agent: [final SQL answer]
+User: Include retired and student too.
 ```
 
-When grouped buckets are partially suppressed for privacy, `grouped_result_suppressed` is `True` and `matched_row_count` can be omitted so hidden bucket sizes are not reconstructable from the visible output.
+Test-grounded path:
 
-When object-level canonicalization is enabled, `display_sql` can remain the simple dataset query while the raw execution-tool `sql` field still contains the internally rewritten canonical SQL that actually ran.
+- previous final result stored `current_query_frame`
+- result-refinement resolver classifies the follow-up as `refine_query`
+- callback rewrites the latest user turn with previous question, SQL, and updated categorical values
+- main model continues from that rewritten same-query context
 
-When grouped or bucketed missing-value normalization rewrites a query, `display_sql` should reflect that semantics-changing grouped SQL so the user-visible `Null` bucket matches the SQL they see, even if the raw execution `sql` field later changes again for object-level canonicalization.
+Typical tools and resolvers:
 
-That callback-owned dictionary is then adapted into `SQLResultViewModel` inside `formatting.py`, which is the deterministic renderer contract for final SQL answers.
+- `result_refinement_resolver`
+- `execute_sqlite_read_only`
 
-## Why This Project Uses Callbacks Instead of `output_schema`
+Response pattern:
 
-The project deliberately formats the final answer with callbacks rather than ADK structured output.
+- new final SQL answer representing the refined filter set
 
-Reason:
+### 11. Follow-up that starts a new dataset question instead of refining the old one
 
-- this agent uses tools heavily
-- the model backend is LiteLLM/OpenAI-compatible rather than Gemini-only
-- ADK documentation notes that mixing `output_schema` and tools is not reliable across all model backends
+Prompt sequence:
 
-So instead of asking the model to satisfy a strict JSON schema in the same tool-using turn, this project:
-
-1. lets the model use tools normally
-2. captures the structured tool result
-3. formats the final user response in Python
-
-This is simpler and more reliable for the current stack.
-
-## The Tests
-
-There are two main test modules.
-
-### `tests/test_sql_agent_db.py`
-
-This file creates temporary SQLite fixture databases in `.tmp_test_runs` and validates the low-level database behavior.
-
-It tests:
-
-- schema introspection
-- internal table filtering
-- read-only query validation
-- `WITH` query validation
-- unsafe SQL blocking
-- multi-statement blocking
-- hallucinated column detection
-- truncated preview behavior
-- structured error handling for invalid SQL
-
-The fixture database includes:
-
-- a `people` table
-- a `visits` table
-- a hidden `__shadow` table to ensure internal filtering works
-
-### `tests/test_sql_agent_pipeline.py`
-
-This file tests the higher-level pipeline helper.
-
-Instead of using a real model, it injects a stub generator function and verifies:
-
-- successful NL -> SQL -> execution flow
-- graceful handling of invalid SQL
-- graceful handling of empty generation
-
-This gives you deterministic tests without depending on a live LLM endpoint.
-
-### Run the tests
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```text
+User: total non-working
+Agent: [final SQL answer]
+User: give me the avg age of females
 ```
 
-## What Is Live and What Is Test-Only
+Test-grounded path:
 
-It helps to separate the code into two groups.
+- previous final result exists, so result-refinement routing runs first
+- resolver classifies latest reply as `topic_change`
+- callback marks fresh-topic state
+- scope gate and schema grounding then treat it like a new dataset question
 
-### Live runtime path
+Typical tools and resolvers:
 
-- `src/agent_zoo/sql_agent/cli.py`
-- `src/agent_zoo/sql_agent/agent.py`
-- `src/agent_zoo/sql_agent/config.py`
-- `src/agent_zoo/sql_agent/instructions.py`
-- `src/agent_zoo/sql_agent/tools.py`
-- `src/agent_zoo/sql_agent/db.py`
-- `src/agent_zoo/sql_agent/runtime.py`
-- `src/agent_zoo/sql_agent/callbacks.py`
-- `src/agent_zoo/sql_agent/formatting.py`
+- `result_refinement_resolver`
+- `scope_gate`
+- `schema_grounding_resolver`
+- likely `execute_sqlite_read_only`
 
-### Test and support path
+Response pattern:
 
-- `src/agent_zoo/sql_agent/pipeline.py`
-- `tests/test_sql_agent_db.py`
-- `tests/test_sql_agent_pipeline.py`
+- new question path, not a refinement of the old SQL
 
-`pipeline.py` is especially important because it mirrors the real workflow in a deterministic way.
+### 12. Query that causes tool or SQL failure
 
-## Debugging and Troubleshooting
+Prompt:
 
-### The model says the SQLite file does not exist, but the file is there
-
-First, distinguish between:
-
-- a real Python/SQLite file error
-- a model-generated explanation
-
-The real file-existence check happens in `db.py` inside `_ensure_database_exists(...)`. If that code fails, the tool result will contain the fully resolved path.
-
-If the model merely says the file is missing in prose, but the actual tool path is correct, that is an agent-output issue rather than a path-resolution bug.
-
-### Relative database paths
-
-Relative paths work because `resolve_repo_path(...)` checks:
-
-1. the current working directory
-2. the repo root
-
-So both of these are normally fine from the repo root:
-
-```powershell
---db .\dataset\titantic\titanic.sqlite
---db dataset\titantic\titanic.sqlite
+```text
+Show the missing field.
 ```
 
-### `uv` cache or permission issues
+Support-path evidence from `pipeline.py` tests:
 
-If `uv run` fails before the agent starts, that is not an agent bug. It usually means `uv` itself hit a local cache or permissions problem.
+- if generated SQL references a missing column, `validate_sql_read_only()` may fail at `EXPLAIN QUERY PLAN`
+- or `execute_sqlite_query()` may return `SQLite execution failed: ...`
+- there is no Python-level forced retry loop
 
-In that case, retry with:
+Response pattern:
 
-```powershell
-.\.venv\Scripts\run-sql-agent.exe ...
+- structured safe error text
+
+Important limitation:
+
+- the live ADK model **may** choose to self-correct after seeing a tool error in session history, but that is model behavior, not a deterministic callback retry.
+
+### 13. Query that should be handled elsewhere, not by this package
+
+Prompt:
+
+```text
+What was my first question?
 ```
 
-### Why `adk run` can show more text than the plain CLI
+Test-grounded path when it is a topic change from a previous SQL question:
 
-The plain runner captures the final response and prints only that by default.
+- result-refinement routing classifies it as `topic_change`
+- scope gate blocks it as out of scope before schema grounding
 
-The ADK CLI may render intermediate streamed events. The before-model finalize path can short-circuit later model turns, and the after-agent path can replace the final response as a fallback, but neither can erase model text that has already been streamed.
+Package behavior:
 
-### Why aggregate queries say `Found 1 matching row`
+- refusal
+- no built-in handoff
 
-Because the summary currently reflects the number of rows in the SQL result set, not the semantic meaning of an aggregate value.
+If your application wants a handoff to another subsystem, that routing must happen above this package.
 
-Example:
+## File and Module Map
 
-```sql
-SELECT COUNT(*) AS total FROM ...
+This section maps where the logic actually lives.
+
+| File | Key classes or functions | Responsibility |
+| --- | --- | --- |
+| `sql_agent/__init__.py` | lazy exports for `SQLAgent`, `ask_question`, `build_root_agent`, `root_agent`, `SQLAgentSettings` | Public import surface |
+| `sql_agent/agent.py` | `SQLAgent`, `build_root_agent`, `root_agent` | Main SQL-agent wrapper and ADK wiring |
+| `sql_agent/runtime.py` | `ask_question`, `run_interactive_loop`, `_RUNNER_CACHE` | Runner reuse, session creation, event streaming, final text capture |
+| `sql_agent/config.py` | `SQLAgentSettings`, `load_settings`, `resolve_repo_path` | Runtime configuration and defaults |
+| `sql_agent/instructions.py` | `DEFAULT_INSTRUCTION`, `build_agent_instruction` | Main model instruction assembly |
+| `sql_agent/tools.py` | `build_sql_tools` | Actual ADK tool registration |
+| `sql_agent/db.py` | `get_schema_summary`, `validate_sql_read_only`, `execute_sqlite_query`, rewrite helpers | SQLite safety layer, schema inspection, execution, SQL rewriting |
+| `sql_agent/callbacks.py` | `build_combined_before_model_callback`, `build_normalize_clarification_after_model_callback`, `build_remember_query_result_callback`, `build_format_final_agent_response_callback` | Real workflow state machine, clarification memory, refinement routing, final rendering coordination |
+| `sql_agent/formatting.py` | clarification parsers and formatters, `format_public_query_result` | Deterministic clarification and final-answer rendering |
+| `scope_guard.py` | `build_llm_scope_gate`, `build_llm_clarification_resolver`, `build_llm_result_refinement_resolver`, `build_llm_schema_grounding_resolver` | Sidecar LLM control plane for scope, clarification, refinement, and schema grounding |
+| `working_memory.py` | `get_agent_working_memory*`, `set_agent_working_memory*` | Custom session-scoped working-memory abstraction |
+| `sql_agent/pipeline.py` | `run_nl_to_sql_pipeline` | Deterministic support pipeline used by tests or external code |
+| `base.py` | `BaseAgent` | Small internal wrapper contract used by `SQLAgent` |
+
+### What to consider the main entrypoint
+
+For runtime behavior:
+
+- `SQLAgent.ask(...)` or `runtime.ask_question(...)`
+
+For ADK packaging:
+
+- `root_agent`
+
+For architecture tracing:
+
+- start in `agent.py`
+- immediately move to `runtime.py`
+- then spend most of your time in `callbacks.py`
+
+### Where state lives vs where prompts live
+
+| Concern | Primary owner |
+| --- | --- |
+| Session and working-memory state | `callbacks.py` + `working_memory.py` |
+| Main system instruction | `instructions.py` |
+| Secondary resolver prompts | `scope_guard.py` |
+| Tool definitions | `tools.py` |
+| SQL validation and execution | `db.py` |
+| Final answer formatting | `formatting.py` |
+
+### Wider app integration points in this repo
+
+Code-grounded:
+
+- `SQLAgent.ask(...)` is the cleanest programmatic entrypoint for an upstream web app.
+- `runtime.ask_question(...)` is the lower-level async helper.
+- The Python source under `src/` does not currently show direct calls from another agent package into `SQLAgent` outside tests and package exports.
+
+That means the SQL agent is packaged for reuse, but this subpackage does not itself define the surrounding web-app orchestration.
+
+## Diagrams
+
+### 1. Workflow and state transition diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> FreshTurn
+    FreshTurn --> PendingClarification : pending_clarification exists
+    FreshTurn --> ResultRefinement : current_query_frame exists
+    FreshTurn --> SchemaGrounding : otherwise
+
+    PendingClarification --> ClarificationWaiting : clarification returned earlier
+    PendingClarification --> MainModel : reply rewritten for same topic
+    PendingClarification --> FreshTopic : topic_change
+
+    ResultRefinement --> ClarificationWaiting : needs_clarification
+    ResultRefinement --> MainModel : refine_query rewrite
+    ResultRefinement --> FreshTopic : topic_change
+
+    FreshTopic --> ScopeGate
+    SchemaGrounding --> ClarificationWaiting : interpretation clarification
+    SchemaGrounding --> ScopeGate : no action
+    SchemaGrounding --> MainModel : grounded filter rewrite
+
+    ScopeGate --> [*] : refusal
+    ScopeGate --> MainModel : in scope
+
+    MainModel --> AfterModel
+    AfterModel --> ClarificationWaiting : clarification normalized
+    AfterModel --> ToolExecution : function call
+    AfterModel --> [*] : plain non-clarification text
+
+    ToolExecution --> MainModel : inspect schema or exploratory SQL
+    ToolExecution --> Finalize : final SQL result stored
+    Finalize --> [*]
+    ClarificationWaiting --> [*]
 ```
 
-returns one row, so the summary says one row, even though the payload might contain a value like `225`.
+### 2. Tool interaction diagram
 
-### Why the agent might ask for clarification instead of guessing
+```mermaid
+sequenceDiagram
+    participant User
+    participant Runtime as runtime.py
+    participant Agent as LlmAgent
+    participant Before as before_model callback
+    participant Model as LiteLlm main model
+    participant Tool as ADK tool
+    participant DB as db.py
+    participant AfterTool as after_tool callback
+    participant Formatter as formatting.py
 
-The prompt explicitly tells the model not to invent tables or columns. If a request cannot be grounded in the schema, the preferred behavior is:
+    User->>Runtime: question
+    Runtime->>Agent: run_async(new_message)
+    Agent->>Before: before_model_callback
+    Before-->>Agent: None or short-circuit response
+    Agent->>Model: main model call
+    Model-->>Agent: tool call or clarification text
+    Agent->>Tool: inspect_sqlite_schema or execute_sqlite_read_only
+    Tool->>DB: schema inspection or validated SQL execution
+    DB-->>Tool: dict result
+    Tool-->>AfterTool: tool_response
+    AfterTool-->>Agent: public result state and query frame
+    Agent->>Before: second before_model pass after tool response
+    Before->>Formatter: format_public_query_result
+    Formatter-->>Agent: deterministic final text
+    Agent-->>Runtime: final response event
+    Runtime-->>User: final text
+```
 
-- ask a clarifying question
-- or explain the limitation
+### 3. Error and clarification loop diagram
 
-That is safer than generating plausible but wrong SQL.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Before as before_model callback
+    participant Resolver as clarification or refinement resolver
+    participant Model as main model
+    participant After as after_model callback
 
-## Configuration Reference
+    User->>Before: ambiguous request or follow-up reply
+    alt Pending clarification exists
+        Before->>Resolver: resolve reply against saved clarification
+        alt selected options or custom rule
+            Resolver-->>Before: same-topic resolution
+            Before-->>Model: rewritten same-topic user turn
+        else topic change
+            Resolver-->>Before: topic_change
+            Before-->>User: refusal or fresh-turn handling later
+        end
+    else No pending clarification
+        Before-->>Model: raw or rewritten fresh question
+        Model-->>After: clarification-like text
+        After-->>User: deterministic clarification message
+    end
+```
 
-### CLI arguments
+### 4. High-level architecture diagram
 
-`run-sql-agent` supports:
+```mermaid
+flowchart LR
+    A[Instructions and schema snapshot] --> M[Main model]
+    B[Scope gate resolver] --> C[before_model callback]
+    D[Clarification resolver] --> C
+    E[Result refinement resolver] --> C
+    F[Schema grounding resolver] --> C
+    C --> M
+    M --> G[ADK tools]
+    G --> H[SQLite safety and execution layer]
+    H --> I[after_tool callback]
+    I --> J[Session state and working memory]
+    J --> K[Deterministic final formatter]
+```
 
-- `--db`
-- `--model`
-- `--debug`
-- `--instruction-file`
-- `--question`
+## Developer Guide
+
+### What to read first
+
+Recommended reading order for a new teammate:
+
+1. `sql_agent/agent.py`
+2. `sql_agent/runtime.py`
+3. `sql_agent/callbacks.py`
+4. `scope_guard.py`
+5. `sql_agent/db.py`
+6. `sql_agent/formatting.py`
+7. `tests/test_sql_agent_db.py`
+
+Why this order works:
+
+- `agent.py` tells you what is wired.
+- `runtime.py` tells you how sessions are created and reused.
+- `callbacks.py` tells you how turns are classified and rewritten.
+- `scope_guard.py` tells you which control-plane LLM calls exist.
+- `db.py` tells you what SQL can actually run.
+- `formatting.py` tells you what the user finally sees.
+
+### How to trace a single query end to end
+
+For a fresh user question:
+
+1. Start at `runtime.ask_question(...)`.
+2. Confirm whether the same runner and session are being reused.
+3. Open `build_root_agent(...)` and note the registered callbacks.
+4. Step through `build_combined_before_model_callback()` in this order:
+   - pending clarification
+   - recent interpretation clarification
+   - result refinement
+   - schema grounding
+   - scope gate
+   - finalize
+5. If the main model issued a tool call, inspect `tools.py` and then `db.py`.
+6. After tool execution, inspect `build_remember_query_result_callback()`.
+7. Confirm whether final rendering happened in the before-model finalize path or the after-agent fallback path.
+
+### Main decision points where bugs are likely
+
+These are the highest-risk areas.
+
+1. Clarification-state transitions in `callbacks.py`
+   - pending clarification resolution
+   - topic-change vs same-topic follow-up
+   - recent interpretation clarification reuse
+
+2. Result refinement in `callbacks.py` + `scope_guard.py`
+   - deciding whether a follow-up is a refinement or a fresh question
+   - keeping selected values and free-text refinement requests together
+
+3. Fresh-turn schema grounding
+   - interaction between request glossary, `source_header`, categorical candidates, and resolver outputs
+   - preserving grounded filters while still asking for unresolved field clarification
+
+4. Privacy shaping in `callbacks.py`
+   - count-only fallback vs privacy block
+   - grouped suppression vs fully blocked grouped result
+
+5. SQL rewriting in `db.py`
+   - grouped `NULL` bucketing rewrite
+   - categorical negation rewrite
+   - object-level canonicalization rewrite
+
+6. Display SQL vs internal SQL
+   - final rendering prefers `display_sql` when present
+   - internal execution SQL may be more complex than the user-visible SQL
+
+### Assumptions the current implementation makes about the dataset
+
+Code-grounded:
+
+- There is a SQLite database file reachable at the configured path.
+- User-facing tables exclude names prefixed with `sqlite_` or `__`.
+- Low-cardinality categorical guidance is only collected for columns that look safe and useful for that purpose.
+- `__column_mapping` is optional, but if present it provides human labels through `source_header`.
+- Wrapped prompts from an upstream app should put the actual user question at the end or under a terminal `User question:` block, because `_extract_topic_context_text(...)` extracts the final non-bullet content line as the effective question.
+- Wrapped prompts can include a `Field glossary:` block; the callbacks know how to parse it and use it for schema grounding.
+
+### How to add a new ADK tool safely
+
+Recommended process:
+
+1. Add the tool in `build_sql_tools(...)`.
+2. Update `DEFAULT_INSTRUCTION` so the main model knows when to use it.
+3. Decide whether the tool's result needs custom `after_tool_callback` handling.
+4. Decide whether the tool changes `current_query_frame`, public-result shaping, or final rendering.
+5. Add tests for both the tool contract and the callback interactions.
+
+### How to add a new workflow stage safely
+
+If you add a new stage, the most important design question is **where** in `build_combined_before_model_callback()` it belongs.
+
+The current ordering is meaningful:
+
+1. resolve clarification follow-ups
+2. reuse recent interpretation menus
+3. refine previous query if appropriate
+4. schema-ground fresh turns
+5. scope gate
+6. finalize if public result already exists
+
+If you insert a new stage in the wrong place, the common failure modes are:
+
+- clarification replies getting reclassified as fresh questions
+- scope gate running too early and blocking a same-topic follow-up
+- old query context leaking into a fresh topic
+- schema grounding re-asking a clarification that should already be resolved
+
+### Code-enforced vs instruction-enforced behavior
+
+Keep this distinction clear whenever you extend the agent.
+
+Code-enforced:
+
+- session and working-memory state handling
+- read-only SQL validation
+- grouped `NULL` rewrite
+- categorical negation rewrite
+- privacy shaping
+- final rendering shape
+- numeric clarification option matching
+
+Instruction-enforced or resolver-prompt-enforced:
+
+- when the main model chooses to inspect schema
+- when the main model asks clarification vs guessing
+- when the main model uses exploratory SQL
+- whether the main model stops after the final tool call
+- many typo-recovery and ambiguity-resolution choices inside sidecar resolvers
+
+### Useful test files while developing
+
+- `tests/test_sql_agent_db.py` is the main behavior specification for the callback state machine.
+- `tests/test_sql_agent_pipeline.py` is useful for support-path behavior and public wrapper contracts.
+
+## Known Limitations
+
+Code-grounded and inference where noted:
+
+1. Typo handling is good enough to keep many dataset-adjacent prompts in scope, but it is still mostly heuristic and prompt-driven rather than a deterministic fuzzy-matching system.
+2. The package has no built-in handoff to another agent or non-SQL subsystem.
+3. Multi-turn context lasts only as long as the in-memory ADK session lasts.
+4. There is no Python-level automatic SQL retry loop after validation or execution failure.
+5. Under default privacy settings, a zero-match aggregate can become a privacy-blocked result instead of a user-visible `0`.
+6. The main model is instructed to prefer schema inspection and clarification, but those decisions are not completely hard-coded.
+7. `pipeline.py` can be useful for deterministic support workflows, but it does not represent the full live callback-driven runtime.
+8. If an upstream web app wraps prompts poorly and the actual user question is not the last meaningful line, topic extraction and follow-up routing can become inaccurate.
+9. The agent forbids model-generated window functions in instructions, but object-level canonicalization in `db.py` can still internally introduce `ROW_NUMBER()` CTEs when that mode is enabled. That internal rewrite is performed by Python, not by the model.
+
+## Glossary
+
+| Term | Meaning in this package |
+| --- | --- |
+| Stage | A real execution step or branch in the callback-driven workflow |
+| Context | The data presented to a model, resolver, callback, or formatter at a specific step |
+| State | Mutable data stored in ADK session state or the custom SQL-agent working-memory namespace |
+| Working memory | Custom per-session nested dict under `agent_working_memory.sql_agent` |
+| Pending clarification | Saved clarification payload waiting for a future user reply |
+| Interpretation clarification | Clarification asking which nearby schema field the user meant |
+| Categorical clarification | Clarification asking which exact stored categorical values to use |
+| Query frame | Structured summary of the last committed final SQL query |
+| Public result | Privacy-shaped callback-owned result dict used for final rendering |
+| `display_sql` | User-visible SQL shown in the final answer |
+| `sql` | Actual executed SQL, which may be more rewritten or canonicalized than `display_sql` |
+| Schema grounding | Fresh-turn attempt to map user wording to exact schema fields and categorical filters before SQL generation |
+| Result refinement | Post-result follow-up that modifies the previous final SQL-backed question instead of starting over |
+
+## Quick Run and Test Appendix
+
+### One-shot CLI
+
+```bash
+uv run run-sql-agent --db dataset/titantic/titanic.sqlite --question "How many passengers survived?"
+```
+
+### Interactive mode
+
+```bash
+uv run run-sql-agent --db dataset/titantic/titanic.sqlite
+```
+
+### ADK-native mode
+
+```bash
+cd src
+adk run agent_zoo/sql_agent
+```
+
+### Targeted test command
+
+Verified command:
+
+```bash
+/home/cheongjsi/agent-zoo/.venv/bin/python -m unittest tests.test_sql_agent_db tests.test_sql_agent_pipeline -v
+```
+
+### Defaults that affect behavior immediately
+
+From `config.py`:
+
+- default DB path: `dataset/titantic/titanic.sqlite`
+- default model: `openai/Qwen3.5-0.8B-GGUF`
+- default preview rows: `20`
+- default `count_aggregates_only`: `True`
+- default `minimum_aggregate_count`: `5`
+- default `capture_internal_rows`: `False`
+- default `include_categorical_value_guidance`: `True`
+- default `max_categorical_values`: `12`
 
 ### Environment variables
 
@@ -1154,100 +1700,10 @@ That is safer than generating plausible but wrong SQL.
 - `SQL_AGENT_DEBUG`
 - `SQL_AGENT_INSTRUCTION_FILE`
 - `SQL_AGENT_PREVIEW_ROWS`
-- `OPENAI_API_BASE`
-- `OPENAI_API_KEY`
-
-### Default values
-
-- default DB path: `dataset/titantic/titanic.sqlite`
-- default model: `openai/SmolLM-1.7B-Instruct-GGUF`
-- default preview rows: `20`
-
-## Why The Implementation Is Structured This Way
-
-Several design choices are worth calling out.
-
-### Why the DB logic is plain Python
-
-Because database safety is easier to test and reason about when it is not hidden inside the agent framework.
-
-### Why the tools are thin wrappers
-
-Because the real behavior should live in reusable helpers, not in ADK-specific glue.
-
-### Why the prompt contains a schema snapshot and there is also a schema tool
-
-Because one helps before tool use and the other helps during tool use.
-
-### Why validation happens twice
-
-Because duplicate validation is cheaper than accidental unsafe execution.
-
-### Why the final response is formatted in Python
-
-Because exact answer shape is easier to guarantee in code than through prompting alone.
-
-## Current Limitations
-
-This implementation is solid as an MVP, but it is intentionally simple.
-
-### 1. The model still does the semantic SQL generation
-
-The guardrails can reject bad SQL, but they do not magically make the model understand every domain perfectly.
-
-### 2. Schema context is global
-
-The full schema snapshot is injected into the instruction. That is fine for small databases, but larger databases would eventually need schema narrowing.
-
-### 3. Summary text is row-oriented, not business-oriented
-
-As noted above, aggregate queries can produce slightly awkward summaries.
-
-### 4. Callback-driven final formatting does not suppress earlier streamed text
-
-The formatter can control the final visible answer shape, but it still cannot retract earlier streamed text once the UI has shown it.
-
-### 5. The system currently trusts the model to call the schema tool when needed
-
-The prompt strongly instructs it to do so, but that is still model behavior rather than a hard-coded orchestration layer.
-
-## Good Next Improvements
-
-If you want to take this further, these are the most natural next steps:
-
-1. Add schema narrowing so only relevant tables are shown to the model.
-2. Improve result summaries for aggregate queries.
-3. Add explicit ambiguity handling rules for domain-specific fields.
-4. Add optional SQL dry-run mode.
-5. Build a small local web UI that displays only final answers, not intermediate events.
-6. Add cached schema summaries to avoid repeated introspection for the same DB.
-
-## Development Notes
-
-### Dependencies
-
-The relevant dependencies in `pyproject.toml` are:
-
-- `google-adk`
-- `litellm`
-- `openai`
-- `python-dotenv`
-
-### Python version
-
-The project currently declares:
-
-```toml
-requires-python = ">=3.14"
-```
-
-Make sure your environment matches what the project expects.
-
-## Quick Mental Model
-
-If you only remember one thing about this codebase, remember this:
-
-The model is responsible for choosing and writing SQL.
-The Python code is responsible for deciding whether that SQL is safe, valid for the schema, executable in read-only mode, and presented consistently to the user.
-
-That separation is the main reason the project is understandable and testable.
+- `SQL_AGENT_COUNT_AGGREGATES_ONLY`
+- `SQL_AGENT_MINIMUM_AGGREGATE_COUNT`
+- `SQL_AGENT_CAPTURE_INTERNAL_ROWS`
+- `SQL_AGENT_INCLUDE_CATEGORICAL_VALUE_GUIDANCE`
+- `SQL_AGENT_MAX_CATEGORICAL_VALUES`
+- `SQL_AGENT_OBJECT_ID_COLUMN`
+- `SQL_AGENT_OBJECT_ORDER_COLUMN`
