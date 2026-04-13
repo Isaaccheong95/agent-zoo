@@ -990,6 +990,127 @@ def _extract_source_reference_name(source_segment: str) -> str | None:
     return source.rsplit(".", 1)[-1]
 
 
+def _extract_single_subquery_source(source_segment: str) -> tuple[str, str | None] | None:
+    candidate = source_segment.strip()
+    if not candidate.startswith("("):
+        return None
+
+    state = "normal"
+    depth = 0
+    closing_index: int | None = None
+    index = 0
+    while index < len(candidate):
+        char = candidate[index]
+        next_char = candidate[index + 1] if index + 1 < len(candidate) else ""
+
+        if state == "line_comment":
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if state == "single_quote":
+            if char == "'" and next_char == "'":
+                index += 2
+                continue
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "double_quote":
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "backtick":
+            if char == "`":
+                state = "normal"
+            index += 1
+            continue
+
+        if state == "bracket":
+            if char == "]":
+                state = "normal"
+            index += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            state = "line_comment"
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            state = "block_comment"
+            index += 2
+            continue
+
+        if char == "'":
+            state = "single_quote"
+            index += 1
+            continue
+
+        if char == '"':
+            state = "double_quote"
+            index += 1
+            continue
+
+        if char == "`":
+            state = "backtick"
+            index += 1
+            continue
+
+        if char == "[":
+            state = "bracket"
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            index += 1
+            continue
+
+        if char == ")":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                closing_index = index
+                break
+            index += 1
+            continue
+
+        index += 1
+
+    if closing_index is None:
+        return None
+
+    subquery_sql = candidate[1:closing_index].strip()
+    if not subquery_sql:
+        return None
+
+    trailing_segment = candidate[closing_index + 1 :].strip()
+    if not trailing_segment:
+        return subquery_sql, None
+
+    alias_match = re.match(
+        r'^(?:AS\s+)?(?P<alias>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)$',
+        trailing_segment,
+        flags=re.IGNORECASE,
+    )
+    if alias_match is None:
+        return None
+
+    return subquery_sql, alias_match.group("alias")
+
+
 def _has_top_level_set_operation(sql: str) -> bool:
     return any(
         _find_top_level_keyword(sql, keyword) is not None
@@ -997,29 +1118,11 @@ def _has_top_level_set_operation(sql: str) -> bool:
     )
 
 
-def _build_object_mode_sql(
-    sql: str,
+def _build_object_mode_ctes(
+    from_clause: str,
     object_id_column: str,
     object_order_column: str | None,
-) -> tuple[str | None, str | None]:
-    if _has_top_level_set_operation(sql):
-        return None, "Object-level mode does not support UNION, INTERSECT, or EXCEPT queries."
-
-    sections = _extract_top_level_query_sections(sql)
-    if sections is None:
-        return None, "Object-level mode requires a top-level SELECT or WITH query with a FROM clause."
-
-    source_segment = _extract_source_segment(sections["from_clause"])
-    if not _is_supported_object_level_source(source_segment):
-        return None, (
-            "Object-level mode currently supports only single-source top-level queries "
-            "without joins, comma-separated sources, or subqueries in FROM."
-        )
-
-    source_reference_name = _extract_source_reference_name(source_segment)
-    if source_reference_name is None:
-        return None, "Object-level mode could not determine a stable source alias for canonicalization."
-
+) -> str:
     order_expression = OBJECT_SOURCE_ORDINAL_COLUMN
     if object_order_column:
         order_expression = (
@@ -1027,9 +1130,9 @@ def _build_object_mode_sql(
             f"{OBJECT_SOURCE_ORDINAL_COLUMN} ASC"
         )
 
-    ctes = ", ".join(
+    return ", ".join(
         [
-            f"{OBJECT_SOURCE_CTE_NAME} AS (SELECT * {sections['from_clause']})",
+            f"{OBJECT_SOURCE_CTE_NAME} AS (SELECT * {from_clause})",
             (
                 f"{OBJECT_RANKED_CTE_NAME} AS ("
                 f"SELECT {OBJECT_SOURCE_CTE_NAME}.*, "
@@ -1052,12 +1155,85 @@ def _build_object_mode_sql(
         ]
     )
 
+
+def _build_object_mode_sql(
+    sql: str,
+    object_id_column: str,
+    object_order_column: str | None,
+) -> tuple[str | None, str | None]:
+    if _has_top_level_set_operation(sql):
+        return None, "Object-level mode does not support UNION, INTERSECT, or EXCEPT queries."
+
+    sections = _extract_top_level_query_sections(sql)
+    if sections is None:
+        return None, "Object-level mode requires a top-level SELECT or WITH query with a FROM clause."
+
+    source_segment = _extract_source_segment(sections["from_clause"])
     prefix = sections["prefix"].strip()
-    with_prefix = f"{prefix}, {ctes}" if prefix.upper().startswith("WITH") else f"WITH {ctes}"
     suffix = f" {sections['suffix']}" if sections["suffix"] else ""
+
+    if _is_supported_object_level_source(source_segment):
+        source_reference_name = _extract_source_reference_name(source_segment)
+        if source_reference_name is None:
+            return None, "Object-level mode could not determine a stable source alias for canonicalization."
+
+        ctes = _build_object_mode_ctes(
+            sections["from_clause"],
+            object_id_column,
+            object_order_column,
+        )
+        with_prefix = f"{prefix}, {ctes}" if prefix.upper().startswith("WITH") else f"WITH {ctes}"
+        return (
+            f"{with_prefix} SELECT {sections['select_clause']} "
+            f"FROM {OBJECT_CANONICAL_CTE_NAME} AS {source_reference_name}{suffix}",
+            None,
+        )
+
+    subquery_source = _extract_single_subquery_source(source_segment)
+    if subquery_source is None:
+        return None, (
+            "Object-level mode currently supports only single-source top-level queries "
+            "without joins, comma-separated sources, or unsupported subqueries in FROM."
+        )
+
+    subquery_sql, subquery_alias = subquery_source
+    if _has_top_level_set_operation(subquery_sql):
+        return None, "Object-level mode does not support UNION, INTERSECT, or EXCEPT queries."
+
+    subquery_sections = _extract_top_level_query_sections(subquery_sql)
+    if subquery_sections is None:
+        return None, (
+            "Object-level mode subqueries in FROM must be single-source SELECT or WITH queries with a FROM clause."
+        )
+    if subquery_sections["prefix"].strip():
+        return None, "Object-level mode does not currently support subqueries in FROM that use inner WITH clauses."
+
+    subquery_source_segment = _extract_source_segment(subquery_sections["from_clause"])
+    if not _is_supported_object_level_source(subquery_source_segment):
+        return None, (
+            "Object-level mode currently supports only single-source top-level queries "
+            "without joins, comma-separated sources, or unsupported subqueries in FROM."
+        )
+
+    subquery_source_reference_name = _extract_source_reference_name(subquery_source_segment)
+    if subquery_source_reference_name is None:
+        return None, "Object-level mode could not determine a stable source alias for canonicalization."
+
+    ctes = _build_object_mode_ctes(
+        subquery_sections["from_clause"],
+        object_id_column,
+        object_order_column,
+    )
+    with_prefix = f"{prefix}, {ctes}" if prefix.upper().startswith("WITH") else f"WITH {ctes}"
+    subquery_suffix = f" {subquery_sections['suffix']}" if subquery_sections["suffix"] else ""
+    canonicalized_subquery = (
+        f"SELECT {subquery_sections['select_clause']} "
+        f"FROM {OBJECT_CANONICAL_CTE_NAME} AS {subquery_source_reference_name}{subquery_suffix}"
+    )
+    alias_clause = f" AS {subquery_alias}" if subquery_alias else " AS __az_object_subquery"
     return (
         f"{with_prefix} SELECT {sections['select_clause']} "
-        f"FROM {OBJECT_CANONICAL_CTE_NAME} AS {source_reference_name}{suffix}",
+        f"FROM ({canonicalized_subquery}){alias_clause}{suffix}",
         None,
     )
 

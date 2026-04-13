@@ -1315,6 +1315,20 @@ class SQLAgentObjectModeTestCase(unittest.TestCase):
             ],
         )
 
+    def test_execute_sqlite_query_supports_top_n_subquery_aggregate_in_object_mode(self) -> None:
+        result = execute_sqlite_query(
+            self.db_path,
+            "SELECT AVG(score) AS average_score FROM (SELECT score FROM records ORDER BY score DESC LIMIT 2)",
+            object_id_column="person_id",
+            object_order_column="event_rank",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["row_count"], 1)
+        self.assertEqual(result["rows"], [{"average_score": 40.0}])
+        self.assertIn("__az_object_canonical", result["sql"])
+        self.assertIn("LIMIT 2", result["sql"])
+
     def test_object_mode_final_render_shows_original_query_not_canonicalized_sql(self) -> None:
         simple_sql = "SELECT COUNT(*) AS matching_count FROM records WHERE city = 'Tokyo'"
         tool_response = execute_sqlite_query(
