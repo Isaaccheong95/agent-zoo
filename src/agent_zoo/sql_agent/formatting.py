@@ -671,13 +671,13 @@ def format_clarification_response(clarification: dict[str, Any]) -> str:
     parts: list[str] = []
     if user_message:
         parts.append(user_message)
+    if options:
+        parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     grounded_filter_lines = _build_grounded_filter_lines(clarification)
     if grounded_filter_lines:
         parts.append(
             _GROUNDED_FILTERS_HEADING + "\n" + "\n".join(f"- {line}" for line in grounded_filter_lines)
         )
-    if options:
-        parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     return "\n\n".join(parts).strip()
 
 

@@ -4917,6 +4917,10 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertIn("1. Alcohol consumption", response_text)
         self.assertIn("2. Smoking status", response_text)
         self.assertIn("3. None of these / another field", response_text)
+        self.assertLess(
+            response_text.index("1. Alcohol consumption"),
+            response_text.index("Already matched from your request:"),
+        )
         self.assertNotIn("socalc (values:", response_text)
         self.assertNotIn("socsmk (values:", response_text)
         pending_clarification = get_sql_pending_clarification(state)
@@ -5303,6 +5307,10 @@ Which category or combination should I use for \"alcoholic\"?
             self.assertIn("Which values from Alcohol consumption status should I include?", response_text)
             self.assertIn("Already matched from your request:", response_text)
             self.assertIn("- gender = Female", response_text)
+            self.assertLess(
+                response_text.index("1. Never"),
+                response_text.index("Already matched from your request:"),
+            )
             pending_clarification = get_sql_pending_clarification(state)
             self.assertIsNotNone(pending_clarification)
             self.assertEqual(
