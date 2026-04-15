@@ -85,6 +85,11 @@ SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "maximum",
 )
 SQL_INTERPRETATION_OTHER_FIELD_OPTION = "None of these / another field"
+SQL_GROUNDING_ITEM_GROUNDED_FILTER = "grounded_filter"
+SQL_GROUNDING_ITEM_FIELD_AMBIGUITY = "field_ambiguity"
+SQL_GROUNDING_ITEM_VALUE_AMBIGUITY = "value_ambiguity"
+SQL_GROUNDING_RESOLUTION_ITEMS_KEY = "grounding_resolution_items"
+SQL_GROUNDING_CURRENT_ITEM_INDEX_KEY = "grounding_current_item_index"
 _GENERIC_ADD_HINT_TOKENS = frozenset({"add", "again", "also", "back", "include", "put", "restore", "too"})
 _GENERIC_REMOVE_HINT_TOKENS = frozenset({"drop", "exclude", "remove", "without"})
 _GROUNDING_STOPWORDS = frozenset({"a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with"})
@@ -1800,6 +1805,7 @@ def _build_schema_grounding_clarification(
         "I found more than one nearby schema field for this request. Which one do you mean?",
         selected_options,
         clarification_kind=CLARIFICATION_KIND_INTERPRETATION,
+        preserve_option_text=True,
     )
     if topic_context:
         clarification["topic_context"] = topic_context
@@ -1813,7 +1819,582 @@ def _build_schema_grounding_clarification(
             ]
             for identifier, selected_values in grounded_filters.items()
         }
+    if not _schema_grounding_clarification_has_consistent_options(clarification):
+        fallback_item = {
+            "matched_phrase": "",
+            "ambiguity_kind": SQL_GROUNDING_ITEM_FIELD_AMBIGUITY,
+            "candidate_columns": list(candidate_columns),
+            "candidate_column_labels": {
+                identifier: option_labels.get(identifier, identifier)
+                for identifier in candidate_columns
+                if isinstance(identifier, str) and identifier.strip()
+            },
+        }
+        return _build_failsafe_schema_grounding_clarification(
+            topic_context,
+            [fallback_item],
+            0,
+            grounded_filters={
+                identifier: [
+                    value
+                    for value in selected_values or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                for identifier, selected_values in (grounded_filters or {}).items()
+                if isinstance(identifier, str) and identifier.strip()
+            },
+        )
     return clarification
+
+
+def _merge_grounding_resolution_item_filters(
+    resolution_items: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    merged_filters: dict[str, list[str]] = {}
+    for item in resolution_items:
+        if not isinstance(item, dict):
+            continue
+        column_name = str(item.get("selected_column") or "").strip()
+        selected_values = _ordered_unique_values(
+            [
+                value
+                for value in item.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if not column_name or not selected_values:
+            continue
+        existing_values = merged_filters.setdefault(column_name, [])
+        for value in selected_values:
+            if value not in existing_values:
+                existing_values.append(value)
+    return merged_filters
+
+
+def _grounding_resolution_item_is_unresolved(item: dict[str, Any]) -> bool:
+    ambiguity_kind = str(item.get("ambiguity_kind") or "").strip().lower()
+    if ambiguity_kind == SQL_GROUNDING_ITEM_FIELD_AMBIGUITY:
+        resolved_columns = [
+            value
+            for value in item.get("resolved_columns") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        custom_rule = str(item.get("custom_rule") or "").strip()
+        return not resolved_columns and not custom_rule
+    if ambiguity_kind == SQL_GROUNDING_ITEM_VALUE_AMBIGUITY:
+        selected_values = [
+            value
+            for value in item.get("selected_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        custom_rule = str(item.get("custom_rule") or "").strip()
+        return not selected_values and not custom_rule
+    return False
+
+
+def _find_next_unresolved_grounding_item_index(
+    resolution_items: list[dict[str, Any]],
+    *,
+    start_index: int = 0,
+) -> int | None:
+    for index in range(max(start_index, 0), len(resolution_items)):
+        if _grounding_resolution_item_is_unresolved(resolution_items[index]):
+            return index
+    return None
+
+
+def _enrich_grounding_resolution_items(
+    resolution_items: list[dict[str, Any]],
+    schema_grounding_catalog: dict[str, Any],
+) -> list[dict[str, Any]]:
+    option_labels = {
+        str(identifier): str(label)
+        for identifier, label in (schema_grounding_catalog.get("option_labels") or {}).items()
+        if isinstance(identifier, str) and isinstance(label, str)
+    }
+    candidate_values_by_column = {
+        str(identifier): [
+            value
+            for value in values or []
+            if isinstance(value, str) and value.strip()
+        ]
+        for identifier, values in (schema_grounding_catalog.get("candidate_values_by_column") or {}).items()
+        if isinstance(identifier, str)
+    }
+
+    enriched_items: list[dict[str, Any]] = []
+    for item in resolution_items:
+        if not isinstance(item, dict):
+            continue
+        ambiguity_kind = str(item.get("ambiguity_kind") or "").strip().lower()
+        if ambiguity_kind not in {
+            SQL_GROUNDING_ITEM_GROUNDED_FILTER,
+            SQL_GROUNDING_ITEM_FIELD_AMBIGUITY,
+            SQL_GROUNDING_ITEM_VALUE_AMBIGUITY,
+        }:
+            continue
+
+        enriched_item = {
+            "matched_phrase": str(item.get("matched_phrase") or "").strip(),
+            "ambiguity_kind": ambiguity_kind,
+        }
+        selected_column = str(item.get("selected_column") or "").strip()
+        if selected_column:
+            enriched_item["selected_column"] = selected_column
+            enriched_item["field_label"] = option_labels.get(selected_column, selected_column)
+
+        selected_values = _ordered_unique_values(
+            [
+                value
+                for value in item.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if selected_values:
+            enriched_item["selected_values"] = selected_values
+
+        candidate_columns = [
+            value
+            for value in item.get("candidate_columns") or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if candidate_columns:
+            enriched_item["candidate_columns"] = candidate_columns
+            enriched_item["candidate_column_labels"] = {
+                column_name: option_labels.get(column_name, column_name)
+                for column_name in candidate_columns
+            }
+
+        candidate_values = _ordered_unique_values(
+            [
+                value
+                for value in item.get("candidate_values") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if ambiguity_kind == SQL_GROUNDING_ITEM_VALUE_AMBIGUITY and not candidate_values and selected_column:
+            candidate_values = list(candidate_values_by_column.get(selected_column) or [])
+        if candidate_values:
+            enriched_item["candidate_values"] = candidate_values
+
+        resolved_columns = _ordered_unique_values(
+            [
+                value
+                for value in item.get("resolved_columns") or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if resolved_columns:
+            enriched_item["resolved_columns"] = resolved_columns
+
+        custom_rule = str(item.get("custom_rule") or "").strip()
+        if custom_rule:
+            enriched_item["custom_rule"] = custom_rule
+
+        enriched_items.append(enriched_item)
+    return enriched_items
+
+
+def _is_short_grounding_phrase(value: str) -> bool:
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return False
+    return len(normalized_value) <= 60 and len(normalized_value.split()) <= 8
+
+
+def _attach_grounding_queue_metadata(
+    clarification: dict[str, Any],
+    resolution_items: list[dict[str, Any]],
+    current_index: int,
+) -> dict[str, Any]:
+    clarification[SQL_GROUNDING_RESOLUTION_ITEMS_KEY] = copy.deepcopy(resolution_items)
+    clarification[SQL_GROUNDING_CURRENT_ITEM_INDEX_KEY] = current_index
+    return clarification
+
+
+def _schema_grounding_clarification_has_consistent_options(
+    clarification: dict[str, Any],
+) -> bool:
+    option_columns = clarification.get("option_columns")
+    if not isinstance(option_columns, dict) or not option_columns:
+        return True
+
+    rendered_options = [
+        option
+        for option in clarification.get("options") or []
+        if isinstance(option, str)
+        and option.strip()
+        and option != SQL_INTERPRETATION_OTHER_FIELD_OPTION
+    ]
+    return rendered_options == list(option_columns.keys())
+
+
+def _build_failsafe_schema_grounding_clarification(
+    topic_context: str,
+    resolution_items: list[dict[str, Any]],
+    current_index: int,
+    *,
+    grounded_filters: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    current_item = resolution_items[current_index] if 0 <= current_index < len(resolution_items) else {}
+    matched_phrase = str(current_item.get("matched_phrase") or "").strip()
+    if _is_short_grounding_phrase(matched_phrase):
+        user_message = (
+            f"I found more than one nearby schema interpretation for '{matched_phrase}'. "
+            "Please describe the field or value you mean in your own words."
+        )
+    else:
+        user_message = (
+            "I found more than one nearby schema interpretation for this request. "
+            "Please describe the field or value you mean in your own words."
+        )
+    clarification = build_clarification_response(
+        user_message,
+        clarification_kind=CLARIFICATION_KIND_INTERPRETATION,
+    )
+    if topic_context:
+        clarification["topic_context"] = topic_context
+    merged_filters = grounded_filters or _merge_grounding_resolution_item_filters(resolution_items)
+    if merged_filters:
+        clarification["grounded_filters"] = merged_filters
+    return _attach_grounding_queue_metadata(clarification, resolution_items, current_index)
+
+
+def _build_field_ambiguity_clarification_from_item(
+    topic_context: str,
+    resolution_items: list[dict[str, Any]],
+    current_index: int,
+) -> dict[str, Any]:
+    current_item = resolution_items[current_index]
+    candidate_columns = [
+        value
+        for value in current_item.get("candidate_columns") or []
+        if isinstance(value, str) and value.strip()
+    ]
+    candidate_column_labels = {
+        str(identifier): str(label)
+        for identifier, label in (current_item.get("candidate_column_labels") or {}).items()
+        if isinstance(identifier, str) and isinstance(label, str)
+    }
+    selected_options: list[str] = []
+    option_columns: dict[str, str] = {}
+    for column_name in candidate_columns:
+        option_label = candidate_column_labels.get(column_name, column_name)
+        if not option_label or option_label in option_columns:
+            continue
+        selected_options.append(option_label)
+        option_columns[option_label] = column_name
+
+    if len(selected_options) < 2:
+        return _build_failsafe_schema_grounding_clarification(
+            topic_context,
+            resolution_items,
+            current_index,
+        )
+
+    if SQL_INTERPRETATION_OTHER_FIELD_OPTION not in selected_options:
+        selected_options.append(SQL_INTERPRETATION_OTHER_FIELD_OPTION)
+
+    matched_phrase = str(current_item.get("matched_phrase") or "").strip()
+    if _is_short_grounding_phrase(matched_phrase):
+        user_message = f"I found more than one nearby schema field for '{matched_phrase}'. Which one do you mean?"
+    else:
+        user_message = "I found more than one nearby schema field for this request. Which one do you mean?"
+
+    clarification = build_clarification_response(
+        user_message,
+        selected_options,
+        clarification_kind=CLARIFICATION_KIND_INTERPRETATION,
+        preserve_option_text=True,
+    )
+    if topic_context:
+        clarification["topic_context"] = topic_context
+    clarification["option_columns"] = option_columns
+    merged_filters = _merge_grounding_resolution_item_filters(resolution_items)
+    if merged_filters:
+        clarification["grounded_filters"] = merged_filters
+    clarification = _attach_grounding_queue_metadata(clarification, resolution_items, current_index)
+    if not _schema_grounding_clarification_has_consistent_options(clarification):
+        return _build_failsafe_schema_grounding_clarification(
+            topic_context,
+            resolution_items,
+            current_index,
+            grounded_filters=merged_filters,
+        )
+    return clarification
+
+
+def _build_value_ambiguity_clarification_from_item(
+    topic_context: str,
+    resolution_items: list[dict[str, Any]],
+    current_index: int,
+) -> dict[str, Any]:
+    current_item = resolution_items[current_index]
+    field_label = str(
+        current_item.get("field_label")
+        or current_item.get("selected_column")
+        or "this field"
+    ).strip()
+    candidate_values = _ordered_unique_values(
+        [
+            value
+            for value in current_item.get("candidate_values") or []
+            if isinstance(value, str) and value.strip()
+        ]
+    )
+    if not candidate_values:
+        return _build_failsafe_schema_grounding_clarification(
+            topic_context,
+            resolution_items,
+            current_index,
+        )
+
+    matched_phrase = str(current_item.get("matched_phrase") or "").strip()
+    if _is_short_grounding_phrase(matched_phrase):
+        user_message = (
+            f"I matched '{matched_phrase}' to {field_label}, but I still need the exact stored value to use. "
+            f"Which values from {field_label} should I include?"
+        )
+    else:
+        user_message = (
+            f"I matched this part of your request to {field_label}, but I still need the exact stored value to use. "
+            f"Which values from {field_label} should I include?"
+        )
+
+    clarification = build_clarification_response(
+        user_message,
+        candidate_values,
+        clarification_kind=CLARIFICATION_KIND_CATEGORICAL_VALUES,
+    )
+    if topic_context:
+        clarification["topic_context"] = topic_context
+    merged_filters = _merge_grounding_resolution_item_filters(resolution_items)
+    if merged_filters:
+        clarification["grounded_filters"] = merged_filters
+    return _attach_grounding_queue_metadata(clarification, resolution_items, current_index)
+
+
+def _build_schema_grounding_clarification_from_resolution_items(
+    topic_context: str,
+    resolution_items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    current_index = _find_next_unresolved_grounding_item_index(resolution_items)
+    if current_index is None:
+        return None
+
+    current_item = resolution_items[current_index]
+    ambiguity_kind = str(current_item.get("ambiguity_kind") or "").strip().lower()
+    if ambiguity_kind == SQL_GROUNDING_ITEM_FIELD_AMBIGUITY:
+        return _build_field_ambiguity_clarification_from_item(
+            topic_context,
+            resolution_items,
+            current_index,
+        )
+    if ambiguity_kind == SQL_GROUNDING_ITEM_VALUE_AMBIGUITY:
+        return _build_value_ambiguity_clarification_from_item(
+            topic_context,
+            resolution_items,
+            current_index,
+        )
+    return None
+
+
+def _resolve_current_grounding_item(
+    item: dict[str, Any],
+    clarification: dict[str, Any],
+    *,
+    matched_options: list[str] | None = None,
+    custom_rule: str | None = None,
+) -> dict[str, Any]:
+    resolved_item = copy.deepcopy(item)
+    ambiguity_kind = str(resolved_item.get("ambiguity_kind") or "").strip().lower()
+    normalized_custom_rule = custom_rule.strip() if isinstance(custom_rule, str) else ""
+    if ambiguity_kind == SQL_GROUNDING_ITEM_FIELD_AMBIGUITY:
+        option_columns = clarification.get("option_columns")
+        resolved_columns: list[str] = []
+        seen_columns: set[str] = set()
+        if isinstance(option_columns, dict):
+            for option_name in matched_options or []:
+                column_name = str(option_columns.get(option_name) or "").strip()
+                if not column_name or column_name in seen_columns:
+                    continue
+                seen_columns.add(column_name)
+                resolved_columns.append(column_name)
+        if resolved_columns:
+            resolved_item["resolved_columns"] = resolved_columns
+        if normalized_custom_rule:
+            resolved_item["custom_rule"] = normalized_custom_rule
+        return resolved_item
+
+    if ambiguity_kind == SQL_GROUNDING_ITEM_VALUE_AMBIGUITY:
+        selected_values = _ordered_unique_values(
+            [
+                value
+                for value in matched_options or []
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+        if selected_values:
+            resolved_item["selected_values"] = selected_values
+        if normalized_custom_rule:
+            resolved_item["custom_rule"] = normalized_custom_rule
+        return resolved_item
+
+    return resolved_item
+
+
+def _apply_structured_schema_grounding_followup(
+    llm_request,
+    clarification: dict[str, Any],
+    user_text: str,
+    resolution_items: list[dict[str, Any]],
+) -> bool:
+    topic_context = _select_pending_clarification_topic_text(clarification)
+    if not topic_context:
+        return False
+
+    rewritten_sections = [
+        "The user is continuing the same dataset request after structured schema grounding clarification.",
+        f"Current dataset question: {topic_context}",
+    ]
+
+    grounded_filters = _merge_grounding_resolution_item_filters(resolution_items)
+    grounded_lines = [
+        f"- {column_name} = {', '.join(selected_values)}"
+        for column_name, selected_values in grounded_filters.items()
+        if column_name and selected_values
+    ]
+    if grounded_lines:
+        rewritten_sections.append(
+            "Grounded categorical filters already supported by the request or clarification:\n"
+            + "\n".join(grounded_lines)
+        )
+
+    resolved_field_lines: list[str] = []
+    custom_rule_lines: list[str] = []
+    for item in resolution_items:
+        if not isinstance(item, dict):
+            continue
+        matched_phrase = str(item.get("matched_phrase") or "").strip()
+        field_label = str(item.get("field_label") or item.get("selected_column") or "").strip()
+        selected_column = str(item.get("selected_column") or "").strip()
+        for resolved_column in item.get("resolved_columns") or []:
+            resolved_column = str(resolved_column or "").strip()
+            if not resolved_column:
+                continue
+            resolved_label = field_label if selected_column == resolved_column and field_label else resolved_column
+            if _is_short_grounding_phrase(matched_phrase):
+                resolved_field_lines.append(
+                    f"- {matched_phrase} -> {resolved_label} ({resolved_column})"
+                )
+            else:
+                resolved_field_lines.append(f"- {resolved_label} ({resolved_column})")
+        if (
+            str(item.get("ambiguity_kind") or "").strip().lower() == SQL_GROUNDING_ITEM_VALUE_AMBIGUITY
+            and selected_column
+        ):
+            if _is_short_grounding_phrase(matched_phrase):
+                resolved_field_lines.append(f"- {matched_phrase} -> {field_label} ({selected_column})")
+            else:
+                resolved_field_lines.append(f"- {field_label} ({selected_column})")
+        custom_rule = str(item.get("custom_rule") or "").strip()
+        if custom_rule:
+            if _is_short_grounding_phrase(matched_phrase) and field_label:
+                custom_rule_lines.append(
+                    f"- {matched_phrase} on {field_label}: {custom_rule}"
+                )
+            elif field_label:
+                custom_rule_lines.append(f"- {field_label}: {custom_rule}")
+            else:
+                custom_rule_lines.append(f"- {custom_rule}")
+
+    if resolved_field_lines:
+        rewritten_sections.append(
+            "Resolved schema fields from clarification:\n" + "\n".join(_ordered_unique_values(resolved_field_lines))
+        )
+    if custom_rule_lines:
+        rewritten_sections.append(
+            "Custom clarification rules from the user:\n" + "\n".join(_ordered_unique_values(custom_rule_lines))
+        )
+
+    rewritten_sections.append(f"Latest clarification reply: {user_text}")
+    rewritten_sections.append(
+        "Use these grounded interpretations to continue the same dataset request and only then decide whether SQL can be generated."
+    )
+    return _replace_last_user_text(llm_request, "\n\n".join(rewritten_sections))
+
+
+def _advance_structured_schema_grounding_clarification(
+    state: Any,
+    llm_request,
+    clarification: dict[str, Any],
+    user_text: str,
+    *,
+    matched_options: list[str] | None = None,
+    custom_rule: str | None = None,
+) -> tuple[bool, LlmResponse | None]:
+    resolution_items = [
+        item
+        for item in clarification.get(SQL_GROUNDING_RESOLUTION_ITEMS_KEY) or []
+        if isinstance(item, dict)
+    ]
+    if not resolution_items:
+        return False, None
+
+    try:
+        current_index = int(clarification.get(SQL_GROUNDING_CURRENT_ITEM_INDEX_KEY) or 0)
+    except (TypeError, ValueError):
+        current_index = 0
+    if not (0 <= current_index < len(resolution_items)):
+        current_index = _find_next_unresolved_grounding_item_index(resolution_items) or 0
+
+    resolution_items[current_index] = _resolve_current_grounding_item(
+        resolution_items[current_index],
+        clarification,
+        matched_options=matched_options,
+        custom_rule=custom_rule,
+    )
+
+    topic_context = _select_pending_clarification_topic_text(clarification)
+    next_index = _find_next_unresolved_grounding_item_index(
+        resolution_items,
+        start_index=current_index + 1,
+    )
+    if next_index is None:
+        next_index = _find_next_unresolved_grounding_item_index(resolution_items, start_index=0)
+
+    if next_index is not None:
+        next_clarification = _build_schema_grounding_clarification_from_resolution_items(
+            topic_context,
+            resolution_items,
+        )
+        if next_clarification is None:
+            return False, None
+        _set_pending_clarification_state(state, next_clarification)
+        if isinstance(topic_context, str) and topic_context.strip():
+            state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+        formatted_response = format_clarification_response(next_clarification)
+        if not formatted_response:
+            return False, None
+        return False, LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=formatted_response)],
+            )
+        )
+
+    rewritten = _apply_structured_schema_grounding_followup(
+        llm_request,
+        clarification,
+        user_text,
+        resolution_items,
+    )
+    if not rewritten:
+        return False, None
+    _clear_pending_clarification_state(state)
+    if isinstance(topic_context, str) and topic_context.strip():
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+    return True, None
 
 
 def _resolve_pending_clarification_reply(
@@ -3314,11 +3895,16 @@ def build_combined_before_model_callback(
                 _print_clarification_debug(active_settings, "before-model-user-prompt", raw_user_text or user_text)
             pending_clarification = _get_pending_clarification(callback_context.state)
             clarification_followup = False
+            structured_clarification_response: LlmResponse | None = None
             if pending_clarification is not None:
                 _print_clarification_debug(
                     active_settings,
                     "before-model-pending-state",
                     pending_clarification,
+                )
+                is_structured_grounding_clarification = isinstance(
+                    pending_clarification.get(SQL_GROUNDING_RESOLUTION_ITEMS_KEY),
+                    list,
                 )
                 pending_options = [
                     option
@@ -3334,33 +3920,48 @@ def build_combined_before_model_callback(
                         matched_options,
                     )
                 if has_option_match:
-                    clarification_followup = _apply_pending_clarification_followup(
-                        llm_request,
-                        pending_clarification,
-                    )
-                    if clarification_followup:
-                        base_query_frame = pending_clarification.get("base_query_frame")
-                        if isinstance(base_query_frame, dict):
-                            callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                                base_query_frame
-                            )
-                        topic_context = _select_pending_clarification_topic_text(pending_clarification)
-                        if isinstance(topic_context, str) and topic_context.strip():
-                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-followup-rewritten",
-                            _extract_last_user_text(llm_request),
+                    if is_structured_grounding_clarification:
+                        clarification_followup, structured_clarification_response = _advance_structured_schema_grounding_clarification(
+                            callback_context.state,
+                            llm_request,
+                            pending_clarification,
+                            user_text,
+                            matched_options=matched_options,
                         )
-                        recent_interpretation_clarification = _build_recent_interpretation_clarification(
-                            pending_clarification
-                        )
-                        if recent_interpretation_clarification is not None:
-                            _set_recent_interpretation_clarification_state(
-                                callback_context.state,
-                                recent_interpretation_clarification,
+                        if clarification_followup:
+                            _print_clarification_debug(
+                                active_settings,
+                                "before-model-followup-rewritten",
+                                _extract_last_user_text(llm_request),
                             )
-                        _clear_pending_clarification_state(callback_context.state)
+                    else:
+                        clarification_followup = _apply_pending_clarification_followup(
+                            llm_request,
+                            pending_clarification,
+                        )
+                        if clarification_followup:
+                            base_query_frame = pending_clarification.get("base_query_frame")
+                            if isinstance(base_query_frame, dict):
+                                callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                    base_query_frame
+                                )
+                            topic_context = _select_pending_clarification_topic_text(pending_clarification)
+                            if isinstance(topic_context, str) and topic_context.strip():
+                                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+                            _print_clarification_debug(
+                                active_settings,
+                                "before-model-followup-rewritten",
+                                _extract_last_user_text(llm_request),
+                            )
+                            recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                                pending_clarification
+                            )
+                            if recent_interpretation_clarification is not None:
+                                _set_recent_interpretation_clarification_state(
+                                    callback_context.state,
+                                    recent_interpretation_clarification,
+                                )
+                            _clear_pending_clarification_state(callback_context.state)
                 else:
                     clarification_resolution = _resolve_pending_clarification_reply(
                         clarification_resolver,
@@ -3389,37 +3990,60 @@ def build_combined_before_model_callback(
                             "before-model-topic-router-decision",
                             clarification_resolution.get("resolution_type") or "custom_rule",
                         )
-                        clarification_followup = _apply_pending_clarification_followup_with_resolution(
-                            llm_request,
-                            pending_clarification,
-                            user_text,
-                            matched_options=clarification_resolution.get("selected_options"),
-                            custom_rule=clarification_resolution.get("custom_rule"),
-                        )
-                        if clarification_followup:
-                            base_query_frame = pending_clarification.get("base_query_frame")
-                            if isinstance(base_query_frame, dict):
-                                callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                                    base_query_frame
-                                )
-                            topic_context = _select_pending_clarification_topic_text(pending_clarification)
-                            if isinstance(topic_context, str) and topic_context.strip():
-                                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                            _print_clarification_debug(
-                                active_settings,
-                                "before-model-followup-rewritten",
-                                _extract_last_user_text(llm_request),
+                        if is_structured_grounding_clarification:
+                            clarification_followup, structured_clarification_response = _advance_structured_schema_grounding_clarification(
+                                callback_context.state,
+                                llm_request,
+                                pending_clarification,
+                                user_text,
+                                matched_options=clarification_resolution.get("selected_options"),
+                                custom_rule=clarification_resolution.get("custom_rule"),
                             )
-                            if clarification_resolution.get("selected_options"):
-                                recent_interpretation_clarification = _build_recent_interpretation_clarification(
-                                    pending_clarification
+                            if clarification_followup:
+                                _print_clarification_debug(
+                                    active_settings,
+                                    "before-model-followup-rewritten",
+                                    _extract_last_user_text(llm_request),
                                 )
-                                if recent_interpretation_clarification is not None:
-                                    _set_recent_interpretation_clarification_state(
-                                        callback_context.state,
-                                        recent_interpretation_clarification,
+                        else:
+                            clarification_followup = _apply_pending_clarification_followup_with_resolution(
+                                llm_request,
+                                pending_clarification,
+                                user_text,
+                                matched_options=clarification_resolution.get("selected_options"),
+                                custom_rule=clarification_resolution.get("custom_rule"),
+                            )
+                            if clarification_followup:
+                                base_query_frame = pending_clarification.get("base_query_frame")
+                                if isinstance(base_query_frame, dict):
+                                    callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
+                                        base_query_frame
                                     )
-                            _clear_pending_clarification_state(callback_context.state)
+                                topic_context = _select_pending_clarification_topic_text(pending_clarification)
+                                if isinstance(topic_context, str) and topic_context.strip():
+                                    callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+                                _print_clarification_debug(
+                                    active_settings,
+                                    "before-model-followup-rewritten",
+                                    _extract_last_user_text(llm_request),
+                                )
+                                if clarification_resolution.get("selected_options"):
+                                    recent_interpretation_clarification = _build_recent_interpretation_clarification(
+                                        pending_clarification
+                                    )
+                                    if recent_interpretation_clarification is not None:
+                                        _set_recent_interpretation_clarification_state(
+                                            callback_context.state,
+                                            recent_interpretation_clarification,
+                                        )
+                                _clear_pending_clarification_state(callback_context.state)
+            if structured_clarification_response is not None:
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-branch",
+                    "continuing structured schema grounding clarification without scope gate",
+                )
+                return structured_clarification_response
             if clarification_followup:
                 _print_clarification_debug(
                     active_settings,
@@ -3673,8 +4297,36 @@ def build_combined_before_model_callback(
                         "grounded_filters": grounded_filters,
                         "candidate_columns": resolved_candidate_columns,
                         "resolved_columns": resolved_grounding_columns,
+                        "resolution_items": grounding_resolution.get("resolution_items") or [],
                     },
                 )
+                structured_resolution_items = _enrich_grounding_resolution_items(
+                    [
+                        entry
+                        for entry in grounding_resolution.get("resolution_items") or []
+                        if isinstance(entry, dict)
+                    ],
+                    schema_grounding_catalog,
+                )
+                structured_clarification = _build_schema_grounding_clarification_from_resolution_items(
+                    topic_text,
+                    structured_resolution_items,
+                )
+                if structured_clarification is not None:
+                    _set_pending_clarification_state(callback_context.state, structured_clarification)
+                    _print_clarification_debug(
+                        active_settings,
+                        "before-model-schema-grounding-clarification",
+                        structured_clarification,
+                    )
+                    formatted_response = format_clarification_response(structured_clarification)
+                    if formatted_response:
+                        return LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[types.Part(text=formatted_response)],
+                            )
+                        )
                 if grounding_resolution.get("resolution_type") == "needs_clarification" and len(resolved_candidate_columns) >= 2:
                     clarification = _build_schema_grounding_clarification(
                         topic_text,

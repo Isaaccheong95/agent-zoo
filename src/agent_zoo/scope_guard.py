@@ -19,6 +19,9 @@ DEFAULT_REFUSAL_MESSAGE = (
     "dataset, its schema, filters, SQL queries, and aggregated results derived "
     "from it. I can't answer general non-dataset questions."
 )
+GROUNDING_ITEM_GROUNDED_FILTER = "grounded_filter"
+GROUNDING_ITEM_FIELD_AMBIGUITY = "field_ambiguity"
+GROUNDING_ITEM_VALUE_AMBIGUITY = "value_ambiguity"
 
 
 def _print_classifier_debug(debug_label: str | None, stage: str, payload: str) -> None:
@@ -211,6 +214,17 @@ def _filter_supported_grounded_values(
         seen_values.add(value)
         supported_values.append(value)
     return supported_values
+
+
+def _normalize_grounding_item_kind(value: Any) -> str:
+    normalized_kind = str(value or "").strip().lower()
+    if normalized_kind in {
+        GROUNDING_ITEM_GROUNDED_FILTER,
+        GROUNDING_ITEM_FIELD_AMBIGUITY,
+        GROUNDING_ITEM_VALUE_AMBIGUITY,
+    }:
+        return normalized_kind
+    return ""
 
 
 def _fallback_clarification_resolution(user_reply: str) -> dict[str, Any]:
@@ -791,6 +805,355 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
         "- Output JSON only. No markdown fences or extra text."
     )
 
+    itemization_system_prompt = (
+        "You are a strict structured schema-grounding planner for a dataset SQL agent.\n"
+        "You will receive the latest user request, schema previews, exact stored values, dataset-backed grounding candidates, and a coarse phase-1 grounding result.\n"
+        "Your job is to decompose the request into structured schema-linked items without inventing columns or values.\n\n"
+        "Reply with exactly one JSON object using this schema:\n"
+        '{"items":[{"matched_phrase":"...","ambiguity_kind":"grounded_filter|field_ambiguity|value_ambiguity","selected_column":"...","selected_values":["..."],"candidate_columns":["..."],"candidate_values":["..."]}]}\n\n'
+        "Rules:\n"
+        "- Create one item per substantive schema-linked phrase or condition in the user request.\n"
+        "- Use ambiguity_kind='grounded_filter' when one exact column and one or more exact stored values are already clearly supported.\n"
+        "- Use ambiguity_kind='field_ambiguity' when a phrase could still refer to two or more schema columns.\n"
+        "- Use ambiguity_kind='value_ambiguity' when one schema column is clear but no exact stored value is clearly supported yet.\n"
+        "- matched_phrase should be the shortest exact phrase from the user request that best names the concept.\n"
+        "- selected_column must be an exact schema identifier and is required for grounded_filter and value_ambiguity items.\n"
+        "- selected_values must contain only exact stored values for selected_column and is required for grounded_filter items.\n"
+        "- candidate_columns must contain only exact schema identifiers and is required for field_ambiguity items. Include 2 to 4 columns.\n"
+        "- candidate_values must contain only exact stored values for selected_column when ambiguity_kind='value_ambiguity'. If you are unsure, return an empty array and let the caller use the full stored value set.\n"
+        "- Do not collapse distinct concepts from the same request into one item. Preserve separate items for already-grounded concepts and unresolved concepts.\n"
+        "- Do not invent new filters, columns, or values not present in the provided schema context.\n"
+        "- Output JSON only. No markdown fences or extra text."
+    )
+
+    def _guess_best_matched_phrase(
+        column_names: list[str],
+        value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+        fallback_text: str,
+    ) -> str:
+        best_phrase = ""
+        best_confidence = 0.0
+        for column_name in column_names:
+            value_evidence = value_evidence_by_column.get(column_name) or {}
+            for evidence in value_evidence.values():
+                if not isinstance(evidence, dict):
+                    continue
+                matched_phrase = str(evidence.get("matched_user_phrase") or "").strip()
+                if not matched_phrase:
+                    continue
+                try:
+                    confidence = float(evidence.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if confidence > best_confidence or not best_phrase:
+                    best_phrase = matched_phrase
+                    best_confidence = confidence
+        return best_phrase or fallback_text.strip()
+
+    def _build_fallback_resolution_items(
+        user_text: str,
+        grounded_filters: dict[str, list[str]],
+        candidate_columns_for_clarification: list[str],
+        resolved_columns: list[str],
+        candidate_value_map: dict[str, list[str]],
+        candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        fallback_items: list[dict[str, Any]] = []
+        for column_name, selected_values in grounded_filters.items():
+            if not column_name or not selected_values:
+                continue
+            fallback_items.append(
+                {
+                    "matched_phrase": _guess_best_matched_phrase(
+                        [column_name],
+                        candidate_value_evidence_by_column,
+                        user_text,
+                    ),
+                    "ambiguity_kind": GROUNDING_ITEM_GROUNDED_FILTER,
+                    "selected_column": column_name,
+                    "selected_values": list(selected_values),
+                    "candidate_columns": [],
+                    "candidate_values": [],
+                }
+            )
+
+        if len(candidate_columns_for_clarification) >= 2:
+            fallback_items.append(
+                {
+                    "matched_phrase": _guess_best_matched_phrase(
+                        candidate_columns_for_clarification,
+                        candidate_value_evidence_by_column,
+                        user_text,
+                    ),
+                    "ambiguity_kind": GROUNDING_ITEM_FIELD_AMBIGUITY,
+                    "selected_column": "",
+                    "selected_values": [],
+                    "candidate_columns": candidate_columns_for_clarification[:4],
+                    "candidate_values": [],
+                }
+            )
+
+        grounded_columns = set(grounded_filters)
+        for column_name in resolved_columns:
+            available_values = [
+                value
+                for value in candidate_value_map.get(column_name) or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if column_name in grounded_columns or len(available_values) < 2:
+                continue
+            fallback_items.append(
+                {
+                    "matched_phrase": _guess_best_matched_phrase(
+                        [column_name],
+                        candidate_value_evidence_by_column,
+                        user_text,
+                    ),
+                    "ambiguity_kind": GROUNDING_ITEM_VALUE_AMBIGUITY,
+                    "selected_column": column_name,
+                    "selected_values": [],
+                    "candidate_columns": [],
+                    "candidate_values": list(available_values),
+                }
+            )
+        return fallback_items
+
+    def _normalize_resolution_items(
+        raw_items: Any,
+        *,
+        user_text: str,
+        identifiers: list[str],
+        candidate_value_map: dict[str, list[str]],
+        candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+        fallback_grounded_filters: dict[str, list[str]],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw_items, list):
+            return []
+
+        normalized_items: list[dict[str, Any]] = []
+        seen_signatures: set[tuple[Any, ...]] = set()
+        for entry in raw_items:
+            if not isinstance(entry, dict):
+                continue
+
+            ambiguity_kind = _normalize_grounding_item_kind(entry.get("ambiguity_kind"))
+            if not ambiguity_kind:
+                continue
+
+            selected_column = _normalize_selected_identifier(
+                entry.get("selected_column"),
+                identifiers,
+            )
+            selected_values: list[str] = []
+            candidate_columns_for_item: list[str] = []
+            candidate_values_for_item: list[str] = []
+
+            if ambiguity_kind == GROUNDING_ITEM_GROUNDED_FILTER:
+                if not selected_column:
+                    continue
+                allowed_values = [
+                    value
+                    for value in candidate_value_map.get(selected_column) or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if not allowed_values:
+                    continue
+                selected_values = _normalize_selected_options(
+                    entry.get("selected_values"),
+                    allowed_values,
+                )
+                if selected_values:
+                    supported_values = _filter_supported_grounded_values(
+                        selected_values,
+                        candidate_value_evidence_by_column.get(selected_column, {}),
+                    )
+                    if supported_values:
+                        selected_values = supported_values
+                if not selected_values:
+                    selected_values = list(fallback_grounded_filters.get(selected_column) or [])
+                if not selected_values or len(selected_values) >= len(allowed_values):
+                    continue
+
+            elif ambiguity_kind == GROUNDING_ITEM_FIELD_AMBIGUITY:
+                candidate_columns_for_item = _normalize_selected_identifiers(
+                    entry.get("candidate_columns"),
+                    identifiers,
+                )
+                if len(candidate_columns_for_item) < 2:
+                    continue
+
+            elif ambiguity_kind == GROUNDING_ITEM_VALUE_AMBIGUITY:
+                if not selected_column:
+                    continue
+                allowed_values = [
+                    value
+                    for value in candidate_value_map.get(selected_column) or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if len(allowed_values) < 2:
+                    continue
+                candidate_values_for_item = _normalize_selected_options(
+                    entry.get("candidate_values"),
+                    allowed_values,
+                )
+                if len(candidate_values_for_item) < 2:
+                    candidate_values_for_item = list(allowed_values)
+
+            matched_phrase = str(entry.get("matched_phrase") or "").strip()
+            if not matched_phrase:
+                phrase_columns = candidate_columns_for_item or ([selected_column] if selected_column else [])
+                matched_phrase = _guess_best_matched_phrase(
+                    phrase_columns,
+                    candidate_value_evidence_by_column,
+                    user_text,
+                )
+
+            normalized_item = {
+                "matched_phrase": matched_phrase or user_text.strip(),
+                "ambiguity_kind": ambiguity_kind,
+                "selected_column": selected_column,
+                "selected_values": selected_values,
+                "candidate_columns": candidate_columns_for_item[:4],
+                "candidate_values": candidate_values_for_item,
+            }
+            signature = (
+                normalized_item["ambiguity_kind"],
+                normalized_item["matched_phrase"],
+                normalized_item["selected_column"],
+                tuple(normalized_item["selected_values"]),
+                tuple(normalized_item["candidate_columns"]),
+                tuple(normalized_item["candidate_values"]),
+            )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            normalized_items.append(normalized_item)
+
+        grounded_columns = {
+            item["selected_column"]
+            for item in normalized_items
+            if item.get("ambiguity_kind") == GROUNDING_ITEM_GROUNDED_FILTER
+            and item.get("selected_column")
+        }
+        filtered_items: list[dict[str, Any]] = []
+        for item in normalized_items:
+            if item.get("ambiguity_kind") == GROUNDING_ITEM_FIELD_AMBIGUITY:
+                filtered_candidate_columns = [
+                    identifier
+                    for identifier in item.get("candidate_columns") or []
+                    if identifier not in grounded_columns
+                ]
+                if len(filtered_candidate_columns) < 2:
+                    continue
+                item = {**item, "candidate_columns": filtered_candidate_columns[:4]}
+            elif item.get("ambiguity_kind") == GROUNDING_ITEM_VALUE_AMBIGUITY:
+                if item.get("selected_column") in grounded_columns:
+                    continue
+            filtered_items.append(item)
+
+        represented_grounded_columns = {
+            item.get("selected_column")
+            for item in filtered_items
+            if item.get("ambiguity_kind") == GROUNDING_ITEM_GROUNDED_FILTER
+        }
+        for column_name, selected_values in fallback_grounded_filters.items():
+            if column_name in represented_grounded_columns:
+                continue
+            filtered_items.append(
+                {
+                    "matched_phrase": _guess_best_matched_phrase(
+                        [column_name],
+                        candidate_value_evidence_by_column,
+                        user_text,
+                    ),
+                    "ambiguity_kind": GROUNDING_ITEM_GROUNDED_FILTER,
+                    "selected_column": column_name,
+                    "selected_values": list(selected_values),
+                    "candidate_columns": [],
+                    "candidate_values": [],
+                }
+            )
+        return filtered_items
+
+    def _itemize_grounding_resolution_items(
+        user_text: str,
+        schema_context: str,
+        grounding_candidates: list[dict[str, Any]],
+        phase_one_grounded_filters: dict[str, list[str]],
+        phase_one_candidate_columns: list[str],
+        phase_one_resolved_columns: list[str],
+        candidate_columns: list[str],
+        candidate_value_map: dict[str, list[str]],
+        candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        available_value_lines: list[str] = []
+        for column_name in candidate_columns:
+            available_values = [
+                value
+                for value in candidate_value_map.get(column_name) or []
+                if isinstance(value, str) and value.strip()
+            ]
+            if not available_values:
+                continue
+            available_value_lines.append(f"- {column_name}: {', '.join(available_values)}")
+
+        grounded_lines = [
+            f"- {column_name} = {', '.join(selected_values)}"
+            for column_name, selected_values in phase_one_grounded_filters.items()
+            if column_name and selected_values
+        ]
+        classifier_input = (
+            "Latest user request:\n"
+            + user_text.strip()
+            + "\n\nPhase-1 grounded exact filters:\n"
+            + ("\n".join(grounded_lines) or "[none]")
+            + "\n\nPhase-1 unresolved field candidates:\n"
+            + ("\n".join(f"- {identifier}" for identifier in phase_one_candidate_columns) or "[none]")
+            + "\n\nPhase-1 resolved columns without exact stored values:\n"
+            + ("\n".join(f"- {identifier}" for identifier in phase_one_resolved_columns) or "[none]")
+            + "\n\nAll schema column identifiers you may reference:\n"
+            + "\n".join(f"- {identifier}" for identifier in candidate_columns)
+            + "\n\nExact stored categorical values by column:\n"
+            + ("\n".join(available_value_lines) or "[none]")
+            + "\n\nCategorical grounding candidates:\n"
+            + (
+                "\n".join(f"- {json.dumps(entry, sort_keys=True)}" for entry in grounding_candidates if isinstance(entry, dict))
+                or "[none]"
+            )
+            + "\n\nSchema columns and previews:\n"
+            + schema_context.strip()
+        )
+
+        verdict = _run_litellm_classifier(
+            model,
+            itemization_system_prompt,
+            classifier_input,
+            max_tokens=700,
+            debug_label="schema-grounding-items" if debug else None,
+            uppercase=False,
+        )
+        if verdict is None:
+            return []
+
+        parsed_response = _parse_classifier_json(verdict)
+        if debug:
+            _print_classifier_debug(
+                "schema-grounding-items",
+                "parsed-response",
+                json.dumps(parsed_response, sort_keys=True) if parsed_response is not None else "<invalid>",
+            )
+        if parsed_response is None:
+            return []
+
+        return _normalize_resolution_items(
+            parsed_response.get("items"),
+            user_text=user_text,
+            identifiers=candidate_columns,
+            candidate_value_map=candidate_value_map,
+            candidate_value_evidence_by_column=candidate_value_evidence_by_column,
+            fallback_grounded_filters=phase_one_grounded_filters,
+        )
+
     def _review_unresolved_request(
         user_text: str,
         schema_context: str,
@@ -1038,6 +1401,7 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 "resolution_type": "proceed",
                 "grounded_filters": {},
                 "candidate_columns": [],
+                "resolution_items": [],
             }
 
         candidate_value_map: dict[str, list[str]] = {}
@@ -1113,6 +1477,7 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 "resolution_type": "proceed",
                 "grounded_filters": {},
                 "candidate_columns": [],
+                "resolution_items": [],
             }
 
         parsed_response = _parse_classifier_json(verdict)
@@ -1127,6 +1492,7 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 "resolution_type": "proceed",
                 "grounded_filters": {},
                 "candidate_columns": [],
+                "resolution_items": [],
             }
 
         resolution_type = str(parsed_response.get("resolution_type") or "").strip().lower()
@@ -1191,16 +1557,14 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
             ]
 
         if resolution_type == "needs_clarification" and len(normalized_candidate_columns) >= 2:
-            result = {
+            result: dict[str, Any] = {
                 "resolution_type": "needs_clarification",
                 "grounded_filters": normalized_grounded_filters,
                 "candidate_columns": normalized_candidate_columns[:4],
             }
             if resolved_columns:
                 result["resolved_columns"] = resolved_columns
-            return result
-
-        if committed_columns and not normalized_candidate_columns:
+        elif committed_columns and not normalized_candidate_columns:
             remaining_candidate_columns = [
                 identifier
                 for identifier in candidate_columns
@@ -1230,28 +1594,68 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                     final_resolved_columns = list(resolved_columns)
                     if selected_review_column not in final_resolved_columns:
                         final_resolved_columns.append(selected_review_column)
-                    return {
+                    result = {
                         "resolution_type": "proceed",
                         "grounded_filters": normalized_grounded_filters,
                         "candidate_columns": [],
                         "resolved_columns": final_resolved_columns,
                     }
+                else:
+                    result = {
+                        "resolution_type": "needs_clarification",
+                        "grounded_filters": normalized_grounded_filters,
+                        "candidate_columns": review_candidate_columns,
+                    }
+                    if resolved_columns:
+                        result["resolved_columns"] = resolved_columns
+            else:
                 result = {
-                    "resolution_type": "needs_clarification",
+                    "resolution_type": "proceed",
                     "grounded_filters": normalized_grounded_filters,
-                    "candidate_columns": review_candidate_columns,
+                    "candidate_columns": [],
                 }
                 if resolved_columns:
                     result["resolved_columns"] = resolved_columns
-                return result
+        else:
+            result = {
+                "resolution_type": "proceed",
+                "grounded_filters": normalized_grounded_filters,
+                "candidate_columns": [],
+            }
+            if resolved_columns:
+                result["resolved_columns"] = resolved_columns
 
-        result = {
-            "resolution_type": "proceed",
-            "grounded_filters": normalized_grounded_filters,
-            "candidate_columns": [],
-        }
-        if resolved_columns:
-            result["resolved_columns"] = resolved_columns
+        phase_one_candidate_columns = [
+            identifier
+            for identifier in result.get("candidate_columns") or []
+            if isinstance(identifier, str) and identifier.strip()
+        ]
+        phase_one_resolved_columns = [
+            identifier
+            for identifier in result.get("resolved_columns") or []
+            if isinstance(identifier, str) and identifier.strip()
+        ]
+        resolution_items = _itemize_grounding_resolution_items(
+            user_text,
+            schema_context,
+            grounding_candidates,
+            normalized_grounded_filters,
+            phase_one_candidate_columns,
+            phase_one_resolved_columns,
+            candidate_columns,
+            candidate_value_map,
+            candidate_value_evidence_by_column,
+        )
+        if not resolution_items:
+            resolution_items = _build_fallback_resolution_items(
+                user_text,
+                normalized_grounded_filters,
+                phase_one_candidate_columns,
+                phase_one_resolved_columns,
+                candidate_value_map,
+                candidate_value_evidence_by_column,
+            )
+        result["resolution_items"] = resolution_items
         return result
 
     return resolve

@@ -55,7 +55,7 @@ For onboarding, the simplest accurate mental model is:
    - a reply to a pending clarification
    - a refinement of the previous final SQL query
    - a fresh topic change that still needs routing before SQL flow continues
-4. That callback may rewrite the latest user turn, ask for clarification immediately, or refuse the request before the main model ever runs.
+4. That callback may rewrite the latest user turn, advance a pending clarification queue, ask for clarification immediately, or refuse the request before the main model ever runs.
 5. The main model either:
    - asks a clarification question
    - inspects schema
@@ -106,6 +106,7 @@ Code-grounded and test-grounded:
 - When the request is still in scope but ambiguous.
 - When more than one nearby schema field could match the request.
 - When a colloquial label like `drink` could mean more than one categorical field.
+- When one schema field is clear but the exact stored categorical values are still unresolved.
 - When a user asks to broaden or change a previous categorical filter without naming the exact final value set.
 - When the main model emits clarification-like text instead of a tool call.
 
@@ -201,11 +202,11 @@ The table below names the real stages from code. Stage names use actual builder 
 | 1. Agent construction | `build_root_agent()` in `agent.py` | Agent build time | Creates `LlmAgent`, injects instruction, tools, and four callbacks | `LlmAgent` instance |
 | 2. Session setup | `ask_question()` / `run_interactive_loop()` in `runtime.py` | Each user turn | Reuses or creates `InMemoryRunner`, creates session if needed, wraps user text in ADK `Content` | ADK session, event stream |
 | 3. Fresh-turn preamble | `build_combined_before_model_callback()` in `callbacks.py` | Before model call, when request does not end with tool response | Clears old private result state, extracts the effective user question, stores current topic text | `temp:sql_last_user_text`, `temp:sql_active_query_topic` |
-| 4. Pending clarification branch | same callback | Working memory contains `pending_clarification` | Resolves numeric, exact-text, or resolver-based clarification replies; rewrites latest user turn | rewritten latest user message |
+| 4. Pending clarification branch | same callback | Working memory contains `pending_clarification` | Resolves numeric, exact-text, or resolver-based clarification replies; structured schema-grounding clarifications can advance to the next unresolved item without calling the main model | rewritten latest user message or next clarification |
 | 5. Recent interpretation replay | same callback | Working memory contains `recent_interpretation_clarification` | Allows one later selection-like reply to reuse interpretation options after a result turn | rewritten latest user message |
 | 6. Result refinement branch | same callback | Working memory contains `current_query_frame` | Decides whether the new turn refines the previous query, needs clarification about a categorical filter or grouped structure, or starts a fresh topic | rewritten follow-up or pending clarification |
 | 7. Fresh-topic relevance router | same callback + `build_llm_fresh_topic_relevance_router()` | A pending clarification or result-refinement reply was classified as `topic_change` | Distinguishes `dataset_question`, `meta_or_conversational`, and `out_of_scope` before fresh SQL flow continues | router decision or immediate response |
-| 8. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, either grounds filters or asks interpretation clarification | rewritten question or pending clarification |
+| 8. Schema grounding branch | same callback | Fresh dataset question with usable text | Builds schema candidate catalog, runs schema grounding resolver, enriches structured `resolution_items`, then either rewrites grounded filters or starts a sequential field/value clarification flow | rewritten question or pending clarification |
 | 9. Scope gate | `build_scope_gate_callback()` via same callback | No earlier short-circuit blocked it | Runs dataset-scope classifier and returns refusal on out-of-scope prompts | refusal `LlmResponse` |
 | 10. Main model step | ADK `LlmAgent` | `before_model_callback` returned `None` | Main model can ask clarification, inspect schema, run exploratory SQL, or run final SQL | plain text or function call |
 | 11. Clarification normalization | `build_normalize_clarification_after_model_callback()` | Main model returned text, not a function call | Converts clarification-like text into deterministic clarification output and stores pending clarification | pending clarification + normalized clarification text |
@@ -245,8 +246,8 @@ There are two real loops, both spanning multiple turns inside the same session.
 1. Clarification loop
    - pending clarification is stored
    - user replies later
-   - `before_model_callback` rewrites the new user turn as a continuation of the earlier request
-   - the main model continues from there
+   - `before_model_callback` either advances the next structured clarification item immediately or rewrites the new user turn as a continuation of the earlier request
+   - the main model continues only after the clarification queue is resolved or the follow-up is rewritten
 
 2. Result refinement loop
    - a final query stores `current_query_frame`
@@ -394,7 +395,11 @@ The pending clarification payload is a dict. Depending on the path that created 
 | `base_query_frame` | Copy of the prior committed query frame, used when refinement must continue after clarification |
 | `option_columns` | Mapping from displayed interpretation option label back to exact schema column identifier |
 | `grounded_filters` | Already grounded categorical filters from the original request |
+| `grounding_resolution_items` | Internal structured schema-grounding queue used to continue unresolved field/value clarifications across turns |
+| `grounding_current_item_index` | Internal pointer to the currently active structured schema-grounding item |
 | `grouping_change_request` | Raw grouped-structure change request preserved when a follow-up needs clarification about a new grouping field |
+
+When `grounding_resolution_items` is present, the callbacks treat the clarification as a structured schema-grounding continuation rather than a one-shot menu. Exact option matches or resolver-based free-text replies update the current item, then the callback either emits the next clarification immediately or rewrites the same dataset question once all unresolved items are resolved.
 
 ### What is persistent across turns vs not
 
@@ -522,7 +527,7 @@ The package also makes separate LiteLLM calls in `scope_guard.py`. These are **n
 | `build_llm_clarification_resolver()` | topic context, clarification question, options, latest reply | Decide `selected_options`, `custom_rule`, or `topic_change` |
 | `build_llm_fresh_topic_relevance_router()` | schema text, previous committed dataset topic if any, latest reply already classified as `topic_change` | Decide `dataset_question`, `meta_or_conversational`, or `out_of_scope` |
 | `build_llm_result_refinement_resolver()` | previous question, topic context, previous SQL, categorical filters, grouping columns, recent refinement history, latest reply | Decide `refine_query`, `needs_clarification`, or `topic_change` |
-| `build_llm_schema_grounding_resolver()` | latest user request, schema column previews, grounding candidates, candidate column identifiers | Decide grounded categorical filters and unresolved field ambiguity |
+| `build_llm_schema_grounding_resolver()` | latest user request, schema column previews, grounding candidates, candidate column identifiers | Decide grounded filters, reviewed field resolutions, and structured `resolution_items` for unresolved field/value ambiguity |
 
 ### Schema-grounding context in particular
 
@@ -543,6 +548,41 @@ The grounding variants helper expands text into:
 - simple singularized token variants
 
 This matters for colloquial prompts such as `guys`, plural labels, and field glossary terms.
+
+### Schema-grounding resolver contract
+
+Fresh-turn schema grounding is now a two-part contract owned jointly by `scope_guard.py` and `callbacks.py`.
+
+`build_llm_schema_grounding_resolver()` returns a coarse top-level decision that can include:
+
+- `resolution_type`
+- `grounded_filters`
+- `candidate_columns`
+- `resolved_columns`
+- `resolution_items`
+
+`resolution_items` is the structured payload that describes how the request decomposes into schema-linked parts. Each item uses this shape:
+
+- `matched_phrase`
+- `ambiguity_kind`
+- `selected_column`
+- `selected_values`
+- `candidate_columns`
+- `candidate_values`
+
+The current item kinds are:
+
+- `grounded_filter`: one exact column and one or more exact stored values are already grounded
+- `field_ambiguity`: the phrase could still refer to two or more schema columns
+- `value_ambiguity`: one column is clear, but the exact stored value set is still unresolved
+
+The resolver owns the coarse decision and first-pass itemization. The callback layer then enriches those items with schema-backed display labels and fallback candidate values, stores them in `pending_clarification`, and asks unresolved items sequentially.
+
+Important nuance:
+
+- The callback layer is still the final authority for user-visible clarification flow.
+- Some `proceed` results can carry `resolved_columns` even when the final clarification still needs exact stored values.
+- In that case, callbacks may derive the value-level clarification from the schema catalog even if the resolver only emitted grounded-filter items.
 
 ### After-model clarification context
 
@@ -631,6 +671,7 @@ Code path:
 - `_get_pending_clarification(...)`
 - `_extract_matching_clarification_options(...)`
 - `_resolve_pending_clarification_reply(...)`
+- `_advance_structured_schema_grounding_clarification(...)`
 - `_apply_pending_clarification_followup_with_resolution(...)`
 
 Entry condition:
@@ -639,6 +680,7 @@ Entry condition:
 
 Actual transition conditions:
 
+- If the clarification is carrying a structured schema-grounding queue and the reply resolves the current item, the callback can emit the next unresolved clarification immediately without calling the main model.
 - If the reply exactly matches option text or deterministically matches numeric option indexes like `2`, `2 and 3`, or `2,3`, the callback rewrites the latest user turn immediately.
 - If there is no exact or numeric match, it calls `build_llm_clarification_resolver()`.
 - Resolver outcome `selected_options` -> rewrite follow-up and continue.
@@ -647,6 +689,7 @@ Actual transition conditions:
 
 Outputs:
 
+- next clarification response when a structured schema-grounding queue still has unresolved items
 - rewritten latest user turn containing clarification question, matched options or custom rule, and raw reply
 - cleared pending clarification state when successfully resolved
 
@@ -746,6 +789,9 @@ Code path:
 - `_extract_request_field_glossary(...)`
 - `_build_schema_grounding_catalog(...)`
 - `build_llm_schema_grounding_resolver()`
+- `_enrich_grounding_resolution_items(...)`
+- `_build_schema_grounding_clarification_from_resolution_items(...)`
+- `_advance_structured_schema_grounding_clarification(...)`
 - `_normalize_schema_grounding_filters(...)`
 - `_build_schema_grounding_clarification(...)`
 - `_apply_grounded_filter_followup(...)`
@@ -756,17 +802,21 @@ Entry condition:
 
 Actual transition conditions:
 
-- Resolver returns `needs_clarification` with at least two candidate columns -> build interpretation clarification and stop.
-- Resolver returns grounded filters and no remaining ambiguity -> rewrite latest user turn with those grounded filters and continue.
+- Resolver returns unresolved structured `resolution_items` -> callbacks enrich them and ask the first unresolved field or value clarification.
+- User replies to that structured clarification -> callbacks may ask the next unresolved item immediately without calling the main model.
+- Resolver returns grounded filters and no remaining unresolved item -> rewrite latest user turn with those grounded filters and continue.
+- Resolver returns `resolved_columns` for a clearly chosen field but exact stored values are still unresolved -> callbacks can derive a value clarification from the schema catalog before SQL generation continues.
 - Resolver returns no action -> fall through to scope gate.
 
 What triggers clarification here:
 
 - unresolved field-level ambiguity between two or more candidate schema columns
+- unresolved value-level ambiguity inside one already chosen schema field
+- multi-concept requests where one concept is already grounded and another still needs clarification
 
 What does **not** trigger this clarification:
 
-- pure value-level ambiguity within one already chosen field
+- fully resolved grounded filters with no remaining unresolved field or value choice
 
 ### 7. Scope gate
 
@@ -1101,9 +1151,8 @@ How many females drink?
 Test-grounded path:
 
 - schema grounding identifies `Female` as a likely grounded filter
-- same resolver sees that `drink` could map to more than one nearby categorical field
-- callback builds an interpretation clarification such as `Alcohol consumption` vs `Smoking status`
-- `pending_clarification` stores `grounded_filters` and `option_columns`
+- same resolver and callback flow can either surface a field ambiguity such as `Alcohol consumption` vs `Smoking status` or, when the field is judged clear enough, ask a second value clarification for the exact stored categories
+- `pending_clarification` stores `grounded_filters`, `option_columns`, and structured queue metadata when the clarification is part of the schema-grounding queue
 
 Typical tools and resolvers:
 
@@ -1150,7 +1199,8 @@ Test-grounded path:
 
 - schema grounding can infer `Male` from colloquial wording or from a wrapped field glossary
 - if `drink` is still ambiguous, callback returns an interpretation clarification
-- if the resolver can settle the field, callback rewrites the current question with grounded filters and continues
+- if the resolver can settle the field but not the exact stored value set, callback can ask a follow-up categorical clarification before SQL generation continues
+- if the field and value set are both settled, callback rewrites the current question with grounded filters and continues
 
 Typical tools and resolvers:
 
@@ -1159,7 +1209,7 @@ Typical tools and resolvers:
 
 Response pattern:
 
-- either interpretation clarification or rewritten same-turn grounded query flow
+- interpretation clarification, value clarification, or rewritten same-turn grounded query flow
 
 ### 6. Off-topic request
 
@@ -1363,7 +1413,7 @@ This section maps where the logic actually lives.
 | `sql_agent/instructions.py` | `DEFAULT_INSTRUCTION`, `build_agent_instruction` | Main model instruction assembly |
 | `sql_agent/tools.py` | `build_sql_tools` | Actual ADK tool registration |
 | `sql_agent/db.py` | `get_schema_summary`, `validate_sql_read_only`, `execute_sqlite_query`, rewrite helpers | SQLite safety layer, schema inspection, execution, SQL rewriting |
-| `sql_agent/callbacks.py` | `build_combined_before_model_callback`, `build_normalize_clarification_after_model_callback`, `build_remember_query_result_callback`, `build_format_final_agent_response_callback` | Real workflow state machine, clarification memory, refinement routing, final rendering coordination |
+| `sql_agent/callbacks.py` | `build_combined_before_model_callback`, `build_normalize_clarification_after_model_callback`, `build_remember_query_result_callback`, `build_format_final_agent_response_callback` | Real workflow state machine, including clarification memory, sequential schema-grounding queue handling, refinement routing, and final rendering coordination |
 | `sql_agent/formatting.py` | clarification parsers and formatters, `format_public_query_result` | Deterministic clarification and final-answer rendering |
 | `scope_guard.py` | `build_llm_scope_gate`, `build_llm_clarification_resolver`, `build_llm_result_refinement_resolver`, `build_llm_schema_grounding_resolver` | Sidecar LLM control plane for scope, clarification, refinement, and schema grounding |
 | `working_memory.py` | `get_agent_working_memory*`, `set_agent_working_memory*` | Custom session-scoped working-memory abstraction |
@@ -1418,7 +1468,7 @@ stateDiagram-v2
     FreshTurn --> ResultRefinement : current_query_frame exists
     FreshTurn --> SchemaGrounding : otherwise
 
-    PendingClarification --> ClarificationWaiting : clarification returned earlier
+      PendingClarification --> ClarificationWaiting : structured queue has more unresolved items
     PendingClarification --> MainModel : reply rewritten for same topic
     PendingClarification --> FreshTopic : topic_change
 
@@ -1427,7 +1477,7 @@ stateDiagram-v2
     ResultRefinement --> FreshTopic : topic_change
 
     FreshTopic --> ScopeGate
-    SchemaGrounding --> ClarificationWaiting : interpretation clarification
+      SchemaGrounding --> ClarificationWaiting : field or value clarification
     SchemaGrounding --> ScopeGate : no action
     SchemaGrounding --> MainModel : grounded filter rewrite
 
@@ -1576,8 +1626,8 @@ These are the highest-risk areas.
    - keeping selected values and free-text refinement requests together
 
 3. Fresh-turn schema grounding
-   - interaction between request glossary, `source_header`, categorical candidates, and resolver outputs
-   - preserving grounded filters while still asking for unresolved field clarification
+   - interaction between request glossary, `source_header`, categorical candidates, structured `resolution_items`, and callback enrichment
+   - preserving grounded filters while still asking for unresolved field or value clarification
 
 4. Privacy shaping in `callbacks.py`
    - count-only fallback vs privacy block
@@ -1673,6 +1723,7 @@ Code-grounded and inference where noted:
 7. `pipeline.py` can be useful for deterministic support workflows, but it does not represent the full live callback-driven runtime.
 8. If an upstream web app wraps prompts poorly and the actual user question is not the last meaningful line, topic extraction and follow-up routing can become inaccurate.
 9. The agent forbids model-generated window functions in instructions, but object-level canonicalization in `db.py` can still internally introduce `ROW_NUMBER()` CTEs when that mode is enabled. That internal rewrite is performed by Python, not by the model.
+10. Fresh-turn schema grounding currently asks unresolved items sequentially, one field/value ambiguity at a time. It does not yet build one combined clarification that covers multiple unresolved concepts in a single message.
 
 ## Glossary
 
@@ -1690,6 +1741,7 @@ Code-grounded and inference where noted:
 | `display_sql` | User-visible SQL shown in the final answer |
 | `sql` | Actual executed SQL, which may be more rewritten or canonicalized than `display_sql` |
 | Schema grounding | Fresh-turn attempt to map user wording to exact schema fields and categorical filters before SQL generation |
+| `resolution_items` | Structured schema-grounding payload describing grounded filters plus unresolved field/value items |
 | Result refinement | Post-result follow-up that modifies the previous final SQL-backed question instead of starting over |
 
 ## Quick Run and Test Appendix

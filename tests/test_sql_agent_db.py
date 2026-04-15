@@ -1134,11 +1134,12 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(resolution, {"resolution_type": "dataset_question"})
 
     def test_schema_grounding_resolver_includes_schema_context(self) -> None:
-        captured: dict[str, str] = {}
+        captured_system_prompts: list[str] = []
+        captured_user_prompts: list[str] = []
 
         def completion(**kwargs):
-            captured["system_prompt"] = kwargs["messages"][0]["content"]
-            captured["user_prompt"] = kwargs["messages"][1]["content"]
+            captured_system_prompts.append(kwargs["messages"][0]["content"])
+            captured_user_prompts.append(kwargs["messages"][1]["content"])
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -1186,16 +1187,35 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 "resolution_type": "needs_clarification",
                 "grounded_filters": {"gender": ["Female"]},
                 "candidate_columns": ["socalc", "socsmk"],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "females",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "gender",
+                        "selected_values": ["Female"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                    {
+                        "matched_phrase": "how many females drink",
+                        "ambiguity_kind": "field_ambiguity",
+                        "selected_column": "",
+                        "selected_values": [],
+                        "candidate_columns": ["socalc", "socsmk"],
+                        "candidate_values": [],
+                    },
+                ],
             },
         )
-        self.assertIn("proceed|needs_clarification", captured["system_prompt"])
-        self.assertIn("grounded_filters", captured["system_prompt"])
-        self.assertIn("Schema column identifiers you may return", captured["user_prompt"])
-        self.assertIn("Categorical grounding candidates", captured["user_prompt"])
-        self.assertIn("socalc", captured["user_prompt"])
-        self.assertIn("socsmk", captured["user_prompt"])
-        self.assertIn("Latest user request", captured["user_prompt"])
-        self.assertIn("how many females drink", captured["user_prompt"])
+        self.assertIn("proceed|needs_clarification", captured_system_prompts[0])
+        self.assertIn("grounded_filters", captured_system_prompts[0])
+        self.assertIn("Schema column identifiers you may return", captured_user_prompts[0])
+        self.assertIn("Categorical grounding candidates", captured_user_prompts[0])
+        self.assertIn("socalc", captured_user_prompts[0])
+        self.assertIn("socsmk", captured_user_prompts[0])
+        self.assertIn("Latest user request", captured_user_prompts[0])
+        self.assertIn("how many females drink", captured_user_prompts[0])
+        self.assertIn("strict structured schema-grounding planner", captured_system_prompts[1])
 
     def test_schema_grounding_resolver_fails_open_on_invalid_output(self) -> None:
         def completion(**kwargs):
@@ -1228,6 +1248,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 "resolution_type": "proceed",
                 "grounded_filters": {},
                 "candidate_columns": [],
+                "resolution_items": [],
             },
         )
 
@@ -1239,6 +1260,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
                 '{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk"]}',
                 '{"resolution_type":"proceed","selected_column":"socalc"}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink","ambiguity_kind":"value_ambiguity","selected_column":"socalc","selected_values":[],"candidate_columns":[],"candidate_values":[]}]}',
             ]
         )
 
@@ -1298,22 +1320,32 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 ["gender", "socalc", "socsmk"],
             )
 
-        self.assertEqual(
-            resolution,
-            {
-                "resolution_type": "proceed",
-                "grounded_filters": {"gender": ["Female"]},
-                "candidate_columns": [],
-                "resolved_columns": ["socalc"],
-            },
+        self.assertEqual(resolution["resolution_type"], "proceed")
+        self.assertEqual(resolution["grounded_filters"], {"gender": ["Female"]})
+        self.assertEqual(resolution["candidate_columns"], [])
+        self.assertEqual(resolution["resolved_columns"], ["socalc"])
+        self.assertTrue(
+            any(
+                item.get("ambiguity_kind") == "grounded_filter"
+                and item.get("selected_column") == "gender"
+                and item.get("selected_values") == ["Female"]
+                for item in resolution.get("resolution_items") or []
+            )
         )
-        self.assertEqual(len(captured_system_prompts), 3)
+        self.assertTrue(
+            all(
+                item.get("ambiguity_kind") != "field_ambiguity"
+                for item in resolution.get("resolution_items") or []
+            )
+        )
+        self.assertEqual(len(captured_system_prompts), 4)
         self.assertIn("Do not return proceed merely because one part of the request was grounded", captured_system_prompts[0])
         self.assertIn("strict unresolved-request reviewer", captured_system_prompts[1])
         self.assertIn("Already grounded filters:", captured_user_prompts[1])
         self.assertIn("- gender = Female", captured_user_prompts[1])
         self.assertIn("strict final field-resolution judge", captured_system_prompts[2])
         self.assertIn("Candidate columns to judge:", captured_user_prompts[2])
+        self.assertIn("strict structured schema-grounding planner", captured_system_prompts[3])
 
     def test_schema_grounding_resolver_reduces_overbroad_review_candidates(self) -> None:
         captured_system_prompts: list[str] = []
@@ -1323,6 +1355,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 '{"resolution_type":"needs_clarification","candidate_columns":["socsmk","socalc","sococc"]}',
                 '{"candidate_columns":["socalc","socsmk"]}',
                 '{"resolution_type":"needs_clarification","selected_column":""}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink","ambiguity_kind":"field_ambiguity","selected_column":"","selected_values":[],"candidate_columns":["socalc","socsmk"],"candidate_values":[]}]}',
             ]
         )
 
@@ -1361,11 +1394,30 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 "resolution_type": "needs_clarification",
                 "grounded_filters": {"gender": ["Female"]},
                 "candidate_columns": ["socalc", "socsmk"],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "women",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "gender",
+                        "selected_values": ["Female"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                    {
+                        "matched_phrase": "drink",
+                        "ambiguity_kind": "field_ambiguity",
+                        "selected_column": "",
+                        "selected_values": [],
+                        "candidate_columns": ["socalc", "socsmk"],
+                        "candidate_values": [],
+                    },
+                ],
             },
         )
-        self.assertEqual(len(captured_system_prompts), 4)
+        self.assertEqual(len(captured_system_prompts), 5)
         self.assertIn("strict clarification-set reducer", captured_system_prompts[2])
         self.assertIn("strict final field-resolution judge", captured_system_prompts[3])
+        self.assertIn("strict structured schema-grounding planner", captured_system_prompts[4])
 
     def test_schema_grounding_resolver_reviews_multi_value_filter_for_drink_excluding_unknown(self) -> None:
         captured_system_prompts: list[str] = []
@@ -1374,6 +1426,7 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]},{"column":"socalc","selected_values":["Never","Occasionally","Regularly"]}],"candidate_columns":[]}',
                 '{"selected_values":["Never","Occasionally","Regularly"]}',
                 '{"resolution_type":"proceed","candidate_columns":[]}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink","ambiguity_kind":"value_ambiguity","selected_column":"socalc","selected_values":[],"candidate_columns":[],"candidate_values":[]}]}',
             ]
         )
 
@@ -1448,17 +1501,29 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 ["gender", "socalc", "socsmk"],
             )
 
-        self.assertEqual(
-            resolution,
-            {
-                "resolution_type": "proceed",
-                "grounded_filters": {"gender": ["Female"]},
-                "candidate_columns": [],
-                "resolved_columns": ["socalc"],
-            },
+        self.assertEqual(resolution["resolution_type"], "proceed")
+        self.assertEqual(resolution["grounded_filters"], {"gender": ["Female"]})
+        self.assertEqual(resolution["candidate_columns"], [])
+        self.assertEqual(resolution["resolved_columns"], ["socalc"])
+        self.assertTrue(
+            any(
+                item.get("ambiguity_kind") == "grounded_filter"
+                and item.get("selected_column") == "gender"
+                and item.get("selected_values") == ["Female"]
+                for item in resolution.get("resolution_items") or []
+            )
         )
-        self.assertEqual(len(captured_system_prompts), 2)
+        self.assertTrue(
+            any(
+                item.get("ambiguity_kind") == "value_ambiguity"
+                and item.get("selected_column") == "socalc"
+                and item.get("candidate_values") == ["Never", "Occasionally", "Regularly", "Unknown"]
+                for item in resolution.get("resolution_items") or []
+            )
+        )
+        self.assertEqual(len(captured_system_prompts), 3)
         self.assertIn("strict categorical-value grounding reviewer", captured_system_prompts[1])
+        self.assertIn("strict structured schema-grounding planner", captured_system_prompts[2])
 
     def test_collect_grounding_match_evidence_prefers_value_match_over_generic_label_tokens(self) -> None:
         matched_phrase, confidence, evidence_sources = _collect_grounding_match_evidence(
@@ -3290,7 +3355,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("Do you mean alcohol consumption (socalc) or smoking status (socsmk)?", response_text)
         self.assertIn(
-            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            "You can reply with one field, multiple fields, no fields, or describe the field you mean in your own words.",
             response_text,
         )
         self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
@@ -3362,7 +3427,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         response_text = result.content.parts[0].text
         self.assertIn("When you refer to 'cancer types'", response_text)
         self.assertIn(
-            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            "You can reply with one field, multiple fields, no fields, or describe the field you mean in your own words.",
             response_text,
         )
         self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
@@ -4842,7 +4907,7 @@ Which category or combination should I use for \"alcoholic\"?
         response_text = result.content.parts[0].text
         self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
         self.assertIn(
-            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            "You can reply with one field, multiple fields, no fields, or describe the field you mean in your own words.",
             response_text,
         )
         self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
@@ -4884,6 +4949,256 @@ Which category or combination should I use for \"alcoholic\"?
             {"gender": ["Female"]},
         )
 
+    def test_combined_before_model_callback_preserves_authoritative_schema_labels_in_structured_grounding(self) -> None:
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            return True, None
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            return {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": ["socalc", "socsmk"],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "women",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "gender",
+                        "selected_values": ["Female"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                    {
+                        "matched_phrase": "drink",
+                        "ambiguity_kind": "field_ambiguity",
+                        "selected_column": "",
+                        "selected_values": [],
+                        "candidate_columns": ["socalc", "socsmk"],
+                        "candidate_values": [],
+                    },
+                ],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT, socsmk TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Gender",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption?",
+                                "categorical_values": ["Never", "Social Drinking", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status?",
+                                "categorical_values": ["No", "Yes"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        llm_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="how many women drink")])]
+        )
+
+        result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=llm_request,
+        )
+
+        self.assertIsNotNone(result)
+        response_text = result.content.parts[0].text
+        self.assertIn("1. Alcohol consumption?", response_text)
+        self.assertIn("2. Smoking status?", response_text)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(
+            pending_clarification["options"],
+            [
+                "Alcohol consumption?",
+                "Smoking status?",
+                "None of these / another field",
+            ],
+        )
+        self.assertEqual(
+            pending_clarification["option_columns"],
+            {
+                "Alcohol consumption?": "socalc",
+                "Smoking status?": "socsmk",
+            },
+        )
+
+    def test_combined_before_model_callback_sequences_structured_grounding_items(self) -> None:
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            return True, None
+
+        def fake_schema_grounding_resolver(
+            user_text: str,
+            schema_context: str,
+            grounding_candidates: list[dict[str, object]],
+            candidate_columns: list[str],
+        ) -> dict[str, object]:
+            return {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": ["socalc", "socsmk"],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "women",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "gender",
+                        "selected_values": ["Female"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                    {
+                        "matched_phrase": "drink",
+                        "ambiguity_kind": "value_ambiguity",
+                        "selected_column": "socalc",
+                        "selected_values": [],
+                        "candidate_columns": [],
+                        "candidate_values": ["Never", "Social Drinking", "Unknown"],
+                    },
+                    {
+                        "matched_phrase": "smoke all day",
+                        "ambiguity_kind": "value_ambiguity",
+                        "selected_column": "socsmk",
+                        "selected_values": [],
+                        "candidate_columns": [],
+                        "candidate_values": ["No", "Yes"],
+                    },
+                ],
+            }
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT, socsmk TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Gender",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol consumption?",
+                                "categorical_values": ["Never", "Social Drinking", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoking status?",
+                                "categorical_values": ["No", "Yes"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_schema_grounding_resolver",
+            return_value=fake_schema_grounding_resolver,
+        ):
+            callback = build_combined_before_model_callback(self._settings())
+
+        state: dict[str, object] = {}
+        initial_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="how many women drink and smoke all day")])]
+        )
+        first_result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=initial_request,
+        )
+
+        self.assertIsNotNone(first_result)
+        first_text = first_result.content.parts[0].text
+        self.assertIn("Already matched from your request:", first_text)
+        self.assertIn("- gender = Female", first_text)
+        self.assertIn("Which values from Alcohol consumption? should I include?", first_text)
+
+        second_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="Social Drinking")])]
+        )
+        second_result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=second_request,
+        )
+
+        self.assertIsNotNone(second_result)
+        second_text = second_result.content.parts[0].text
+        self.assertIn("Which values from Smoking status? should I include?", second_text)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(pending_clarification["options"], ["No", "Yes"])
+
+        third_request = SimpleNamespace(
+            contents=[types.Content(role="user", parts=[types.Part(text="Yes")])]
+        )
+        third_result = callback(
+            callback_context=SimpleNamespace(state=state),
+            llm_request=third_request,
+        )
+
+        self.assertIsNone(third_result)
+        rewritten_text = third_request.contents[-1].parts[0].text
+        self.assertIn("Current dataset question: how many women drink and smoke all day", rewritten_text)
+        self.assertIn("- gender = Female", rewritten_text)
+        self.assertIn("- socalc = Social Drinking", rewritten_text)
+        self.assertIn("- socsmk = Yes", rewritten_text)
+        self.assertIsNone(get_sql_pending_clarification(state))
+
     def test_combined_before_model_callback_resolves_partially_grounded_drink_request_without_clarification(self) -> None:
         scope_gate_calls: list[str] = []
         litellm_responses = iter(
@@ -4892,6 +5207,7 @@ Which category or combination should I use for \"alcoholic\"?
                 '{"resolution_type":"needs_clarification","candidate_columns":["age","race","socsmk","socalc"]}',
                 '{"candidate_columns":["socalc","socsmk"]}',
                 '{"resolution_type":"proceed","selected_column":"socalc"}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink","ambiguity_kind":"value_ambiguity","selected_column":"socalc","selected_values":[],"candidate_columns":[],"candidate_values":[]}]}',
             ]
         )
 
@@ -4981,14 +5297,18 @@ Which category or combination should I use for \"alcoholic\"?
                 llm_request=llm_request,
             )
 
-            self.assertIsNone(result)
+            self.assertIsNotNone(result)
             self.assertEqual(scope_gate_calls, [])
-            rewritten_text = llm_request.contents[-1].parts[0].text
-            self.assertIn("Current dataset question: how many women drink", rewritten_text)
-            self.assertIn("- gender = Female", rewritten_text)
-            self.assertIn("Resolved schema field already implied by the same question:", rewritten_text)
-            self.assertIn("- Alcohol consumption status (socalc)", rewritten_text)
-            self.assertIsNone(get_sql_pending_clarification(state))
+            response_text = result.content.parts[0].text
+            self.assertIn("Which values from Alcohol consumption status should I include?", response_text)
+            self.assertIn("Already matched from your request:", response_text)
+            self.assertIn("- gender = Female", response_text)
+            pending_clarification = get_sql_pending_clarification(state)
+            self.assertIsNotNone(pending_clarification)
+            self.assertEqual(
+                pending_clarification["options"],
+                ["Never", "Occasionally", "Regularly", "Unknown"],
+            )
 
     def test_combined_before_model_callback_prunes_never_from_drink_exclude_unknown(self) -> None:
         scope_gate_calls: list[str] = []
@@ -4997,6 +5317,7 @@ Which category or combination should I use for \"alcoholic\"?
                 '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]},{"column":"socalc","selected_values":["Never","Occasionally","Regularly"]}],"candidate_columns":[]}',
                 '{"selected_values":["Never","Occasionally","Regularly"]}',
                 '{"resolution_type":"proceed","candidate_columns":[]}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink","ambiguity_kind":"value_ambiguity","selected_column":"socalc","selected_values":[],"candidate_columns":[],"candidate_values":[]}]}',
             ]
         )
 
@@ -5068,16 +5389,18 @@ Which category or combination should I use for \"alcoholic\"?
                 llm_request=llm_request,
             )
 
-            self.assertIsNone(result)
+            self.assertIsNotNone(result)
             self.assertEqual(scope_gate_calls, [])
-            rewritten_text = llm_request.contents[-1].parts[0].text
-            self.assertIn("Current dataset question: how many women drink, exclude unk", rewritten_text)
-            self.assertIn("- gender = Female", rewritten_text)
-            self.assertNotIn("- socalc = Never, Occasionally, Regularly", rewritten_text)
-            self.assertNotIn("- socalc = Occasionally, Regularly", rewritten_text)
-            self.assertIn("Resolved schema field already implied by the same question:", rewritten_text)
-            self.assertIn("- Alcohol consumption status (socalc)", rewritten_text)
-            self.assertIsNone(get_sql_pending_clarification(state))
+            response_text = result.content.parts[0].text
+            self.assertIn("Which values from Alcohol consumption status should I include?", response_text)
+            self.assertIn("Already matched from your request:", response_text)
+            self.assertIn("- gender = Female", response_text)
+            pending_clarification = get_sql_pending_clarification(state)
+            self.assertIsNotNone(pending_clarification)
+            self.assertEqual(
+                pending_clarification["options"],
+                ["Never", "Occasionally", "Regularly", "Unknown"],
+            )
 
     def test_combined_before_model_callback_uses_request_glossary_and_excludes_grounded_gender(self) -> None:
         scope_gate_calls: list[str] = []

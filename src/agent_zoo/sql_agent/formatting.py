@@ -157,6 +157,21 @@ def _clean_option_text(value: str, *, clarification_kind: str | None = None) -> 
     return candidate
 
 
+def _clean_authoritative_option_text(value: str) -> str | None:
+    candidate = re.sub(r"^\s*(?:[-*•]|\d+\s*[.)-])\s*", "", value).strip()
+    candidate = candidate.strip("`\"'")
+    candidate = _normalize_whitespace(candidate)
+    if not candidate:
+        return None
+    if candidate.casefold() in _CLARIFICATION_METADATA_KEYS:
+        return None
+    if any(char in candidate for char in "{}[]"):
+        return None
+    if len(candidate) > 160:
+        return None
+    return candidate
+
+
 def _looks_like_interpretation_clarification(
     user_message: str | None,
     options: list[str] | None = None,
@@ -306,12 +321,18 @@ def build_clarification_response(
     options: list[str] | None = None,
     *,
     clarification_kind: str | None = None,
+    preserve_option_text: bool = False,
 ) -> dict[str, Any]:
     normalized_kind = _normalize_clarification_kind(clarification_kind)
+    option_cleaner = (
+        _clean_authoritative_option_text
+        if preserve_option_text
+        else lambda value: _clean_option_text(value, clarification_kind=normalized_kind)
+    )
     cleaned_options = [
         option
         for option in (
-            _clean_option_text(value, clarification_kind=normalized_kind)
+            option_cleaner(value)
             for value in (options or [])
         )
         if option is not None
