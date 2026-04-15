@@ -28,6 +28,11 @@ CLARIFICATION_KIND_INTERPRETATION = "interpretation"
 
 _CLARIFICATION_REPLY_GUIDANCE = "Choose one or more options, or describe your own rule."
 _CLARIFICATION_NUMBER_REPLY_GUIDANCE = "You can reply with option numbers like 2 or 2 and 3."
+_INTERPRETATION_REPLY_GUIDANCE = (
+    "You can reply with one field, multiple fields, no fields, "
+    "or describe the field you mean in your own words."
+)
+_GROUNDED_FILTERS_HEADING = "Already matched from your request:"
 _FALLBACK_CLARIFICATION_MESSAGE = (
     "I need clarification before I can run the query. "
     "Please specify the exact category, value, or rule you want me to use."
@@ -158,13 +163,15 @@ def _looks_like_interpretation_clarification(
     raw_text: str | None = None,
 ) -> bool:
     normalized_message = _normalize_whitespace(user_message or "")
-    if normalized_message and re.search(r"\bdo\s+you\s+mean\b", normalized_message, flags=re.IGNORECASE):
-        return True
     if normalized_message and re.search(
         r"\bwhich\s+(?:column|field|interpretation|meaning|concept|measure|dimension)\b",
         normalized_message,
         flags=re.IGNORECASE,
     ):
+        return True
+    if normalized_message and re.search(r"\bgroup(?:\s+the\s+results)?\s+by\b", normalized_message, flags=re.IGNORECASE):
+        return True
+    if normalized_message and "broader" in normalized_message.casefold() and "specific" in normalized_message.casefold():
         return True
 
     raw_candidates = [
@@ -175,11 +182,49 @@ def _looks_like_interpretation_clarification(
     if any(re.search(r"\([A-Za-z_][A-Za-z0-9_]*\)", value) for value in raw_candidates):
         return True
 
+    looks_like_value_prompt = bool(
+        normalized_message
+        and re.search(
+            r"\bwhich\s+(?:category|value|option)\s+do\s+you\s+mean\b",
+            normalized_message,
+            flags=re.IGNORECASE,
+        )
+    )
+    if _options_share_interpretation_stem(raw_candidates) and normalized_message and re.search(
+        r"\b(?:do\s+you\s+mean|which\s+one\s+do\s+you\s+mean|are\s+you\s+asking)\b",
+        normalized_message,
+        flags=re.IGNORECASE,
+    ) and not looks_like_value_prompt:
+        return True
+
     normalized_raw_text = _normalize_whitespace(raw_text or "")
-    if normalized_raw_text and re.search(r"\bdo\s+you\s+mean\b", normalized_raw_text, flags=re.IGNORECASE):
+    if normalized_raw_text and re.search(r"\bgroup(?:\s+the\s+results)?\s+by\b", normalized_raw_text, flags=re.IGNORECASE):
+        return True
+    if normalized_raw_text and "broader" in normalized_raw_text.casefold() and "specific" in normalized_raw_text.casefold():
         return True
 
     return False
+
+
+def _extract_option_stem_tokens(value: str) -> set[str]:
+    normalized_value = _normalize_whitespace(value)
+    if not normalized_value:
+        return set()
+
+    normalized_value = re.sub(r"\([A-Za-z_][A-Za-z0-9_]*\)", " ", normalized_value)
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_]+", normalized_value)
+        if len(token) >= 4
+    }
+
+
+def _options_share_interpretation_stem(options: list[str]) -> bool:
+    token_counts: dict[str, int] = {}
+    for option in options:
+        for token in _extract_option_stem_tokens(option):
+            token_counts[token] = token_counts.get(token, 0) + 1
+    return any(count >= 2 for count in token_counts.values())
 
 
 def _extract_jsonish_options(raw_text: str) -> list[str]:
@@ -545,17 +590,26 @@ def normalize_clarification_response(raw_text: str) -> dict[str, Any] | None:
     )
 
 
-def _augment_clarification_user_message(user_message: str, options: list[Any]) -> str:
+def _augment_clarification_user_message(
+    user_message: str,
+    options: list[Any],
+    *,
+    clarification_kind: str | None = None,
+) -> str:
     normalized_message = _normalize_whitespace(user_message)
     if not normalized_message or not options:
         return normalized_message
 
     additions: list[str] = []
     normalized_casefold = normalized_message.casefold()
-    if _CLARIFICATION_REPLY_GUIDANCE.casefold() not in normalized_casefold:
-        additions.append(_CLARIFICATION_REPLY_GUIDANCE)
-    if _CLARIFICATION_NUMBER_REPLY_GUIDANCE.casefold() not in normalized_casefold:
-        additions.append(_CLARIFICATION_NUMBER_REPLY_GUIDANCE)
+    if clarification_kind == CLARIFICATION_KIND_INTERPRETATION:
+        if _INTERPRETATION_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+            additions.append(_INTERPRETATION_REPLY_GUIDANCE)
+    else:
+        if _CLARIFICATION_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+            additions.append(_CLARIFICATION_REPLY_GUIDANCE)
+        if _CLARIFICATION_NUMBER_REPLY_GUIDANCE.casefold() not in normalized_casefold:
+            additions.append(_CLARIFICATION_NUMBER_REPLY_GUIDANCE)
     if not additions:
         return normalized_message
 
@@ -563,15 +617,44 @@ def _augment_clarification_user_message(user_message: str, options: list[Any]) -
     return f"{normalized_message}{suffix} {' '.join(additions)}"
 
 
+def _build_grounded_filter_lines(clarification: dict[str, Any]) -> list[str]:
+    grounded_filters = clarification.get("grounded_filters")
+    if not isinstance(grounded_filters, dict):
+        return []
+
+    lines: list[str] = []
+    for column_name, selected_values in grounded_filters.items():
+        normalized_column_name = str(column_name or "").strip()
+        normalized_values = [
+            value.strip()
+            for value in selected_values or []
+            if isinstance(value, str) and value.strip()
+        ]
+        if not normalized_column_name or not normalized_values:
+            continue
+        if len(normalized_values) == 1:
+            lines.append(f"{normalized_column_name} = {normalized_values[0]}")
+            continue
+        lines.append(f"{normalized_column_name} in {', '.join(normalized_values)}")
+    return lines
+
+
 def format_clarification_response(clarification: dict[str, Any]) -> str:
     options = clarification.get("options") or []
+    clarification_kind = _normalize_clarification_kind(clarification.get("clarification_kind"))
     user_message = _augment_clarification_user_message(
         str(clarification.get("user_message") or ""),
         options,
+        clarification_kind=clarification_kind,
     )
     parts: list[str] = []
     if user_message:
         parts.append(user_message)
+    grounded_filter_lines = _build_grounded_filter_lines(clarification)
+    if grounded_filter_lines:
+        parts.append(
+            _GROUNDED_FILTERS_HEADING + "\n" + "\n".join(f"- {line}" for line in grounded_filter_lines)
+        )
     if options:
         parts.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
     return "\n\n".join(parts).strip()

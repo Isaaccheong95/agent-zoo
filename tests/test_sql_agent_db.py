@@ -29,6 +29,7 @@ from agent_zoo.sql_agent.callbacks import (
     SQL_PUBLIC_RESULT_STATE_KEY,
     SQL_PUBLIC_RESULT_RENDERED_STATE_KEY,
     SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY,
+    _collect_grounding_match_evidence,
     build_combined_before_model_callback,
     build_finalize_after_query_before_model_callback,
     build_format_final_agent_response_callback,
@@ -1458,6 +1459,19 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(len(captured_system_prompts), 2)
         self.assertIn("strict categorical-value grounding reviewer", captured_system_prompts[1])
+
+    def test_collect_grounding_match_evidence_prefers_value_match_over_generic_label_tokens(self) -> None:
+        matched_phrase, confidence, evidence_sources = _collect_grounding_match_evidence(
+            "number of males for each diagnosed cancer type",
+            [
+                ("request_field_label", "Sex of patient"),
+                ("candidate_value", "Male"),
+            ],
+        )
+
+        self.assertEqual(matched_phrase, "males")
+        self.assertEqual(confidence, 0.95)
+        self.assertEqual(evidence_sources, ["candidate_value"])
 
 
 class SQLiteMissingGroupRewriteTestCase(unittest.TestCase):
@@ -3275,6 +3289,12 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("Do you mean alcohol consumption (socalc) or smoking status (socsmk)?", response_text)
+        self.assertIn(
+            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            response_text,
+        )
+        self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
+        self.assertNotIn("You can reply with option numbers like 2 or 2 and 3.", response_text)
         self.assertIn("1. Alcohol consumption (socalc)", response_text)
         self.assertIn("2. Smoking status (socsmk)", response_text)
         self.assertNotIn("1. Never", response_text)
@@ -3341,6 +3361,12 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         response_text = result.content.parts[0].text
         self.assertIn("When you refer to 'cancer types'", response_text)
+        self.assertIn(
+            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            response_text,
+        )
+        self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
+        self.assertNotIn("You can reply with option numbers like 2 or 2 and 3.", response_text)
         self.assertIn("1. Parent lymphoma category", response_text)
         self.assertIn("2. Lymphoma subtype", response_text)
         self.assertNotIn("1. B-cell lymphoma", response_text)
@@ -4815,8 +4841,17 @@ Which category or combination should I use for \"alcoholic\"?
         )
         response_text = result.content.parts[0].text
         self.assertIn("I found more than one nearby schema field for this request. Which one do you mean?", response_text)
+        self.assertIn(
+            "You can reply with one field, multiple fields such as both or all, or describe the field you mean in your own words.",
+            response_text,
+        )
+        self.assertNotIn("Choose one or more options, or describe your own rule.", response_text)
+        self.assertNotIn("You can reply with option numbers like 2 or 2 and 3.", response_text)
+        self.assertIn("Already matched from your request:", response_text)
+        self.assertIn("- gender = Female", response_text)
         self.assertIn("1. Alcohol consumption", response_text)
         self.assertIn("2. Smoking status", response_text)
+        self.assertIn("3. None of these / another field", response_text)
         self.assertNotIn("socalc (values:", response_text)
         self.assertNotIn("socsmk (values:", response_text)
         pending_clarification = get_sql_pending_clarification(state)
@@ -4828,6 +4863,14 @@ Which category or combination should I use for \"alcoholic\"?
         self.assertEqual(
             pending_clarification["topic_context"],
             "how many females drink",
+        )
+        self.assertEqual(
+            pending_clarification["options"],
+            [
+                "Alcohol consumption",
+                "Smoking status",
+                "None of these / another field",
+            ],
         )
         self.assertEqual(
             pending_clarification["option_columns"],
@@ -5139,12 +5182,23 @@ Which category or combination should I use for \"alcoholic\"?
         response_text = result.content.parts[0].text
         self.assertIn("1. Smoking status", response_text)
         self.assertIn("2. Alcohol consumption status", response_text)
+        self.assertIn("3. None of these / another field", response_text)
+        self.assertIn("Already matched from your request:", response_text)
+        self.assertIn("- gender = Male", response_text)
         self.assertNotIn("1. gender", response_text)
         pending_clarification = get_sql_pending_clarification(state)
         self.assertIsNotNone(pending_clarification)
         self.assertEqual(
             pending_clarification["grounded_filters"],
             {"gender": ["Male"]},
+        )
+        self.assertEqual(
+            pending_clarification["options"],
+            [
+                "Smoking status",
+                "Alcohol consumption status",
+                "None of these / another field",
+            ],
         )
         self.assertEqual(
             pending_clarification["option_columns"],

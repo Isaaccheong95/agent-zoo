@@ -84,8 +84,66 @@ SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "max",
     "maximum",
 )
+SQL_INTERPRETATION_OTHER_FIELD_OPTION = "None of these / another field"
 _GENERIC_ADD_HINT_TOKENS = frozenset({"add", "again", "also", "back", "include", "put", "restore", "too"})
 _GENERIC_REMOVE_HINT_TOKENS = frozenset({"drop", "exclude", "remove", "without"})
+_GROUNDING_STOPWORDS = frozenset({"a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with"})
+_GROUNDING_GENERIC_TOKENS = frozenset(
+    {
+        "available",
+        "category",
+        "categories",
+        "cohort",
+        "column",
+        "columns",
+        "current",
+        "dataset",
+        "date",
+        "dates",
+        "dimension",
+        "field",
+        "fields",
+        "filter",
+        "filters",
+        "group",
+        "groups",
+        "id",
+        "ids",
+        "initial",
+        "item",
+        "items",
+        "latest",
+        "measure",
+        "measures",
+        "number",
+        "numbers",
+        "option",
+        "options",
+        "other",
+        "others",
+        "patient",
+        "patients",
+        "primary",
+        "record",
+        "records",
+        "related",
+        "row",
+        "rows",
+        "schema",
+        "snapshot",
+        "standardized",
+        "status",
+        "table",
+        "tables",
+        "timepoint",
+        "topic",
+        "type",
+        "types",
+        "use",
+        "value",
+        "values",
+    }
+)
 
 
 def _print_clarification_debug(settings: SQLAgentSettings, stage: str, payload: Any) -> None:
@@ -753,21 +811,58 @@ def _singularize_grounding_token(token: str) -> str:
     return normalized_token
 
 
-def _build_grounding_variants(value: str) -> list[str]:
+def _pluralize_grounding_token(token: str) -> str:
+    normalized_token = token.strip()
+    if len(normalized_token) <= 1:
+        return normalized_token
+    if re.search(r"(?:s|x|z|ch|sh)$", normalized_token, flags=re.IGNORECASE):
+        return normalized_token + "es"
+    if normalized_token.endswith("y") and len(normalized_token) > 1 and normalized_token[-2].lower() not in {"a", "e", "i", "o", "u"}:
+        return normalized_token[:-1] + "ies"
+    return normalized_token + "s"
+
+
+def _is_grounding_content_token(token: str) -> bool:
+    normalized_token = token.strip().casefold()
+    if len(normalized_token) <= 2:
+        return False
+    if normalized_token in _GROUNDING_STOPWORDS:
+        return False
+    if normalized_token in _GROUNDING_GENERIC_TOKENS:
+        return False
+    return True
+
+
+def _build_grounding_variants(
+    value: str,
+    *,
+    include_plural_variants: bool = False,
+) -> list[str]:
     normalized_value = _normalize_match_text(value)
     if not normalized_value:
         return []
 
     tokens = [token for token in normalized_value.split() if token]
-    singular_tokens = [_singularize_grounding_token(token) for token in tokens]
     variants = [normalized_value]
-    if tokens:
-        variants.extend(tokens)
+    content_tokens = [token for token in tokens if _is_grounding_content_token(token)]
+    singular_tokens = [_singularize_grounding_token(token) for token in content_tokens]
+    if content_tokens:
+        variants.extend(content_tokens)
+        content_phrase = " ".join(content_tokens)
+        if len(content_tokens) > 1 and content_phrase:
+            variants.append(content_phrase)
     if singular_tokens:
         variants.extend(singular_tokens)
         singular_phrase = " ".join(token for token in singular_tokens if token)
-        if singular_phrase:
+        if len(singular_tokens) > 1 and singular_phrase:
             variants.append(singular_phrase)
+    if include_plural_variants:
+        plural_tokens = [_pluralize_grounding_token(token) for token in singular_tokens or content_tokens]
+        if plural_tokens:
+            variants.extend(plural_tokens)
+            plural_phrase = " ".join(token for token in plural_tokens if token)
+            if len(plural_tokens) > 1 and plural_phrase:
+                variants.append(plural_phrase)
     return _dedupe_preserving_order([variant for variant in variants if variant])
 
 
@@ -782,21 +877,29 @@ def _collect_grounding_match_evidence(
     matched_phrase = ""
     confidence = 0.0
     evidence_sources: list[str] = []
+    best_priority = 0
     for source_name, evidence_text in evidence_texts:
         if not evidence_text:
             continue
-        for variant in _build_grounding_variants(evidence_text):
+        current_confidence = 0.95 if source_name == "candidate_value" else 0.6
+        current_priority = 2 if source_name == "candidate_value" else 1
+        for variant in _build_grounding_variants(
+            evidence_text,
+            include_plural_variants=source_name == "candidate_value",
+        ):
             if not variant:
                 continue
             if re.search(rf"(?<!\w){re.escape(variant)}(?!\w)", normalized_user_text):
-                if not matched_phrase:
+                if (
+                    current_confidence > confidence
+                    or (current_confidence == confidence and current_priority > best_priority)
+                    or not matched_phrase
+                ):
                     matched_phrase = variant
+                    best_priority = current_priority
                 if source_name not in evidence_sources:
                     evidence_sources.append(source_name)
-                if source_name == "candidate_value":
-                    confidence = max(confidence, 0.95)
-                else:
-                    confidence = max(confidence, 0.6)
+                confidence = max(confidence, current_confidence)
                 break
     return matched_phrase, confidence, evidence_sources
 
@@ -1603,19 +1706,7 @@ def _build_schema_grounding_catalog(
                         ("candidate_value", categorical_value),
                     ],
                 )
-                evidence_sources = _dedupe_preserving_order(
-                    [
-                        source_name
-                        for source_name, evidence_text in (
-                            ("column_label", column_label),
-                            ("request_field_label", request_field_label),
-                            ("source_header", source_header),
-                            ("candidate_value", categorical_value),
-                        )
-                        if evidence_text
-                    ]
-                    + lexical_sources
-                )
+                evidence_sources = _dedupe_preserving_order(lexical_sources)
                 grounding_candidates.append(
                     {
                         "column": identifier,
@@ -1624,7 +1715,10 @@ def _build_schema_grounding_catalog(
                         "source_header": source_header,
                         "request_field_label": request_field_label,
                         "candidate_value": categorical_value,
-                        "candidate_value_variants": _build_grounding_variants(categorical_value),
+                        "candidate_value_variants": _build_grounding_variants(
+                            categorical_value,
+                            include_plural_variants=True,
+                        ),
                         "matched_user_phrase": matched_phrase,
                         "confidence": confidence,
                         "evidence_sources": evidence_sources,
@@ -1698,6 +1792,9 @@ def _build_schema_grounding_clarification(
 
     if len(selected_options) < 2:
         return None
+
+    if SQL_INTERPRETATION_OTHER_FIELD_OPTION not in selected_options:
+        selected_options.append(SQL_INTERPRETATION_OTHER_FIELD_OPTION)
 
     clarification = build_clarification_response(
         "I found more than one nearby schema field for this request. Which one do you mean?",
@@ -1988,6 +2085,14 @@ def _apply_pending_clarification_followup_with_resolution(
         rewritten_sections.append(
             "Matched options from the reply: " + ", ".join(resolved_options)
         )
+        clarification_kind = str(clarification.get("clarification_kind") or "").strip().lower()
+        if (
+            clarification_kind == CLARIFICATION_KIND_INTERPRETATION
+            and SQL_INTERPRETATION_OTHER_FIELD_OPTION in resolved_options
+        ):
+            rewritten_sections.append(
+                "The user indicated that none of the listed schema fields fit and may clarify with another field in free text."
+            )
         option_columns = clarification.get("option_columns")
         if isinstance(option_columns, dict):
             resolved_columns: list[str] = []
