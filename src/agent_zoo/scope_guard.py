@@ -216,6 +216,69 @@ def _filter_supported_grounded_values(
     return supported_values
 
 
+def _has_positive_grounding_column_evidence(
+    column_name: str,
+    candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+) -> bool:
+    column_value_evidence = candidate_value_evidence_by_column.get(column_name) or {}
+    if not isinstance(column_value_evidence, dict):
+        return False
+
+    return any(
+        _has_positive_grounding_value_evidence(value_evidence)
+        for value_evidence in column_value_evidence.values()
+        if isinstance(value_evidence, dict)
+    )
+
+
+def _select_evidence_backed_candidate_columns(
+    candidate_columns: list[str],
+    candidate_value_evidence_by_column: dict[str, dict[str, dict[str, Any]]],
+) -> list[str]:
+    selected_columns: list[str] = []
+    seen_columns: set[str] = set()
+    for identifier in candidate_columns:
+        if not isinstance(identifier, str):
+            continue
+        column_name = identifier.strip()
+        if not column_name or column_name in seen_columns:
+            continue
+        if not _has_positive_grounding_column_evidence(
+            column_name,
+            candidate_value_evidence_by_column,
+        ):
+            continue
+        seen_columns.add(column_name)
+        selected_columns.append(column_name)
+    return selected_columns
+
+
+def _filter_schema_context_for_identifiers(
+    schema_context: str,
+    identifiers: list[str],
+) -> str:
+    normalized_schema_context = schema_context.strip()
+    if not normalized_schema_context:
+        return ""
+
+    identifier_set = {
+        identifier.strip()
+        for identifier in identifiers
+        if isinstance(identifier, str) and identifier.strip()
+    }
+    if not identifier_set:
+        return normalized_schema_context
+
+    filtered_lines: list[str] = []
+    for raw_line in normalized_schema_context.splitlines():
+        line = raw_line.rstrip()
+        match = re.match(r"^-\s+([^\s(:=]+)", line)
+        if match and match.group(1) in identifier_set:
+            filtered_lines.append(line)
+
+    return "\n".join(filtered_lines) if filtered_lines else normalized_schema_context
+
+
 def _normalize_grounding_item_kind(value: Any) -> str:
     normalized_kind = str(value or "").strip().lower()
     if normalized_kind in {
@@ -1570,45 +1633,11 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 for identifier in candidate_columns
                 if identifier not in committed_columns
             ]
-            review_candidate_columns = _review_unresolved_request(
-                user_text,
-                schema_context,
-                normalized_grounded_filters,
+            evidence_backed_candidate_columns = _select_evidence_backed_candidate_columns(
                 remaining_candidate_columns,
+                candidate_value_evidence_by_column,
             )
-            if len(review_candidate_columns) >= 3:
-                review_candidate_columns = _reduce_review_candidate_columns(
-                    user_text,
-                    schema_context,
-                    normalized_grounded_filters,
-                    review_candidate_columns,
-                )
-            if len(review_candidate_columns) >= 2:
-                selected_review_column = _select_best_review_candidate(
-                    user_text,
-                    schema_context,
-                    normalized_grounded_filters,
-                    review_candidate_columns,
-                )
-                if selected_review_column:
-                    final_resolved_columns = list(resolved_columns)
-                    if selected_review_column not in final_resolved_columns:
-                        final_resolved_columns.append(selected_review_column)
-                    result = {
-                        "resolution_type": "proceed",
-                        "grounded_filters": normalized_grounded_filters,
-                        "candidate_columns": [],
-                        "resolved_columns": final_resolved_columns,
-                    }
-                else:
-                    result = {
-                        "resolution_type": "needs_clarification",
-                        "grounded_filters": normalized_grounded_filters,
-                        "candidate_columns": review_candidate_columns,
-                    }
-                    if resolved_columns:
-                        result["resolved_columns"] = resolved_columns
-            else:
+            if not evidence_backed_candidate_columns:
                 result = {
                     "resolution_type": "proceed",
                     "grounded_filters": normalized_grounded_filters,
@@ -1616,6 +1645,67 @@ def build_llm_schema_grounding_resolver(model: str, *, debug: bool = False):
                 }
                 if resolved_columns:
                     result["resolved_columns"] = resolved_columns
+            elif len(evidence_backed_candidate_columns) == 1:
+                final_resolved_columns = list(resolved_columns)
+                if evidence_backed_candidate_columns[0] not in final_resolved_columns:
+                    final_resolved_columns.append(evidence_backed_candidate_columns[0])
+                result = {
+                    "resolution_type": "proceed",
+                    "grounded_filters": normalized_grounded_filters,
+                    "candidate_columns": [],
+                    "resolved_columns": final_resolved_columns,
+                }
+            else:
+                review_schema_context = _filter_schema_context_for_identifiers(
+                    schema_context,
+                    evidence_backed_candidate_columns,
+                )
+                review_candidate_columns = _review_unresolved_request(
+                    user_text,
+                    review_schema_context,
+                    normalized_grounded_filters,
+                    evidence_backed_candidate_columns,
+                )
+                if len(review_candidate_columns) >= 3:
+                    review_candidate_columns = _reduce_review_candidate_columns(
+                        user_text,
+                        review_schema_context,
+                        normalized_grounded_filters,
+                        review_candidate_columns,
+                    )
+                if len(review_candidate_columns) >= 2:
+                    selected_review_column = _select_best_review_candidate(
+                        user_text,
+                        review_schema_context,
+                        normalized_grounded_filters,
+                        review_candidate_columns,
+                    )
+                    if selected_review_column:
+                        final_resolved_columns = list(resolved_columns)
+                        if selected_review_column not in final_resolved_columns:
+                            final_resolved_columns.append(selected_review_column)
+                        result = {
+                            "resolution_type": "proceed",
+                            "grounded_filters": normalized_grounded_filters,
+                            "candidate_columns": [],
+                            "resolved_columns": final_resolved_columns,
+                        }
+                    else:
+                        result = {
+                            "resolution_type": "needs_clarification",
+                            "grounded_filters": normalized_grounded_filters,
+                            "candidate_columns": review_candidate_columns,
+                        }
+                        if resolved_columns:
+                            result["resolved_columns"] = resolved_columns
+                else:
+                    result = {
+                        "resolution_type": "proceed",
+                        "grounded_filters": normalized_grounded_filters,
+                        "candidate_columns": [],
+                    }
+                    if resolved_columns:
+                        result["resolved_columns"] = resolved_columns
         else:
             result = {
                 "resolution_type": "proceed",
