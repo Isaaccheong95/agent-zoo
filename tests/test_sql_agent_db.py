@@ -1304,17 +1304,17 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                         "column": "socalc",
                         "candidate_value": "Occasionally",
                         "field_label": "Alcohol consumption status",
-                        "matched_user_phrase": "",
-                        "confidence": 0.0,
-                        "evidence_sources": ["candidate_value"],
+                        "matched_user_phrase": "drink",
+                        "confidence": 0.6,
+                        "evidence_sources": ["source_header"],
                     },
                     {
                         "column": "socsmk",
                         "candidate_value": "Yes",
                         "field_label": "Smoking status",
-                        "matched_user_phrase": "",
-                        "confidence": 0.0,
-                        "evidence_sources": ["candidate_value"],
+                        "matched_user_phrase": "smoke",
+                        "confidence": 0.6,
+                        "evidence_sources": ["source_header"],
                     },
                 ],
                 ["gender", "socalc", "socsmk"],
@@ -1381,9 +1381,9 @@ class SQLiteHelpersTestCase(unittest.TestCase):
                 [
                     {"column": "gender", "candidate_value": "Female", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
                     {"column": "gender", "candidate_value": "Male", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
-                    {"column": "socalc", "candidate_value": "Occasionally", "field_label": "Alcohol consumption status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
-                    {"column": "socsmk", "candidate_value": "Yes", "field_label": "Smoking status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
-                    {"column": "sococc", "candidate_value": "Employed", "field_label": "Occupation status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": ["candidate_value"]},
+                    {"column": "socalc", "candidate_value": "Occasionally", "field_label": "Alcohol consumption status", "matched_user_phrase": "drink", "confidence": 0.6, "evidence_sources": ["source_header"]},
+                    {"column": "socsmk", "candidate_value": "Yes", "field_label": "Smoking status", "matched_user_phrase": "smoke", "confidence": 0.6, "evidence_sources": ["source_header"]},
+                    {"column": "sococc", "candidate_value": "Employed", "field_label": "Occupation status", "matched_user_phrase": "job", "confidence": 0.6, "evidence_sources": ["source_header"]},
                 ],
                 ["gender", "socalc", "socsmk", "sococc"],
             )
@@ -1418,6 +1418,145 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertIn("strict clarification-set reducer", captured_system_prompts[2])
         self.assertIn("strict final field-resolution judge", captured_system_prompts[3])
         self.assertIn("strict structured schema-grounding planner", captured_system_prompts[4])
+
+    def test_schema_grounding_resolver_filters_zero_evidence_columns_from_second_pass_review(self) -> None:
+        captured_user_prompts: list[str] = []
+        responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
+                '{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk","bsymp","bsymp1"]}',
+                '{"resolution_type":"needs_clarification","selected_column":""}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink or smoke","ambiguity_kind":"field_ambiguity","selected_column":"","selected_values":[],"candidate_columns":["socalc","socsmk"],"candidate_values":[]}]}',
+            ]
+        )
+
+        def completion(**kwargs):
+            captured_user_prompts.append(kwargs["messages"][1]["content"])
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(responses))
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many women drink and smoke",
+                "- gender (TEXT): field label = Sex of patient; categorical values = Female, Male\n"
+                "- socalc (TEXT): field label = Alcohol consumption status; categorical values = Never, Occasionally, Regularly, Unknown\n"
+                "- socsmk (TEXT): field label = Smoking status; categorical values = No, Unknown, Yes\n"
+                "- bsymp (TEXT): field label = B symptom status; categorical values = No, Unknown, Yes\n"
+                "- bsymp1 (TEXT): field label = B symptom severity; categorical values = Mild, Moderate, Severe, Unknown",
+                [
+                    {"column": "gender", "candidate_value": "Female", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "gender", "candidate_value": "Male", "field_label": "Sex of patient", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "socalc", "candidate_value": "Occasionally", "field_label": "Alcohol consumption status", "matched_user_phrase": "drink", "confidence": 0.6, "evidence_sources": ["source_header"]},
+                    {"column": "socsmk", "candidate_value": "Yes", "field_label": "Smoking status", "matched_user_phrase": "smoke", "confidence": 0.6, "evidence_sources": ["source_header"]},
+                    {"column": "bsymp", "candidate_value": "Yes", "field_label": "B symptom status", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "bsymp1", "candidate_value": "Moderate", "field_label": "B symptom severity", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                ],
+                ["gender", "socalc", "socsmk", "bsymp", "bsymp1"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "needs_clarification",
+                "grounded_filters": {"gender": ["Female"]},
+                "candidate_columns": ["socalc", "socsmk"],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "women",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "gender",
+                        "selected_values": ["Female"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                    {
+                        "matched_phrase": "drink or smoke",
+                        "ambiguity_kind": "field_ambiguity",
+                        "selected_column": "",
+                        "selected_values": [],
+                        "candidate_columns": ["socalc", "socsmk"],
+                        "candidate_values": [],
+                    },
+                ],
+            },
+        )
+        self.assertEqual(len(captured_user_prompts), 4)
+        self.assertIn("Remaining schema column identifiers you may return:", captured_user_prompts[1])
+        self.assertIn("- socalc", captured_user_prompts[1])
+        self.assertIn("- socsmk", captured_user_prompts[1])
+        self.assertNotIn("- bsymp", captured_user_prompts[1])
+        self.assertNotIn("- bsymp1", captured_user_prompts[1])
+        self.assertIn("- socalc (TEXT)", captured_user_prompts[1])
+        self.assertIn("- socsmk (TEXT)", captured_user_prompts[1])
+        self.assertNotIn("- bsymp (TEXT)", captured_user_prompts[1])
+        self.assertNotIn("- bsymp1 (TEXT)", captured_user_prompts[1])
+
+    def test_schema_grounding_resolver_proceeds_when_no_evidence_backed_columns_remain(self) -> None:
+        captured_user_prompts: list[str] = []
+        responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"socalc","selected_values":["Binge Drinking"]}],"candidate_columns":[]}',
+                '{"items":[{"matched_phrase":"drink alot","ambiguity_kind":"grounded_filter","selected_column":"socalc","selected_values":["Binge Drinking"],"candidate_columns":[],"candidate_values":[]}]}',
+            ]
+        )
+
+        def completion(**kwargs):
+            captured_user_prompts.append(kwargs["messages"][1]["content"])
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(responses))
+                    )
+                ]
+            )
+
+        resolver = build_llm_schema_grounding_resolver("test-model")
+
+        with patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            resolution = resolver(
+                "how many drink alot",
+                "- socalc (TEXT): field label = Alcohol intake; categorical values = Binge Drinking, Ex-Binge Drinker, Ex-Social Drinker, Never, Social Drinking, Unknown\n"
+                "- bsymp (TEXT): field label = B symptoms; categorical values = No, No response, Yes\n"
+                "- bsymp1 (TEXT): field label = bsymp1; categorical values = No, No response, Yes\n"
+                "- bsymp2 (TEXT): field label = bsymp2; categorical values = No, No response, Yes\n"
+                "- bsymp3 (TEXT): field label = bsymp3; categorical values = No, No response, Yes",
+                [
+                    {"column": "socalc", "candidate_value": "Binge Drinking", "field_label": "Alcohol intake", "matched_user_phrase": "drink alot", "confidence": 0.95, "evidence_sources": ["candidate_value"]},
+                    {"column": "socalc", "candidate_value": "Social Drinking", "field_label": "Alcohol intake", "matched_user_phrase": "drink", "confidence": 0.6, "evidence_sources": ["source_header"]},
+                    {"column": "bsymp", "candidate_value": "Yes", "field_label": "B symptoms", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "bsymp1", "candidate_value": "Yes", "field_label": "bsymp1", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "bsymp2", "candidate_value": "Yes", "field_label": "bsymp2", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                    {"column": "bsymp3", "candidate_value": "Yes", "field_label": "bsymp3", "matched_user_phrase": "", "confidence": 0.0, "evidence_sources": []},
+                ],
+                ["socalc", "bsymp", "bsymp1", "bsymp2", "bsymp3"],
+            )
+
+        self.assertEqual(
+            resolution,
+            {
+                "resolution_type": "proceed",
+                "grounded_filters": {"socalc": ["Binge Drinking"]},
+                "candidate_columns": [],
+                "resolution_items": [
+                    {
+                        "matched_phrase": "drink alot",
+                        "ambiguity_kind": "grounded_filter",
+                        "selected_column": "socalc",
+                        "selected_values": ["Binge Drinking"],
+                        "candidate_columns": [],
+                        "candidate_values": [],
+                    },
+                ],
+            },
+        )
+        self.assertEqual(len(captured_user_prompts), 2)
 
     def test_schema_grounding_resolver_reviews_multi_value_filter_for_drink_excluding_unknown(self) -> None:
         captured_system_prompts: list[str] = []
@@ -5258,7 +5397,7 @@ Which category or combination should I use for \"alcoholic\"?
                             {
                                 "name": "socalc",
                                 "type": "TEXT",
-                                "source_header": "Alcohol consumption status",
+                                "source_header": "Drink frequency",
                                 "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
                             },
                             {
@@ -5304,7 +5443,7 @@ Which category or combination should I use for \"alcoholic\"?
             self.assertIsNotNone(result)
             self.assertEqual(scope_gate_calls, [])
             response_text = result.content.parts[0].text
-            self.assertIn("Which values from Alcohol consumption status should I include?", response_text)
+            self.assertIn("Which values from Drink frequency should I include?", response_text)
             self.assertIn("Already matched from your request:", response_text)
             self.assertIn("- gender = Female", response_text)
             self.assertLess(
@@ -5317,6 +5456,207 @@ Which category or combination should I use for \"alcoholic\"?
                 pending_clarification["options"],
                 ["Never", "Occasionally", "Regularly", "Unknown"],
             )
+
+    def test_combined_before_model_callback_omits_zero_evidence_fields_from_schema_grounding_clarification(self) -> None:
+        scope_gate_calls: list[str] = []
+        litellm_responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"gender","selected_values":["Female"]}],"candidate_columns":[]}',
+                '{"resolution_type":"needs_clarification","candidate_columns":["socalc","socsmk","bsymp","bsymp1"]}',
+                '{"resolution_type":"needs_clarification","selected_column":""}',
+                '{"items":[{"matched_phrase":"women","ambiguity_kind":"grounded_filter","selected_column":"gender","selected_values":["Female"],"candidate_columns":[],"candidate_values":[]},{"matched_phrase":"drink or smoke","ambiguity_kind":"field_ambiguity","selected_column":"","selected_values":[],"candidate_columns":["socalc","socsmk"],"candidate_values":[]}]}',
+            ]
+        )
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(litellm_responses))
+                    )
+                ]
+            )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(gender TEXT, socalc TEXT, socsmk TEXT, bsymp TEXT, bsymp1 TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "gender",
+                                "type": "TEXT",
+                                "source_header": "Sex of patient",
+                                "categorical_values": ["Female", "Male"],
+                            },
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Drink frequency",
+                                "categorical_values": ["Never", "Occasionally", "Regularly", "Unknown"],
+                            },
+                            {
+                                "name": "socsmk",
+                                "type": "TEXT",
+                                "source_header": "Smoke frequency",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "bsymp",
+                                "type": "TEXT",
+                                "source_header": "B symptom status",
+                                "categorical_values": ["No", "Unknown", "Yes"],
+                            },
+                            {
+                                "name": "bsymp1",
+                                "type": "TEXT",
+                                "source_header": "B symptom severity",
+                                "categorical_values": ["Mild", "Moderate", "Severe", "Unknown"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            callback = build_combined_before_model_callback(self._settings())
+
+            state: dict[str, object] = {}
+            llm_request = SimpleNamespace(
+                contents=[types.Content(role="user", parts=[types.Part(text="how many women drink and smoke")])]
+            )
+
+            result = callback(
+                callback_context=SimpleNamespace(state=state),
+                llm_request=llm_request,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        response_text = result.content.parts[0].text
+        self.assertIn("1. Drink frequency", response_text)
+        self.assertIn("2. Smoke frequency", response_text)
+        self.assertNotIn("B symptom status", response_text)
+        self.assertNotIn("B symptom severity", response_text)
+        pending_clarification = get_sql_pending_clarification(state)
+        self.assertIsNotNone(pending_clarification)
+        self.assertEqual(
+            pending_clarification["options"],
+            ["Drink frequency", "Smoke frequency", "None of these / another field"],
+        )
+
+    def test_combined_before_model_callback_proceeds_with_grounded_drink_filter_when_no_other_field_has_evidence(self) -> None:
+        scope_gate_calls: list[str] = []
+        litellm_responses = iter(
+            [
+                '{"resolution_type":"proceed","grounded_filters":[{"column":"socalc","selected_values":["Binge Drinking"]}],"candidate_columns":[]}',
+                '{"items":[{"matched_phrase":"drink alot","ambiguity_kind":"grounded_filter","selected_column":"socalc","selected_values":["Binge Drinking"],"candidate_columns":[],"candidate_values":[]}]}',
+            ]
+        )
+
+        def fake_scope_gate(user_text: str) -> tuple[bool, str | None]:
+            scope_gate_calls.append(user_text)
+            return True, None
+
+        def completion(**kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=next(litellm_responses))
+                    )
+                ]
+            )
+
+        with patch(
+            "agent_zoo.sql_agent.callbacks.get_schema_summary",
+            return_value={
+                "status": "success",
+                "schema_text": "filtered_dataset(socalc TEXT, bsymp TEXT, bsymp1 TEXT, bsymp2 TEXT, bsymp3 TEXT)",
+                "tables": [
+                    {
+                        "name": "filtered_dataset",
+                        "columns": [
+                            {
+                                "name": "socalc",
+                                "type": "TEXT",
+                                "source_header": "Alcohol intake",
+                                "categorical_values": ["Binge Drinking", "Ex-Binge Drinker", "Ex-Social Drinker", "Never", "Social Drinking", "Unknown"],
+                            },
+                            {
+                                "name": "bsymp",
+                                "type": "TEXT",
+                                "source_header": "B symptoms",
+                                "categorical_values": ["No", "No response", "Yes"],
+                            },
+                            {
+                                "name": "bsymp1",
+                                "type": "TEXT",
+                                "source_header": "bsymp1",
+                                "categorical_values": ["No", "No response", "Yes"],
+                            },
+                            {
+                                "name": "bsymp2",
+                                "type": "TEXT",
+                                "source_header": "bsymp2",
+                                "categorical_values": ["No", "No response", "Yes"],
+                            },
+                            {
+                                "name": "bsymp3",
+                                "type": "TEXT",
+                                "source_header": "bsymp3",
+                                "categorical_values": ["No", "No response", "Yes"],
+                            },
+                        ],
+                    }
+                ],
+                "categorical_value_guidance": [],
+                "categorical_value_guidance_text": "",
+            },
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_scope_gate",
+            return_value=fake_scope_gate,
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_clarification_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "custom_rule", "selected_options": [], "custom_rule": ""},
+        ), patch(
+            "agent_zoo.sql_agent.callbacks.build_llm_result_refinement_resolver",
+            return_value=lambda *args, **kwargs: {"resolution_type": "topic_change", "target_column": "", "selected_values": [], "refinement_request": ""},
+        ), patch.dict(sys.modules, {"litellm": SimpleNamespace(completion=completion)}):
+            callback = build_combined_before_model_callback(self._settings())
+
+            state: dict[str, object] = {}
+            llm_request = SimpleNamespace(
+                contents=[types.Content(role="user", parts=[types.Part(text="how many drink alot")])]
+            )
+
+            result = callback(
+                callback_context=SimpleNamespace(state=state),
+                llm_request=llm_request,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(scope_gate_calls, [])
+        rewritten_text = llm_request.contents[-1].parts[0].text
+        self.assertIn("Current dataset question: how many drink alot", rewritten_text)
+        self.assertIn("- socalc = Binge Drinking", rewritten_text)
+        self.assertIsNone(get_sql_pending_clarification(state))
 
     def test_combined_before_model_callback_prunes_never_from_drink_exclude_unknown(self) -> None:
         scope_gate_calls: list[str] = []
