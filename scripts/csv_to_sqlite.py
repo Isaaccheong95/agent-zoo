@@ -18,6 +18,9 @@ The conversion flow is:
 The type inference is intentionally conservative. Columns are inferred as
 `INTEGER`, `REAL`, or `TEXT`; values such as dates and booleans are not given
 special handling.
+
+Command to run the script:
+uv run scripts/csv_to_sqlite.py --input <INPUT_CSV_PATH> --output <OUTPUT_SQLITE_PATH> --table <TABLE_NAME>
 """
 
 import argparse
