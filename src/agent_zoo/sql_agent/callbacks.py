@@ -1413,16 +1413,17 @@ def _build_last_query_frame(
         raw_sql = tool_response.get("sql")
     if not isinstance(raw_sql, str) or not raw_sql.strip():
         return None
+    normalized_sql = _normalize_public_display_sql(raw_sql) or raw_sql.strip()
 
     query_frame = {
         "question": active_query_topic.strip(),
-        "sql": raw_sql.strip(),
+        "sql": normalized_sql,
     }
-    categorical_filters = _extract_categorical_filters_from_sql(raw_sql, categorical_value_guidance)
+    categorical_filters = _extract_categorical_filters_from_sql(normalized_sql, categorical_value_guidance)
     if categorical_filters and db_path:
         _annotate_categorical_filter_missing_counts(
             db_path,
-            raw_sql,
+            normalized_sql,
             categorical_filters,
             minimum_aggregate_count=minimum_aggregate_count,
             redact_small_counts=redact_small_counts,
@@ -1433,7 +1434,7 @@ def _build_last_query_frame(
     if categorical_filters:
         query_frame["categorical_filters"] = categorical_filters
     comparison_filters = _extract_comparison_filters_from_sql(
-        raw_sql,
+        normalized_sql,
         excluded_columns={
             str(entry.get("column") or "").strip()
             for entry in categorical_filters
@@ -1447,7 +1448,7 @@ def _build_last_query_frame(
         for column in (tool_response.get("group_columns") or [])
         if isinstance(column, str) and str(column).strip()
     ]
-    if not group_columns and _sql_has_top_level_group_by(raw_sql):
+    if not group_columns and _sql_has_top_level_group_by(normalized_sql):
         group_columns = [
             column
             for column in (tool_response.get("columns") or [])

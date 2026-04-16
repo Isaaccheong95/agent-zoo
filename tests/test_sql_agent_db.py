@@ -1947,6 +1947,33 @@ class SQLAgentFilterCoverageTestCase(unittest.TestCase):
             },
         )
 
+    def test_remember_query_result_normalizes_semicolon_sql_before_missing_blank_count(self) -> None:
+        sql = "SELECT COUNT(*) AS matching_count FROM patients WHERE sex IN ('female', 'male');"
+        tool_response = execute_sqlite_query(self.db_path, sql)
+        callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=1))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={SQL_LAST_USER_TEXT_STATE_KEY: "How many patients have a recorded sex value?"})
+
+        callback(tool, {"sql": sql, "is_final": True}, tool_context, tool_response)
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        query_summary_context = public_result["query_summary_context"]
+        self.assertEqual(
+            query_summary_context["sql"],
+            "SELECT COUNT(*) AS matching_count FROM patients WHERE sex IN ('female', 'male')",
+        )
+        self.assertEqual(
+            query_summary_context["categorical_filters"],
+            [
+                {
+                    "column": "sex",
+                    "selected_values": ["female", "male"],
+                    "available_values": ["female", "male"],
+                    "missing_or_blank_rows_excluded": 3,
+                }
+            ],
+        )
+
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):
     def _settings(self, **overrides) -> SQLAgentSettings:
