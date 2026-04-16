@@ -221,7 +221,7 @@ Successful completion:
 
 - The model reaches a final `execute_sqlite_read_only(..., is_final=True)` call.
 - `after_tool_callback` stores `temp:sql_public_result`.
-- The finalize path renders `Generated SQL`, `What I matched`, and `Result`.
+- The finalize path renders `Generated SQL`, `Cohort filter summary`, and `Result`.
 
 Paused completion waiting for user input:
 
@@ -369,7 +369,7 @@ The saved frame can include these fields:
 | --- | --- |
 | `question` | Current committed dataset question/topic |
 | `sql` | User-visible SQL, preferring `display_sql` when present |
-| `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values` and `available_values` |
+| `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values`, `available_values`, and optional missing or blank exclusion metadata for final cohort filter summary rendering |
 | `comparison_filters` | Extracted comparison filters such as `age > 46` |
 | `is_grouped` | Boolean flag showing that the saved query was a grouped query |
 | `group_columns` | Grouping columns inferred from the committed grouped query |
@@ -932,7 +932,7 @@ Actual transition conditions:
 Final answer format:
 
 1. `Generated SQL`
-2. `What I matched`
+2. `Cohort filter summary`
 3. `Result`
 4. optional privacy note
 
@@ -1114,7 +1114,7 @@ Typical tools and resolvers:
 
 Response pattern:
 
-- final structured SQL answer with `Generated SQL`, `What I matched`, and `Result`
+- final structured SQL answer with `Generated SQL`, `Cohort filter summary`, and `Result`
 
 ### 2. Vague request that needs clarification
 

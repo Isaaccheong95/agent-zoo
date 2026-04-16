@@ -40,6 +40,7 @@ _FALLBACK_CLARIFICATION_MESSAGE = (
 _GROUPED_SUPPRESSION_NOTE = (
     "Note: Some grouped results were omitted due to privacy guardrails."
 )
+_FILTER_COVERAGE_HEADING = "Cohort filter summary"
 _SAFE_AGGREGATE_COLUMN_PATTERNS = (
     "avg",
     "average",
@@ -800,6 +801,11 @@ def _build_query_action_summary(tool_result: dict) -> str:
     return "Selected matching rows from the current filtered dataset."
 
 
+def _format_row_count_label(value: int | float) -> str:
+    normalized_value = int(value) if isinstance(value, float) and value.is_integer() else value
+    return f"{normalized_value} row" if normalized_value == 1 else f"{normalized_value} rows"
+
+
 def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
     column_name = str(entry.get("column") or "").strip()
     selected_values = [
@@ -815,23 +821,37 @@ def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
     if not column_name or not selected_values:
         return None
 
-    if len(selected_values) == 1:
-        bullet = f"{column_name} = {selected_values[0]}"
-    else:
-        bullet = f"{column_name} in {', '.join(selected_values)}"
+    bullet_lines = [
+        f"{column_name}:",
+        f"  Matched categories: {', '.join(selected_values)}",
+    ]
 
     normalized_selected_values = {value.casefold() for value in selected_values}
     normalized_available_values = {value.casefold() for value in available_values}
+    if available_values and normalized_available_values:
+        if normalized_selected_values < normalized_available_values:
+            other_values = [
+                value for value in available_values if value.casefold() not in normalized_selected_values
+            ]
+            if other_values:
+                bullet_lines.append(f"  other stored values: {', '.join(other_values)}")
+        elif normalized_selected_values == normalized_available_values:
+            bullet_lines.append("  coverage: all non-null stored values for this column")
+
+    missing_or_blank_rows_excluded = entry.get("missing_or_blank_rows_excluded")
     if (
-        available_values
-        and normalized_available_values
-        and normalized_selected_values < normalized_available_values
+        isinstance(missing_or_blank_rows_excluded, (int, float))
+        and not isinstance(missing_or_blank_rows_excluded, bool)
+        and missing_or_blank_rows_excluded > 0
     ):
-        bullet += (
-            f"  \n  Stored values for {column_name}: "
-            + ", ".join(available_values)
+        bullet_lines.append(
+            "  no. of missing / blank rows excluded: "
+            + _format_row_count_label(missing_or_blank_rows_excluded)
         )
-    return bullet
+    elif entry.get("has_missing_or_blank_rows_excluded"):
+        bullet_lines.append("  missing / blank rows are also excluded.")
+
+    return "\n".join(bullet_lines)
 
 
 def _build_query_filter_bullets(tool_result: dict) -> list[str]:
@@ -871,7 +891,7 @@ def _format_query_summary_section(tool_result: dict) -> str:
     if not bullets:
         bullets = [_build_query_action_summary(tool_result)]
 
-    return "What I matched:\n" + "\n".join(f"- {bullet}" for bullet in bullets)
+    return _FILTER_COVERAGE_HEADING + ":\n" + "\n".join(f"- {bullet}" for bullet in bullets)
 
 
 def build_sql_result_view_model(tool_result: dict[str, Any]) -> SQLResultViewModel:
