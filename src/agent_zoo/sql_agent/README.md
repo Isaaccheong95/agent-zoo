@@ -369,7 +369,7 @@ The saved frame can include these fields:
 | --- | --- |
 | `question` | Current committed dataset question/topic |
 | `sql` | User-visible SQL, preferring `display_sql` when present |
-| `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values`, `available_values`, and optional missing or blank exclusion metadata for final cohort filter summary rendering |
+| `categorical_filters` | Extracted categorical filters found in SQL, with `selected_values`, `available_values`, and optional overall missing or blank count metadata for final cohort filter summary rendering |
 | `comparison_filters` | Extracted comparison filters such as `age > 46` |
 | `is_grouped` | Boolean flag showing that the saved query was a grouped query |
 | `group_columns` | Grouping columns inferred from the committed grouped query |

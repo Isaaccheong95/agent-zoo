@@ -801,9 +801,11 @@ def _build_query_action_summary(tool_result: dict) -> str:
     return "Selected matching rows from the current filtered dataset."
 
 
-def _format_row_count_label(value: int | float) -> str:
+def _format_count_label(value: int | float, singular_label: str, plural_label: str | None = None) -> str:
     normalized_value = int(value) if isinstance(value, float) and value.is_integer() else value
-    return f"{normalized_value} row" if normalized_value == 1 else f"{normalized_value} rows"
+    resolved_plural_label = plural_label or f"{singular_label}s"
+    label = singular_label if normalized_value == 1 else resolved_plural_label
+    return f"{normalized_value} {label}"
 
 
 def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
@@ -838,15 +840,36 @@ def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
         elif normalized_selected_values == normalized_available_values:
             bullet_lines.append("  coverage: all non-null stored values for this column")
 
+    dataset_missing_or_blank_count = entry.get("dataset_missing_or_blank_count")
+    dataset_missing_or_blank_count_unit = str(
+        entry.get("dataset_missing_or_blank_count_unit") or "rows"
+    ).strip().lower()
+    if (
+        isinstance(dataset_missing_or_blank_count, (int, float))
+        and not isinstance(dataset_missing_or_blank_count, bool)
+        and dataset_missing_or_blank_count >= 0
+    ):
+        if dataset_missing_or_blank_count_unit == "patients":
+            bullet_lines.append(
+                "  total patients with missing / blank values in this column: "
+                + _format_count_label(dataset_missing_or_blank_count, "patient")
+            )
+        else:
+            bullet_lines.append(
+                "  total rows with missing / blank values in this column: "
+                + _format_count_label(dataset_missing_or_blank_count, "row")
+            )
+
     missing_or_blank_rows_excluded = entry.get("missing_or_blank_rows_excluded")
     if (
-        isinstance(missing_or_blank_rows_excluded, (int, float))
+        dataset_missing_or_blank_count is None
+        and isinstance(missing_or_blank_rows_excluded, (int, float))
         and not isinstance(missing_or_blank_rows_excluded, bool)
         and missing_or_blank_rows_excluded > 0
     ):
         bullet_lines.append(
             "  no. of missing / blank rows excluded: "
-            + _format_row_count_label(missing_or_blank_rows_excluded)
+            + _format_count_label(missing_or_blank_rows_excluded, "row")
         )
 
     return "\n".join(bullet_lines)

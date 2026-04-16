@@ -1279,6 +1279,27 @@ def _normalize_sql_identifier(value: str) -> str:
     return identifier.strip()
 
 
+def _quote_sql_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _build_related_identifier_sql(reference_sql: str, identifier_name: str) -> str | None:
+    normalized_identifier_name = str(identifier_name or "").strip()
+    if not normalized_identifier_name:
+        return None
+
+    quoted_identifier = _quote_sql_identifier(normalized_identifier_name)
+    normalized_reference_sql = str(reference_sql or "").strip()
+    if "." not in normalized_reference_sql:
+        return quoted_identifier
+
+    qualifier, _, _ = normalized_reference_sql.rpartition(".")
+    qualifier = qualifier.strip()
+    if not qualifier:
+        return quoted_identifier
+    return f"{qualifier}.{quoted_identifier}"
+
+
 def _normalize_sql_literal(value: str) -> str:
     literal = value.strip()
     if literal.startswith("'") and literal.endswith("'") and len(literal) >= 2:
@@ -1394,6 +1415,7 @@ def _build_last_query_frame(
     categorical_value_guidance: list[dict[str, Any]],
     *,
     db_path: Any = None,
+    object_id_column: str | None = None,
 ) -> dict[str, Any] | None:
     if state is None or not hasattr(state, "get"):
         return None
@@ -1419,10 +1441,11 @@ def _build_last_query_frame(
     }
     categorical_filters = _extract_categorical_filters_from_sql(normalized_sql, categorical_value_guidance)
     if categorical_filters and db_path:
-        _annotate_categorical_filter_missing_counts(
+        _annotate_categorical_filter_dataset_missing_counts(
             db_path,
             normalized_sql,
             categorical_filters,
+            object_id_column=object_id_column,
         )
     for entry in categorical_filters:
         if isinstance(entry, dict):
@@ -3146,137 +3169,74 @@ def _build_missing_or_blank_value_condition(column_sql: str) -> str:
     return f"NULLIF(TRIM(CAST({column_sql} AS TEXT)), '') IS NULL"
 
 
-def _match_categorical_filter_predicate(
-    where_clause: str,
+def _build_dataset_missing_or_blank_count_sql(
+    sql: str,
     filter_entry: dict[str, Any],
-) -> tuple[int, int, str] | None:
-    column_name = str(filter_entry.get("column") or "").strip()
-    selected_values = [
-        value
-        for value in filter_entry.get("selected_values") or []
-        if isinstance(value, str) and value.strip()
-    ]
-    available_values = [
-        value
-        for value in filter_entry.get("available_values") or []
-        if isinstance(value, str) and value.strip()
-    ]
-    if not column_name or not selected_values or not available_values:
-        return None
-
-    searchable_where = _mask_case_expressions(where_clause)
-    identifier_pattern = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*'
-    expected_values = _normalize_allowed_values(selected_values, available_values)
-    normalized_column_name = column_name.casefold()
-
-    for match in re.finditer(
-        rf'(?P<column_sql>{identifier_pattern})\s+IN\s*\((?P<values>[^)]*)\)',
-        searchable_where,
-        flags=re.IGNORECASE | re.DOTALL,
-    ):
-        matched_column_sql = str(match.group("column_sql") or "").strip()
-        if _normalize_sql_identifier(matched_column_sql).casefold() != normalized_column_name:
-            continue
-        matched_values = _normalize_allowed_values(
-            _extract_sql_string_literals(match.group("values")),
-            available_values,
-        )
-        if matched_values == expected_values:
-            return match.start(), match.end(), matched_column_sql
-
-    if len(expected_values) != 1:
-        return None
-
-    for match in re.finditer(
-        rf'(?P<column_sql>{identifier_pattern})\s*=\s*(?P<value>\'(?:(?:\'\')|[^\'])*\')',
-        searchable_where,
-        flags=re.IGNORECASE,
-    ):
-        matched_column_sql = str(match.group("column_sql") or "").strip()
-        if _normalize_sql_identifier(matched_column_sql).casefold() != normalized_column_name:
-            continue
-        matched_values = _normalize_allowed_values(
-            [_normalize_sql_literal(match.group("value"))],
-            available_values,
-        )
-        if matched_values == expected_values:
-            return match.start(), match.end(), matched_column_sql
-
-    return None
-
-
-def _remove_where_predicate(where_clause: str, start: int, end: int) -> str | None:
-    before = where_clause[:start]
-    after = where_clause[end:]
-
-    has_leading_and = bool(re.search(r"\bAND\s*$", before, flags=re.IGNORECASE))
-    has_trailing_and = bool(re.match(r"^\s*AND\b", after, flags=re.IGNORECASE))
-    if before.strip() and after.strip() and not (has_leading_and or has_trailing_and):
-        return None
-
-    trimmed_before = re.sub(r"\bAND\s*$", "", before, flags=re.IGNORECASE).rstrip()
-    trimmed_after = re.sub(r"^\s*AND\b\s*", "", after, flags=re.IGNORECASE).lstrip()
-    if trimmed_before and trimmed_after:
-        return f"{trimmed_before} {trimmed_after}".strip()
-    return (trimmed_before or trimmed_after).strip()
-
-
-def _build_missing_or_blank_count_sql(sql: str, filter_entry: dict[str, Any]) -> str | None:
+    *,
+    object_id_column: str | None = None,
+) -> tuple[str | None, str | None]:
     select_pos = _find_top_level_keyword(sql, "SELECT")
     from_pos = _find_top_level_keyword(sql, "FROM")
     if select_pos is None or from_pos is None:
-        return None
+        return None, None
 
     prefix = sql[:select_pos].rstrip()
     rest = sql[from_pos:]
     cut_pos = len(rest)
-    for terminal in ("GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
+    for terminal in ("WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
         pos = _find_top_level_keyword(rest, terminal)
         if pos is not None and pos < cut_pos:
             cut_pos = pos
-    from_clause = rest[:cut_pos].rstrip()
+    source_clause = rest[:cut_pos].rstrip()
+    if not source_clause:
+        return None, None
 
-    where_pos = _find_top_level_keyword(from_clause, "WHERE")
-    if where_pos is None:
-        return None
+    column_sql = str(filter_entry.get("column_sql") or "").strip()
+    if not column_sql:
+        column_name = str(filter_entry.get("column") or "").strip()
+        if not column_name:
+            return None, None
+        column_sql = _quote_sql_identifier(column_name)
 
-    source_clause = from_clause[:where_pos].rstrip()
-    where_clause = from_clause[where_pos + len("WHERE"):].strip()
-    predicate_match = _match_categorical_filter_predicate(where_clause, filter_entry)
-    if predicate_match is None:
-        return None
+    missing_condition = _build_missing_or_blank_value_condition(column_sql)
+    count_expression = "COUNT(*)"
+    count_unit = "rows"
+    normalized_object_id_column = str(object_id_column or "").strip()
+    if normalized_object_id_column:
+        object_id_sql = _build_related_identifier_sql(column_sql, normalized_object_id_column)
+        if object_id_sql:
+            count_expression = f"COUNT(DISTINCT {object_id_sql})"
+            count_unit = "patients"
 
-    predicate_start, predicate_end, matched_column_sql = predicate_match
-    remaining_where = _remove_where_predicate(where_clause, predicate_start, predicate_end)
-    if remaining_where is None:
-        return None
-
-    missing_condition = _build_missing_or_blank_value_condition(matched_column_sql)
-    count_conditions = [
-        condition
-        for condition in (remaining_where, missing_condition)
-        if isinstance(condition, str) and condition.strip()
-    ]
-    if not count_conditions:
-        return None
-
-    count_sql = f"SELECT COUNT(*) AS missing_or_blank_count {source_clause} WHERE {' AND '.join(count_conditions)}"
-    return f"{prefix} {count_sql}".strip()
+    count_sql = (
+        f"SELECT {count_expression} AS missing_or_blank_count "
+        f"{source_clause} WHERE {missing_condition}"
+    )
+    normalized_count_sql = " ".join(part for part in (prefix, count_sql) if part).strip()
+    return normalized_count_sql, count_unit
 
 
-def _annotate_categorical_filter_missing_counts(
+def _annotate_categorical_filter_dataset_missing_counts(
     db_path: Any,
     sql: str,
     categorical_filters: list[dict[str, Any]],
+    *,
+    object_id_column: str | None = None,
 ) -> None:
     for filter_entry in categorical_filters:
-        count_sql = _build_missing_or_blank_count_sql(sql, filter_entry)
+        count_sql, count_unit = _build_dataset_missing_or_blank_count_sql(
+            sql,
+            filter_entry,
+            object_id_column=object_id_column,
+        )
         if not count_sql:
             continue
         missing_count = count_subset_rows(db_path, count_sql)
-        if missing_count is None or missing_count <= 0:
+        if missing_count is None or missing_count < 0:
             continue
-        filter_entry["missing_or_blank_rows_excluded"] = missing_count
+        filter_entry["dataset_missing_or_blank_count"] = missing_count
+        if count_unit:
+            filter_entry["dataset_missing_or_blank_count_unit"] = count_unit
 
 
 def _split_top_level_sql_expressions(sql_fragment: str) -> list[str]:
@@ -3724,6 +3684,7 @@ def build_remember_query_result_callback(
                 tool_response,
                 categorical_value_guidance,
                 db_path=query_db_path,
+                object_id_column=active_settings.object_id_column,
             )
             if last_query_frame is not None:
                 source_query_frame = tool_context.state.get(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY)
