@@ -1974,6 +1974,28 @@ class SQLAgentFilterCoverageTestCase(unittest.TestCase):
             ],
         )
 
+    def test_remember_query_result_keeps_exact_small_missing_blank_count_below_threshold(self) -> None:
+        sql = "SELECT COUNT(*) AS matching_count FROM patients WHERE sex IN ('female', 'male')"
+        tool_response = execute_sqlite_query(self.db_path, sql)
+        callback = build_remember_query_result_callback(self._settings(minimum_aggregate_count=5))
+        tool = SimpleNamespace(name="execute_sqlite_read_only")
+        tool_context = SimpleNamespace(state={SQL_LAST_USER_TEXT_STATE_KEY: "How many patients have a recorded sex value?"})
+
+        callback(tool, {"sql": sql, "is_final": True}, tool_context, tool_response)
+
+        public_result = tool_context.state[SQL_PUBLIC_RESULT_STATE_KEY]
+        self.assertEqual(
+            public_result["query_summary_context"]["categorical_filters"],
+            [
+                {
+                    "column": "sex",
+                    "selected_values": ["female", "male"],
+                    "available_values": ["female", "male"],
+                    "missing_or_blank_rows_excluded": 3,
+                }
+            ],
+        )
+
 
 class SQLAgentPrivacyTestCase(unittest.TestCase):
     def _settings(self, **overrides) -> SQLAgentSettings:
@@ -3142,7 +3164,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
         self.assertNotIn("other stored values:", response_text)
 
-    def test_formatted_final_response_redacts_small_missing_blank_exclusions(self) -> None:
+    def test_formatted_final_response_includes_small_missing_blank_exclusion_counts(self) -> None:
         callback = build_format_final_agent_response_callback()
         content = callback(
             SimpleNamespace(
@@ -3165,7 +3187,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
                                     "column": "gender",
                                     "selected_values": ["Female", "Male"],
                                     "available_values": ["Female", "Male"],
-                                    "has_missing_or_blank_rows_excluded": True,
+                                    "missing_or_blank_rows_excluded": 2,
                                 },
                             ],
                         },
@@ -3176,7 +3198,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
 
         self.assertIsNotNone(content)
         response_text = content.parts[0].text
-        self.assertIn("missing / blank rows are also excluded.", response_text)
+        self.assertIn("no. of missing / blank rows excluded: 2 rows", response_text)
 
     def test_formatted_final_response_includes_comparison_filters(self) -> None:
         callback = build_format_final_agent_response_callback()

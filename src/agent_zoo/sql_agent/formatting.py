@@ -848,8 +848,6 @@ def _build_categorical_filter_bullet(entry: dict[str, Any]) -> str | None:
             "  no. of missing / blank rows excluded: "
             + _format_row_count_label(missing_or_blank_rows_excluded)
         )
-    elif entry.get("has_missing_or_blank_rows_excluded"):
-        bullet_lines.append("  missing / blank rows are also excluded.")
 
     return "\n".join(bullet_lines)
 

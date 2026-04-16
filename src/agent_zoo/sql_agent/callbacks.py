@@ -1394,8 +1394,6 @@ def _build_last_query_frame(
     categorical_value_guidance: list[dict[str, Any]],
     *,
     db_path: Any = None,
-    minimum_aggregate_count: int = 0,
-    redact_small_counts: bool = False,
 ) -> dict[str, Any] | None:
     if state is None or not hasattr(state, "get"):
         return None
@@ -1425,8 +1423,6 @@ def _build_last_query_frame(
             db_path,
             normalized_sql,
             categorical_filters,
-            minimum_aggregate_count=minimum_aggregate_count,
-            redact_small_counts=redact_small_counts,
         )
     for entry in categorical_filters:
         if isinstance(entry, dict):
@@ -3272,9 +3268,6 @@ def _annotate_categorical_filter_missing_counts(
     db_path: Any,
     sql: str,
     categorical_filters: list[dict[str, Any]],
-    *,
-    minimum_aggregate_count: int,
-    redact_small_counts: bool,
 ) -> None:
     for filter_entry in categorical_filters:
         count_sql = _build_missing_or_blank_count_sql(sql, filter_entry)
@@ -3282,9 +3275,6 @@ def _annotate_categorical_filter_missing_counts(
             continue
         missing_count = count_subset_rows(db_path, count_sql)
         if missing_count is None or missing_count <= 0:
-            continue
-        if redact_small_counts and minimum_aggregate_count > 1 and missing_count < minimum_aggregate_count:
-            filter_entry["has_missing_or_blank_rows_excluded"] = True
             continue
         filter_entry["missing_or_blank_rows_excluded"] = missing_count
 
@@ -3734,8 +3724,6 @@ def build_remember_query_result_callback(
                 tool_response,
                 categorical_value_guidance,
                 db_path=query_db_path,
-                minimum_aggregate_count=active_settings.minimum_aggregate_count,
-                redact_small_counts=bool(active_settings.count_aggregates_only),
             )
             if last_query_frame is not None:
                 source_query_frame = tool_context.state.get(SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY)
