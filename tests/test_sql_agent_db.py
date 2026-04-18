@@ -237,6 +237,49 @@ class SQLiteHelpersTestCase(unittest.TestCase):
         self.assertEqual(table_names, ["people", "visits"])
         self.assertIn("people(id INTEGER PRIMARY KEY", summary["schema_text"])
         self.assertNotIn("__shadow", summary["schema_text"])
+        self.assertNotIn("Lookup tables:", summary["schema_text"])
+
+    def test_get_schema_summary_separates_lookup_tables_from_primary_tables(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE schema_columns (
+                    table_name TEXT NOT NULL,
+                    column_name TEXT NOT NULL,
+                    field_label TEXT
+                );
+
+                CREATE TABLE schema_categories (
+                    table_name TEXT NOT NULL,
+                    column_name TEXT NOT NULL,
+                    category_value TEXT NOT NULL
+                );
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        summary = get_schema_summary(self.db_path)
+
+        self.assertEqual(summary["status"], "success")
+        schema_text = summary["schema_text"]
+        self.assertIn("Primary tables:\n", schema_text)
+        self.assertIn("\n\nLookup tables:\n", schema_text)
+
+        primary_text, lookup_text = schema_text.split("\n\nLookup tables:\n", 1)
+        self.assertTrue(primary_text.startswith("Primary tables:\n"))
+        self.assertIn("people(id INTEGER PRIMARY KEY", primary_text)
+        self.assertIn("visits(id INTEGER PRIMARY KEY", primary_text)
+        self.assertNotIn("schema_columns(", primary_text)
+        self.assertNotIn("schema_categories(", primary_text)
+        self.assertIn("schema_categories(table_name TEXT NOT NULL", lookup_text)
+        self.assertIn("schema_columns(table_name TEXT NOT NULL", lookup_text)
+
+        table_names = [table["name"] for table in summary["tables"]]
+        self.assertIn("schema_columns", table_names)
+        self.assertIn("schema_categories", table_names)
 
     def test_get_schema_summary_includes_categorical_value_guidance(self) -> None:
         summary = get_schema_summary(

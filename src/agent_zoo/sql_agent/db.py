@@ -85,6 +85,7 @@ CATEGORICAL_VALUE_GUIDANCE_EXCLUDED_NAME_TOKENS = (
     "phone",
     "payload",
 )
+LOOKUP_SCHEMA_TABLE_NAMES = frozenset({"schema_columns", "schema_categories"})
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -1322,6 +1323,45 @@ def _load_column_mapping_lookup(connection: sqlite3.Connection) -> dict[tuple[st
     return lookup
 
 
+def _is_lookup_schema_table(table_name: str) -> bool:
+    return table_name.strip().casefold() in LOOKUP_SCHEMA_TABLE_NAMES
+
+
+def _format_schema_table_text(table: dict[str, Any]) -> str:
+    formatted_columns = []
+    for column in table["columns"]:
+        details = [column["type"]]
+        if column["primary_key"]:
+            details.append("PRIMARY KEY")
+        if column["not_null"]:
+            details.append("NOT NULL")
+        formatted_columns.append(f'{column["name"]} {" ".join(details)}')
+    return f'{table["name"]}({", ".join(formatted_columns)})'
+
+
+def _format_schema_text(tables: list[dict[str, Any]]) -> str:
+    if not tables:
+        return "No user-facing tables were found in the database."
+
+    primary_tables: list[str] = []
+    lookup_tables: list[str] = []
+    for table in tables:
+        formatted_table = _format_schema_table_text(table)
+        if _is_lookup_schema_table(str(table.get("name") or "")):
+            lookup_tables.append(formatted_table)
+            continue
+        primary_tables.append(formatted_table)
+
+    if not lookup_tables:
+        return "\n".join(primary_tables)
+
+    sections: list[str] = []
+    if primary_tables:
+        sections.append("Primary tables:\n" + "\n".join(primary_tables))
+    sections.append("Lookup tables:\n" + "\n".join(lookup_tables))
+    return "\n\n".join(sections)
+
+
 def get_schema_summary(
     db_path: str | Path,
     *,
@@ -1383,21 +1423,7 @@ def get_schema_summary(
                     columns.append(column_definition)
                 tables.append({"name": table_name, "columns": columns})
 
-        if not tables:
-            schema_text = "No user-facing tables were found in the database."
-        else:
-            formatted_tables = []
-            for table in tables:
-                formatted_columns = []
-                for column in table["columns"]:
-                    details = [column["type"]]
-                    if column["primary_key"]:
-                        details.append("PRIMARY KEY")
-                    if column["not_null"]:
-                        details.append("NOT NULL")
-                    formatted_columns.append(f'{column["name"]} {" ".join(details)}')
-                formatted_tables.append(f'{table["name"]}({", ".join(formatted_columns)})')
-            schema_text = "\n".join(formatted_tables)
+        schema_text = _format_schema_text(tables)
 
         categorical_value_guidance_text = _format_categorical_value_guidance(
             categorical_value_guidance
