@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import sys
 import unittest
 import uuid
 from pathlib import Path
@@ -11,11 +10,7 @@ from unittest.mock import AsyncMock, patch
 from google.genai import types
 
 
-CURRENT_FILE = Path(__file__).resolve()
-REPO_ROOT = CURRENT_FILE.parent if (CURRENT_FILE.parent / "src").exists() else CURRENT_FILE.parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from agent_zoo.base import BaseAgent
 from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings

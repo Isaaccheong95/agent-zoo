@@ -14,11 +14,7 @@ from unittest.mock import patch
 from google.genai import types
 
 
-CURRENT_FILE = Path(__file__).resolve()
-REPO_ROOT = CURRENT_FILE.parent if (CURRENT_FILE.parent / "src").exists() else CURRENT_FILE.parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from agent_zoo.sql_agent.callbacks import (
     SQL_ACTIVE_QUERY_TOPIC_STATE_KEY,
