@@ -5,7 +5,7 @@ This README describes the actual SQL agent implementation in `src/agent_zoo/sql_
 It is intentionally code-grounded:
 
 - `Code-grounded` means the behavior is directly visible in the current implementation.
-- `Test-grounded` means the behavior is asserted in `tests/test_sql_agent_db.py` or `tests/test_sql_agent_pipeline.py`.
+- `Test-grounded` means the behavior is asserted under `tests/` (see `test_db_safety.py`, `test_db_execution.py`, `test_sql_agent_callbacks.py`, `test_sql_agent_object_mode.py`, `test_sql_agent_filter_coverage.py`, `test_sql_agent_runtime.py`).
 - `Inference` means the behavior is a careful conclusion from the code path, not an explicit hard-coded branch.
 
 ADK note:
@@ -65,7 +65,7 @@ For onboarding, the simplest accurate mental model is:
 
 Three code facts matter more than anything else:
 
-- The live runtime path is the ADK path in `agent.py` + `runtime.py`, not `pipeline.py`.
+- The live runtime path is the ADK path in `agent.py` + `runtime.py`.
 - The real control plane is `callbacks.py` + `scope_guard.py`.
 - The database safety layer is `db.py`.
 
@@ -148,7 +148,6 @@ The package exposes several surfaces, but only some are part of the live runtime
 | `build_root_agent(settings)` | `agent.py` | Constructs the ADK `LlmAgent` with model, instruction, tools, and callbacks. |
 | `root_agent` | `agent.py` | Import-time ADK-discoverable root agent object. Useful for `adk run` and `adk web`. |
 | `run-sql-agent` CLI | `cli.py` | Thin shell over `load_settings(...)`, `ask_question(...)`, and `run_interactive_loop(...)`. |
-| `run_nl_to_sql_pipeline(...)` | `pipeline.py` | Deterministic helper used by tests and support workflows. It is **not** the main live ADK runtime. |
 
 Two integration details matter for a web app:
 
@@ -1366,7 +1365,7 @@ Prompt:
 Show the missing field.
 ```
 
-Support-path evidence from `pipeline.py` tests:
+Support-path evidence from `tests/test_db_execution.py`:
 
 - if generated SQL references a missing column, `validate_sql_read_only()` may fail at `EXPLAIN QUERY PLAN`
 - or `execute_sqlite_query()` may return `SQLite execution failed: ...`
@@ -1417,7 +1416,6 @@ This section maps where the logic actually lives.
 | `sql_agent/formatting.py` | clarification parsers and formatters, `format_public_query_result` | Deterministic clarification and final-answer rendering |
 | `scope_guard.py` | `build_llm_scope_gate`, `build_llm_clarification_resolver`, `build_llm_result_refinement_resolver`, `build_llm_schema_grounding_resolver` | Sidecar LLM control plane for scope, clarification, refinement, and schema grounding |
 | `working_memory.py` | `get_agent_working_memory*`, `set_agent_working_memory*` | Custom session-scoped working-memory abstraction |
-| `sql_agent/pipeline.py` | `run_nl_to_sql_pipeline` | Deterministic support pipeline used by tests or external code |
 | `base.py` | `BaseAgent` | Small internal wrapper contract used by `SQLAgent` |
 
 ### What to consider the main entrypoint
@@ -1707,8 +1705,10 @@ Instruction-enforced or resolver-prompt-enforced:
 
 ### Useful test files while developing
 
-- `tests/test_sql_agent_db.py` is the main behavior specification for the callback state machine.
-- `tests/test_sql_agent_pipeline.py` is useful for support-path behavior and public wrapper contracts.
+- `tests/test_sql_agent_callbacks.py` is the main behavior specification for the callback state machine.
+- `tests/test_db_safety.py` and `tests/test_db_execution.py` cover DB-layer safety and direct SQL execution.
+- `tests/test_sql_agent_runtime.py` covers the public `SQLAgent.ask`/`runtime.ask_question` wrappers and runner caching.
+- `tests/test_sql_agent_object_mode.py` and `tests/test_sql_agent_filter_coverage.py` cover their titular modes.
 
 ## Known Limitations
 
@@ -1720,10 +1720,9 @@ Code-grounded and inference where noted:
 4. There is no Python-level automatic SQL retry loop after validation or execution failure.
 5. Under default privacy settings, a zero-match aggregate can become a privacy-blocked result instead of a user-visible `0`.
 6. The main model is instructed to prefer schema inspection and clarification, but those decisions are not completely hard-coded.
-7. `pipeline.py` can be useful for deterministic support workflows, but it does not represent the full live callback-driven runtime.
-8. If an upstream web app wraps prompts poorly and the actual user question is not the last meaningful line, topic extraction and follow-up routing can become inaccurate.
-9. The agent forbids model-generated window functions in instructions, but object-level canonicalization in `db.py` can still internally introduce `ROW_NUMBER()` CTEs when that mode is enabled. That internal rewrite is performed by Python, not by the model.
-10. Fresh-turn schema grounding currently asks unresolved items sequentially, one field/value ambiguity at a time. It does not yet build one combined clarification that covers multiple unresolved concepts in a single message.
+7. If an upstream web app wraps prompts poorly and the actual user question is not the last meaningful line, topic extraction and follow-up routing can become inaccurate.
+8. The agent forbids model-generated window functions in instructions, but object-level canonicalization in `db.py` can still internally introduce `ROW_NUMBER()` CTEs when that mode is enabled. That internal rewrite is performed by Python, not by the model.
+9. Fresh-turn schema grounding currently asks unresolved items sequentially, one field/value ambiguity at a time. It does not yet build one combined clarification that covers multiple unresolved concepts in a single message.
 
 ## Glossary
 
@@ -1770,7 +1769,7 @@ adk run agent_zoo/sql_agent
 Verified command:
 
 ```bash
-/home/cheongjsi/agent-zoo/.venv/bin/python -m unittest tests.test_sql_agent_db tests.test_sql_agent_pipeline -v
+/home/cheongjsi/agent-zoo/.venv/bin/python -m unittest discover tests -v
 ```
 
 ### Defaults that affect behavior immediately
