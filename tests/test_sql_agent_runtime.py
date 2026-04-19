@@ -5,13 +5,15 @@ import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
 
-from google.genai import types
-
 from agent_zoo.base import BaseAgent
 from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings
 from agent_zoo.sql_agent import runtime as sql_runtime
 
-from tests._fixtures import REPO_ROOT, create_fixture_database
+from tests._fixtures import (
+    REPO_ROOT,
+    FakeRunner,
+    create_fixture_database,
+)
 
 
 class SQLAgentRuntimeTestCase(unittest.TestCase):
@@ -71,35 +73,9 @@ class SQLAgentRuntimeTestCase(unittest.TestCase):
             session_id=f"test-session-{uuid.uuid4().hex}",
         )
 
-        created_runners: list[object] = []
-
-        class FakeSessionService:
-            def __init__(self) -> None:
-                self.created_sessions: list[dict[str, str]] = []
-
-            async def create_session(self, **kwargs) -> None:
-                self.created_sessions.append(kwargs)
-
-        class FakeFinalEvent:
-            def __init__(self, text: str) -> None:
-                self.author = "model"
-                self.content = types.Content(role="model", parts=[types.Part(text=text)])
-
-            def is_final_response(self) -> bool:
-                return True
-
-        class FakeRunner:
-            def __init__(self, agent, app_name: str) -> None:
-                self.agent = agent
-                self.app_name = app_name
-                self.session_service = FakeSessionService()
-                created_runners.append(self)
-
-            async def run_async(self, **kwargs):
-                yield FakeFinalEvent("ok")
-
         sql_runtime._RUNNER_CACHE.clear()
         sql_runtime._INITIALIZED_SESSION_KEYS.clear()
+        FakeRunner.instances.clear()
 
         with patch("agent_zoo.sql_agent.runtime.InMemoryRunner", FakeRunner), patch(
             "agent_zoo.sql_agent.agent.build_root_agent",
@@ -110,11 +86,12 @@ class SQLAgentRuntimeTestCase(unittest.TestCase):
 
         self.assertEqual(first_response, "ok")
         self.assertEqual(second_response, "ok")
-        self.assertEqual(len(created_runners), 1)
-        self.assertEqual(len(created_runners[0].session_service.created_sessions), 1)
+        self.assertEqual(len(FakeRunner.instances), 1)
+        self.assertEqual(len(FakeRunner.instances[0].session_service.created_sessions), 1)
 
         sql_runtime._RUNNER_CACHE.clear()
         sql_runtime._INITIALIZED_SESSION_KEYS.clear()
+        FakeRunner.instances.clear()
 
 
 if __name__ == "__main__":

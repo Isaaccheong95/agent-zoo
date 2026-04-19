@@ -4,6 +4,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from google.genai import types
+
 from agent_zoo.working_memory import (
     get_agent_working_memory,
     get_agent_working_memory_value,
@@ -172,3 +174,39 @@ def get_sql_pending_clarification(state: dict[str, object]) -> dict[str, object]
 
 def set_sql_pending_clarification(state: dict[str, object], clarification: dict[str, object]) -> None:
     set_sql_working_memory_value(state, "pending_clarification", clarification)
+
+
+class FakeSessionService:
+    """Stand-in for ADK session services: records create_session calls."""
+
+    def __init__(self) -> None:
+        self.created_sessions: list[dict[str, str]] = []
+
+    async def create_session(self, **kwargs) -> None:
+        self.created_sessions.append(kwargs)
+
+
+class FakeFinalEvent:
+    """Mimics an ADK final model event with a fixed text payload."""
+
+    def __init__(self, text: str) -> None:
+        self.author = "model"
+        self.content = types.Content(role="model", parts=[types.Part(text=text)])
+
+    def is_final_response(self) -> bool:
+        return True
+
+
+class FakeRunner:
+    """Stand-in for ADK InMemoryRunner. Tracks instances on the class."""
+
+    instances: list["FakeRunner"] = []
+
+    def __init__(self, agent, app_name: str) -> None:
+        self.agent = agent
+        self.app_name = app_name
+        self.session_service = FakeSessionService()
+        FakeRunner.instances.append(self)
+
+    async def run_async(self, **kwargs):
+        yield FakeFinalEvent("ok")
