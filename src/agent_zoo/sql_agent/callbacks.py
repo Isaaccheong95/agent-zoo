@@ -16,7 +16,14 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from .config import SQLAgentSettings, load_settings
-from .db import count_subset_rows, execute_sqlite_query, get_schema_summary
+from .db import (
+    _extract_sql_string_literals,
+    _normalize_sql_literal,
+    _quote_identifier as _quote_sql_identifier,
+    count_subset_rows,
+    execute_sqlite_query,
+    get_schema_summary,
+)
 from .formatting import (
     CLARIFICATION_KIND_CATEGORICAL_VALUES,
     CLARIFICATION_KIND_GENERIC,
@@ -1124,13 +1131,6 @@ def _normalize_schema_grounding_filters(
     return normalized_filters
 
 
-def _extract_sql_string_literals(sql_fragment: str) -> list[str]:
-    return [
-        match.group(1).replace("''", "'")
-        for match in re.finditer(r"'((?:''|[^'])*)'", sql_fragment)
-    ]
-
-
 def _mask_char_for_sql_filter_extraction(char: str) -> str:
     return "\n" if char == "\n" else " "
 
@@ -1279,10 +1279,6 @@ def _normalize_sql_identifier(value: str) -> str:
     return identifier.strip()
 
 
-def _quote_sql_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
-
-
 def _build_related_identifier_sql(reference_sql: str, identifier_name: str) -> str | None:
     normalized_identifier_name = str(identifier_name or "").strip()
     if not normalized_identifier_name:
@@ -1298,13 +1294,6 @@ def _build_related_identifier_sql(reference_sql: str, identifier_name: str) -> s
     if not qualifier:
         return quoted_identifier
     return f"{qualifier}.{quoted_identifier}"
-
-
-def _normalize_sql_literal(value: str) -> str:
-    literal = value.strip()
-    if literal.startswith("'") and literal.endswith("'") and len(literal) >= 2:
-        literal = literal[1:-1].replace("''", "'")
-    return literal.strip()
 
 
 def _extract_categorical_filters_from_sql(
