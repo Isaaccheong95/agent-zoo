@@ -784,7 +784,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             sql=sql,
         )
 
-        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=full_result) as mocked_query:
+        with patch("agent_zoo.sql_agent.result_shaping.execute_sqlite_query", return_value=full_result) as mocked_query:
             state = self._invoke_after_tool(
                 self._settings(minimum_aggregate_count=3),
                 make_query_result(
@@ -910,7 +910,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
         )
 
-        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=count_result):
+        with patch("agent_zoo.sql_agent.result_shaping.execute_sqlite_query", return_value=count_result):
             state = self._invoke_after_tool(
                 self._settings(minimum_aggregate_count=3),
                 make_query_result(
@@ -941,7 +941,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
             sql="SELECT sex, COUNT(*) AS matching_count FROM people GROUP BY sex",
         )
 
-        with patch("agent_zoo.sql_agent.callbacks.execute_sqlite_query", return_value=count_result):
+        with patch("agent_zoo.sql_agent.result_shaping.execute_sqlite_query", return_value=count_result):
             state = self._invoke_after_tool(
                 self._settings(minimum_aggregate_count=3),
                 make_query_result(
@@ -989,7 +989,7 @@ class SQLAgentPrivacyTestCase(unittest.TestCase):
         )
 
         with patch(
-            "agent_zoo.sql_agent.callbacks.execute_sqlite_query",
+            "agent_zoo.sql_agent.result_shaping.execute_sqlite_query",
             side_effect=[full_grouped_result, count_result],
         ) as mocked_query:
             state = self._invoke_after_tool(

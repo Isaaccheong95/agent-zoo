@@ -33,7 +33,8 @@ For a common change, look here first:
 | --- | --- |
 | Change how the `LlmAgent` is assembled (model, tools, callbacks) | [src/agent_zoo/sql_agent/agent.py](src/agent_zoo/sql_agent/agent.py) |
 | Change session handling, runner cache, CLI question flow | [src/agent_zoo/sql_agent/runtime.py](src/agent_zoo/sql_agent/runtime.py) |
-| Change clarification, refinement, grounding, privacy, final-answer rendering behavior | [src/agent_zoo/sql_agent/callbacks.py](src/agent_zoo/sql_agent/callbacks.py) (~4.5k lines, the real control plane) |
+| Change clarification, refinement, grounding, privacy, final-answer rendering behavior | [src/agent_zoo/sql_agent/callbacks.py](src/agent_zoo/sql_agent/callbacks.py) (~3k lines, the real control plane) |
+| Change result shaping, privacy filtering, last-query-frame assembly, public result building | [src/agent_zoo/sql_agent/result_shaping.py](src/agent_zoo/sql_agent/result_shaping.py) |
 | Change DB safety / read-only enforcement / SQL validation / schema summary / object-mode rewrite | [src/agent_zoo/sql_agent/db.py](src/agent_zoo/sql_agent/db.py) |
 | Change user-visible response shape (clarifications, filter summaries, result payloads) | [src/agent_zoo/sql_agent/formatting.py](src/agent_zoo/sql_agent/formatting.py) |
 | Change the system prompt / analyst rules / runtime context appended to it | [src/agent_zoo/sql_agent/instructions.py](src/agent_zoo/sql_agent/instructions.py) |
