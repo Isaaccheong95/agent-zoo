@@ -17,7 +17,7 @@ Substantive:
 - [src/agent_zoo/scope_guard.py](src/agent_zoo/scope_guard.py) — reusable LLM-based scope gate + several LLM resolvers (clarification, fresh-topic router, refinement, schema grounding). Used by the SQL agent today; designed to be reusable by future agents.
 - [src/agent_zoo/working_memory.py](src/agent_zoo/working_memory.py) — tiny helper for per-agent namespaced session state.
 - [src/agent_zoo/base.py](src/agent_zoo/base.py) — minimal `BaseAgent` ABC (`name`, `description`, `ask`).
-- [tests/](tests/) — mostly SQL-agent behavior (`test_sql_agent_db.py` has ~145 tests), plus pipeline and working-memory tests.
+- [tests/](tests/) — mostly SQL-agent behavior, plus working-memory tests.
 - [scripts/csv_to_sqlite.py](scripts/csv_to_sqlite.py) — stdlib-only CSV→SQLite builder used to produce the bundled Titanic dataset.
 
 Placeholder / not implemented:
@@ -25,7 +25,7 @@ Placeholder / not implemented:
 
 ## Where The Real Logic Lives
 
-The live SQL-agent runtime path is **`agent.py` + `runtime.py` + the callbacks wired into the `LlmAgent`**, not `pipeline.py`.
+The live SQL-agent runtime path is **`agent.py` + `runtime.py` + the callbacks wired into the `LlmAgent`**.
 
 For a common change, look here first:
 
@@ -41,8 +41,6 @@ For a common change, look here first:
 | Add/modify ADK tools exposed to the model | [src/agent_zoo/sql_agent/tools.py](src/agent_zoo/sql_agent/tools.py) |
 | Change LLM scope/grounding/refinement resolver behavior | [src/agent_zoo/scope_guard.py](src/agent_zoo/scope_guard.py) |
 | Change config/env-var handling, defaults | [src/agent_zoo/sql_agent/config.py](src/agent_zoo/sql_agent/config.py) |
-
-[src/agent_zoo/sql_agent/pipeline.py](src/agent_zoo/sql_agent/pipeline.py) is **not** the live path. It is a lightweight NL→SQL helper used by tests (`tests/test_sql_agent_pipeline.py`). It does not go through ADK, callbacks, clarifications, privacy shaping, or scope gating. Do not "fix" behavior by editing pipeline.py when the live ADK path is what's running.
 
 There is also a **deep, accurate SQL-agent README** at [src/agent_zoo/sql_agent/README.md](src/agent_zoo/sql_agent/README.md). It is the best single reference for workflow stages, state keys, and resolver contracts — skim its Contents and jump into the relevant section before diving into `callbacks.py`.
 
@@ -76,7 +74,7 @@ cd src && adk run agent_zoo/sql_agent
 Tests — configured via `[tool.pytest.ini_options]` (`testpaths = ["tests"]`). The SQL-agent README's verified command uses `unittest`:
 
 ```bash
-.venv/bin/python -m unittest tests.test_sql_agent_db tests.test_sql_agent_pipeline -v
+.venv/bin/python -m unittest discover tests -v
 ```
 
 A `pytest` invocation over `tests/` is the conventional alternative, but prefer the verified `unittest` command when reproducing the repo's own workflow.
@@ -122,8 +120,7 @@ After any non-trivial behavior change in the SQL agent:
 
 ## Common Pitfalls
 
-- Editing [pipeline.py](src/agent_zoo/sql_agent/pipeline.py) thinking it affects the live CLI. It doesn't — it's test/helper code only.
-- Mocking the LLM in ADK path tests: the existing approach (see `test_ask_question_reuses_cached_runner_for_same_session` in `test_sql_agent_pipeline.py`) patches `InMemoryRunner` + `build_root_agent` and clears `runtime._RUNNER_CACHE` / `_INITIALIZED_SESSION_KEYS`. Re-use that pattern instead of inventing a new fixture.
+- Mocking the LLM in ADK path tests: the existing approach (see `test_ask_question_reuses_cached_runner_for_same_session` in `tests/test_sql_agent_runtime.py`) patches `InMemoryRunner` + `build_root_agent` and clears `runtime._RUNNER_CACHE` / `_INITIALIZED_SESSION_KEYS`. Re-use that pattern instead of inventing a new fixture.
 - `count_aggregates_only` is `True` by default. That changes the tool-response pathway: the `after_tool_callback` returns the shaped public result and the model never sees raw rows. If you're debugging "why did the model not see the rows?", check that flag first.
 - The default DB path is literally `dataset/titantic/titanic.sqlite` — the misspelled directory `titantic` is load-bearing. Don't "fix" it as a typo without updating `config.DEFAULT_DB_PATH` and every reference in `README.md`, the SQL-agent README, and the scripts.
 - `config.resolve_repo_path(...)` resolves relative paths against CWD first, then the project root. Absolute paths pass through unchanged. Keep this behavior when adding new path-valued settings.
@@ -331,14 +328,9 @@ flowchart TD
   SGROUND -.->|"grounded_filters<br/>without ambiguity"| AGF["_apply_grounded_filter_followup<br/>inside callbacks.py"]:::util
   AGF --> FIN
 
-  %% Defined-but-not-reached-from-A-D
-  subgraph UNREACHED["Not reached by any of A–D"]
-    direction TB
-    PIPELINE["pipeline.py<br/>(test helper; bypasses ADK)"]:::util
-  end
 ```
 
-Nodes with a dashed border are reached by more than one scenario (the finalize/after_model/after_agent chain, `validate_sql_read_only`, the grounding resolver, the fresh-topic router, and the clarification resolver). `pipeline.py` is exercised only by `tests/test_sql_agent_pipeline.py` — it is not part of any live user-prompt path.
+Nodes with a dashed border are reached by more than one scenario (the finalize/after_model/after_agent chain, `validate_sql_read_only`, the grounding resolver, the fresh-topic router, and the clarification resolver).
 
 ### Suspected dead code
 
