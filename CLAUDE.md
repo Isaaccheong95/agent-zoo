@@ -349,7 +349,6 @@ If a future audit produces candidates, verify each with `grep -rn "<name>" src/ 
 
 | Location A | Location B | Notes |
 | --- | --- | --- |
-| `db.py:505` `_split_top_level_expressions` | `callbacks.py:3160` `_split_top_level_sql_expressions` | Same character-by-character state machine splitting a SQL fragment on top-level commas. The db.py version also handles backtick and `[...]` identifier quoting; the callbacks.py copy is a strict subset. Same shape as the already-consolidated `_find_top_level_keyword` pair. |
 | `db.py:95` `_normalize_whitespace` | `formatting.py:68` `_normalize_whitespace` | **Known and intentionally left alone** per prior decision — revisit only if a third copy appears. |
 
 No other structural duplicates spotted in this pass.

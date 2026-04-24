@@ -22,6 +22,7 @@ from .db import (
     _find_top_level_keyword,
     _normalize_sql_literal,
     _quote_identifier as _quote_sql_identifier,
+    _split_top_level_expressions,
     count_subset_rows,
     execute_sqlite_query,
     get_schema_summary,
@@ -3157,108 +3158,6 @@ def _annotate_categorical_filter_dataset_missing_counts(
             filter_entry["dataset_missing_or_blank_count_unit"] = count_unit
 
 
-def _split_top_level_sql_expressions(sql_fragment: str) -> list[str]:
-    expressions: list[str] = []
-    current: list[str] = []
-    state = "normal"
-    depth = 0
-    index = 0
-
-    while index < len(sql_fragment):
-        char = sql_fragment[index]
-        next_char = sql_fragment[index + 1] if index + 1 < len(sql_fragment) else ""
-
-        if state == "line_comment":
-            current.append(char)
-            if char == "\n":
-                state = "normal"
-            index += 1
-            continue
-
-        if state == "block_comment":
-            current.append(char)
-            if char == "*" and next_char == "/":
-                current.append(next_char)
-                state = "normal"
-                index += 2
-                continue
-            index += 1
-            continue
-
-        if state == "single_quote":
-            current.append(char)
-            if char == "'" and next_char == "'":
-                current.append(next_char)
-                index += 2
-                continue
-            if char == "'":
-                state = "normal"
-            index += 1
-            continue
-
-        if state == "double_quote":
-            current.append(char)
-            if char == '"':
-                state = "normal"
-            index += 1
-            continue
-
-        if char == "-" and next_char == "-":
-            current.append(char)
-            current.append(next_char)
-            state = "line_comment"
-            index += 2
-            continue
-
-        if char == "/" and next_char == "*":
-            current.append(char)
-            current.append(next_char)
-            state = "block_comment"
-            index += 2
-            continue
-
-        if char == "'":
-            current.append(char)
-            state = "single_quote"
-            index += 1
-            continue
-
-        if char == '"':
-            current.append(char)
-            state = "double_quote"
-            index += 1
-            continue
-
-        if char == "(":
-            depth += 1
-            current.append(char)
-            index += 1
-            continue
-
-        if char == ")":
-            depth = max(0, depth - 1)
-            current.append(char)
-            index += 1
-            continue
-
-        if char == "," and depth == 0:
-            expression = "".join(current).strip()
-            if expression:
-                expressions.append(expression)
-            current = []
-            index += 1
-            continue
-
-        current.append(char)
-        index += 1
-
-    trailing_expression = "".join(current).strip()
-    if trailing_expression:
-        expressions.append(trailing_expression)
-
-    return expressions
-
-
 def _extract_select_item_parts(select_item: str) -> tuple[str, str | None]:
     item = select_item.strip()
     if not item:
@@ -3282,7 +3181,7 @@ def _find_group_projection_select_items(sql: str, group_column_names: list[str])
         return None
 
     select_clause = sql[select_pos + len("SELECT"):from_pos].strip()
-    select_items = _split_top_level_sql_expressions(select_clause)
+    select_items = _split_top_level_expressions(select_clause)
     if not select_items:
         return None
 
