@@ -3861,10 +3861,544 @@ def build_scope_gate_callback(
     return scope_gate
 
 
+def _resolve_pending_clarification_stage(
+    state,
+    llm_request,
+    user_text: str,
+    *,
+    clarification_resolver,
+    active_settings: SQLAgentSettings,
+) -> tuple[LlmResponse | None, bool, str]:
+    """Handle a user reply to a previously-posed clarification.
+
+    Returns ``(early_response, clarification_followup_applied, fresh_topic_previous_topic)``:
+      - ``early_response`` — return this ``LlmResponse`` directly from the dispatcher
+        (currently only set by the structured schema-grounding path).
+      - ``clarification_followup_applied`` — if True, the dispatcher should short-circuit
+        by returning ``finalize(...)`` without calling the LLM.
+      - ``fresh_topic_previous_topic`` — seed text for the fresh-topic router when the
+        resolver routed the reply as ``topic_change``; empty string otherwise.
+    """
+    pending_clarification = _get_pending_clarification(state)
+    if pending_clarification is None:
+        return None, False, ""
+
+    _print_clarification_debug(active_settings, "before-model-pending-state", pending_clarification)
+
+    is_structured_grounding_clarification = isinstance(
+        pending_clarification.get(SQL_GROUNDING_RESOLUTION_ITEMS_KEY),
+        list,
+    )
+    pending_options = [
+        option
+        for option in pending_clarification.get("options") or []
+        if isinstance(option, str) and option.strip()
+    ]
+    matched_options = _extract_matching_clarification_options(user_text, pending_options)
+    if matched_options:
+        _print_clarification_debug(active_settings, "before-model-option-matches", matched_options)
+
+        if is_structured_grounding_clarification:
+            followup, structured_response = _advance_structured_schema_grounding_clarification(
+                state,
+                llm_request,
+                pending_clarification,
+                user_text,
+                matched_options=matched_options,
+            )
+            if followup:
+                _print_clarification_debug(
+                    active_settings,
+                    "before-model-followup-rewritten",
+                    _extract_last_user_text(llm_request),
+                )
+            if structured_response is not None:
+                return structured_response, False, ""
+            return None, followup, ""
+
+        followup = _apply_pending_clarification_followup(llm_request, pending_clarification)
+        if followup:
+            _commit_clarification_followup_state(state, pending_clarification, llm_request, active_settings)
+            recent = _build_recent_interpretation_clarification(pending_clarification)
+            if recent is not None:
+                _set_recent_interpretation_clarification_state(state, recent)
+            _clear_pending_clarification_state(state)
+        return None, followup, ""
+
+    # No deterministic option match — ask the LLM resolver what the user meant.
+    clarification_resolution = _resolve_pending_clarification_reply(
+        clarification_resolver,
+        pending_clarification,
+        user_text,
+    )
+    _print_clarification_debug(
+        active_settings,
+        "before-model-clarification-resolution",
+        clarification_resolution,
+    )
+
+    if clarification_resolution.get("resolution_type") == "topic_change":
+        _print_clarification_debug(active_settings, "before-model-topic-router-decision", "TOPIC_CHANGE")
+        fresh_topic_previous_topic = (
+            _select_pending_clarification_topic_text(pending_clarification) or ""
+        )
+        _mark_fresh_topic_clarification_state(state)
+        _clear_pending_clarification_state(state)
+        return None, False, fresh_topic_previous_topic
+
+    _print_clarification_debug(
+        active_settings,
+        "before-model-topic-router-decision",
+        clarification_resolution.get("resolution_type") or "custom_rule",
+    )
+
+    if is_structured_grounding_clarification:
+        followup, structured_response = _advance_structured_schema_grounding_clarification(
+            state,
+            llm_request,
+            pending_clarification,
+            user_text,
+            matched_options=clarification_resolution.get("selected_options"),
+            custom_rule=clarification_resolution.get("custom_rule"),
+        )
+        if followup:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-followup-rewritten",
+                _extract_last_user_text(llm_request),
+            )
+        if structured_response is not None:
+            return structured_response, False, ""
+        return None, followup, ""
+
+    followup = _apply_pending_clarification_followup_with_resolution(
+        llm_request,
+        pending_clarification,
+        user_text,
+        matched_options=clarification_resolution.get("selected_options"),
+        custom_rule=clarification_resolution.get("custom_rule"),
+    )
+    if followup:
+        _commit_clarification_followup_state(state, pending_clarification, llm_request, active_settings)
+        if clarification_resolution.get("selected_options"):
+            recent = _build_recent_interpretation_clarification(pending_clarification)
+            if recent is not None:
+                _set_recent_interpretation_clarification_state(state, recent)
+        _clear_pending_clarification_state(state)
+    return None, followup, ""
+
+
+def _commit_clarification_followup_state(
+    state,
+    pending_clarification: dict,
+    llm_request,
+    active_settings: SQLAgentSettings,
+) -> None:
+    """Persist the refinement-source frame and active topic for a just-applied followup."""
+    base_query_frame = pending_clarification.get("base_query_frame")
+    if isinstance(base_query_frame, dict):
+        state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(base_query_frame)
+    topic_context = _select_pending_clarification_topic_text(pending_clarification)
+    if isinstance(topic_context, str) and topic_context.strip():
+        state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+    _print_clarification_debug(
+        active_settings,
+        "before-model-followup-rewritten",
+        _extract_last_user_text(llm_request),
+    )
+
+
+def _resolve_recent_interpretation_stage(
+    state,
+    llm_request,
+    user_text: str,
+    *,
+    active_settings: SQLAgentSettings,
+) -> bool:
+    """Offer the user a chance to correct a just-applied interpretation clarification.
+
+    Always clears the recent-interpretation state before returning — we only give the
+    user one turn to correct it. Returns True when a followup was applied and the
+    dispatcher should short-circuit to ``finalize(...)``.
+    """
+    recent = _get_recent_interpretation_clarification(state)
+    if recent is None:
+        return False
+
+    recent_options = [
+        option
+        for option in recent.get("options") or []
+        if isinstance(option, str) and option.strip()
+    ]
+    matched_recent_options = _extract_matching_clarification_options(user_text, recent_options)
+
+    followup_applied = False
+    if matched_recent_options:
+        _print_clarification_debug(
+            active_settings,
+            "before-model-option-matches",
+            matched_recent_options,
+        )
+        followup_applied = _apply_pending_clarification_followup_with_resolution(
+            llm_request,
+            recent,
+            user_text,
+            matched_options=matched_recent_options,
+        )
+        if followup_applied:
+            _commit_clarification_followup_state(state, recent, llm_request, active_settings)
+
+    _set_recent_interpretation_clarification_state(state, None)
+    return followup_applied
+
+
+def _resolve_result_refinement_stage(
+    state,
+    llm_request,
+    user_text: str,
+    *,
+    result_refinement_resolver,
+    active_settings: SQLAgentSettings,
+) -> tuple[LlmResponse | None, bool, str]:
+    """Detect whether the user's new turn is a follow-up refinement of the last query.
+
+    Returns ``(early_response, refinement_followup_applied, fresh_topic_previous_topic)``:
+      - ``early_response`` — a clarification LlmResponse the dispatcher should return directly.
+      - ``refinement_followup_applied`` — if True, dispatcher short-circuits to ``finalize(...)``.
+      - ``fresh_topic_previous_topic`` — set when the resolver classified the reply as
+        ``topic_change`` (the dispatcher hands it to the fresh-topic router next).
+    """
+    last_query_frame = _get_last_query_frame(state)
+    if last_query_frame is None:
+        return None, False, ""
+
+    _print_clarification_debug(active_settings, "before-model-last-query-frame", last_query_frame)
+
+    refinement_resolution = _resolve_recent_refinement_followup(last_query_frame, user_text)
+    if refinement_resolution is None:
+        refinement_resolution = result_refinement_resolver(last_query_frame, user_text)
+    _print_clarification_debug(
+        active_settings,
+        "before-model-result-refinement-resolution",
+        refinement_resolution,
+    )
+
+    refinement_type = refinement_resolution.get("resolution_type")
+    fresh_topic_previous_topic = ""
+    if refinement_type == "topic_change":
+        fresh_topic_previous_topic = _get_query_frame_question_text(last_query_frame)
+        _mark_fresh_topic_clarification_state(state)
+
+    if refinement_type == "needs_clarification":
+        clarification = _build_result_refinement_clarification(
+            last_query_frame,
+            str(refinement_resolution.get("target_column") or "").strip(),
+            str(refinement_resolution.get("refinement_request") or "").strip(),
+        )
+        if clarification is None:
+            clarification = build_fallback_clarification_response()
+            previous_question = _get_query_frame_question_text(last_query_frame)
+            if previous_question:
+                clarification["topic_context"] = previous_question
+            query_context = str(last_query_frame.get("topic_context") or "").strip()
+            if query_context:
+                clarification["query_context"] = query_context
+            clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
+        if clarification is not None:
+            _set_pending_clarification_state(state, clarification)
+            topic_context = clarification.get("topic_context")
+            if isinstance(topic_context, str) and topic_context.strip():
+                state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
+            _print_clarification_debug(
+                active_settings,
+                "before-model-result-refinement-clarification",
+                clarification,
+            )
+            formatted_response = format_clarification_response(clarification)
+            if formatted_response:
+                return (
+                    LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=formatted_response)],
+                        )
+                    ),
+                    False,
+                    fresh_topic_previous_topic,
+                )
+    elif refinement_type == "refine_query":
+        refinement_followup = _apply_last_query_refinement_followup(
+            llm_request,
+            last_query_frame,
+            user_text,
+            target_column=str(refinement_resolution.get("target_column") or "").strip() or None,
+            selected_values=[
+                value
+                for value in refinement_resolution.get("selected_values") or []
+                if isinstance(value, str) and value.strip()
+            ],
+            refinement_request=str(refinement_resolution.get("refinement_request") or "").strip(),
+        )
+        if refinement_followup:
+            state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(last_query_frame)
+            previous_question = _get_query_frame_question_text(last_query_frame)
+            if previous_question:
+                state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_question
+            _print_clarification_debug(
+                active_settings,
+                "before-model-followup-rewritten",
+                _extract_last_user_text(llm_request),
+            )
+            return None, True, fresh_topic_previous_topic
+
+    return None, False, fresh_topic_previous_topic
+
+
+def _resolve_fresh_topic_routing_stage(
+    state,
+    user_text_for_router: str,
+    *,
+    fresh_topic_previous_topic: str,
+    previous_last_user_text: str | None,
+    previous_active_query_topic: str | None,
+    fresh_topic_router,
+    active_settings: SQLAgentSettings,
+) -> tuple[LlmResponse | None, bool]:
+    """Route a fresh-topic turn to the dataset, a refusal, or a meta response.
+
+    Only runs when the fresh-topic flag is set (by an earlier stage). Returns
+    ``(early_response, scope_gate_prechecked)``:
+      - For out-of-scope / meta verdicts, returns the response and clears the flag.
+      - For a dataset_question verdict, leaves the flag (after_model will consume it)
+        and signals the dispatcher that the scope gate need not run again.
+    """
+    if not bool(state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
+        return None, False
+
+    _set_recent_interpretation_clarification_state(state, None)
+    fresh_topic_routing = fresh_topic_router(user_text_for_router, fresh_topic_previous_topic)
+    routing_type = str(fresh_topic_routing.get("resolution_type") or "dataset_question").strip().lower()
+    _print_clarification_debug(
+        active_settings,
+        "before-model-fresh-topic-routing",
+        {
+            "current_topic": fresh_topic_previous_topic,
+            "resolution_type": routing_type,
+            "user_text": user_text_for_router,
+        },
+    )
+
+    if routing_type == "out_of_scope":
+        _restore_topic_state(state, previous_last_user_text, previous_active_query_topic)
+        _clear_refinement_source_query_frame_state(state)
+        _clear_fresh_topic_clarification_state(state)
+        return (
+            LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=DEFAULT_REFUSAL_MESSAGE)],
+                )
+            ),
+            False,
+        )
+
+    if routing_type == "meta_or_conversational":
+        _restore_topic_state(state, previous_last_user_text, previous_active_query_topic)
+        _clear_refinement_source_query_frame_state(state)
+        _clear_fresh_topic_clarification_state(state)
+        return (
+            LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text=SQL_META_OR_CONVERSATIONAL_MESSAGE)],
+                )
+            ),
+            False,
+        )
+
+    _clear_refinement_source_query_frame_state(state)
+    return None, True
+
+
+def _resolve_schema_grounding_stage(
+    state,
+    llm_request,
+    user_text: str,
+    raw_user_text: str,
+    *,
+    schema_summary: dict,
+    schema_grounding_resolver,
+    active_settings: SQLAgentSettings,
+) -> tuple[LlmResponse | None, bool]:
+    """Ground the user turn against the schema; may yield a clarification or a rewrite.
+
+    Returns ``(early_response, grounded_followup_applied)``:
+      - ``early_response`` — a structured or field-ambiguity clarification LlmResponse.
+      - ``grounded_followup_applied`` — if True, the user turn was rewritten with
+        grounded filters and the dispatcher should short-circuit to ``finalize(...)``.
+    """
+    if not user_text:
+        return None, False
+
+    topic_text = str(
+        state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+        or state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+        or ""
+    ).strip()
+    request_field_glossary = _extract_request_field_glossary(raw_user_text)
+    schema_grounding_catalog = _build_schema_grounding_catalog(
+        schema_summary,
+        request_field_glossary=request_field_glossary,
+        user_text=user_text,
+    )
+    grounding_resolution = schema_grounding_resolver(
+        user_text,
+        str(schema_grounding_catalog.get("context_text") or ""),
+        [
+            entry
+            for entry in schema_grounding_catalog.get("grounding_candidates") or []
+            if isinstance(entry, dict)
+        ],
+        [
+            identifier
+            for identifier in schema_grounding_catalog.get("candidate_columns") or []
+            if isinstance(identifier, str) and identifier.strip()
+        ],
+    )
+    grounded_filters = _normalize_schema_grounding_filters(
+        grounding_resolution.get("grounded_filters"),
+        {
+            str(identifier): [
+                value
+                for value in values or []
+                if isinstance(value, str) and value.strip()
+            ]
+            for identifier, values in (schema_grounding_catalog.get("candidate_values_by_column") or {}).items()
+            if isinstance(identifier, str) and identifier.strip()
+        },
+    )
+    filtered_schema_grounding_catalog = _build_schema_grounding_catalog(
+        schema_summary,
+        request_field_glossary=request_field_glossary,
+        grounded_filters=grounded_filters,
+        user_text=user_text,
+    )
+    resolved_candidate_columns = [
+        identifier
+        for identifier in grounding_resolution.get("candidate_columns") or []
+        if isinstance(identifier, str)
+        and identifier.strip()
+        and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
+    ]
+    resolved_grounding_columns = [
+        identifier
+        for identifier in grounding_resolution.get("resolved_columns") or []
+        if isinstance(identifier, str)
+        and identifier.strip()
+        and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
+    ]
+    _print_clarification_debug(
+        active_settings,
+        "before-model-schema-grounding-resolution",
+        {
+            **grounding_resolution,
+            "grounded_filters": grounded_filters,
+            "candidate_columns": resolved_candidate_columns,
+            "resolved_columns": resolved_grounding_columns,
+            "resolution_items": grounding_resolution.get("resolution_items") or [],
+        },
+    )
+    structured_resolution_items = _enrich_grounding_resolution_items(
+        [
+            entry
+            for entry in grounding_resolution.get("resolution_items") or []
+            if isinstance(entry, dict)
+        ],
+        schema_grounding_catalog,
+    )
+    structured_clarification = _build_schema_grounding_clarification_from_resolution_items(
+        topic_text,
+        structured_resolution_items,
+    )
+    if structured_clarification is not None:
+        _set_pending_clarification_state(state, structured_clarification)
+        _print_clarification_debug(
+            active_settings,
+            "before-model-schema-grounding-clarification",
+            structured_clarification,
+        )
+        formatted_response = format_clarification_response(structured_clarification)
+        if formatted_response:
+            return (
+                LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(text=formatted_response)],
+                    )
+                ),
+                False,
+            )
+
+    if grounding_resolution.get("resolution_type") == "needs_clarification" and len(resolved_candidate_columns) >= 2:
+        clarification = _build_schema_grounding_clarification(
+            topic_text,
+            resolved_candidate_columns,
+            filtered_schema_grounding_catalog,
+            grounded_filters=grounded_filters,
+        )
+        if clarification is not None:
+            _set_pending_clarification_state(state, clarification)
+            _print_clarification_debug(
+                active_settings,
+                "before-model-schema-grounding-clarification",
+                clarification,
+            )
+            formatted_response = format_clarification_response(clarification)
+            if formatted_response:
+                return (
+                    LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part(text=formatted_response)],
+                        )
+                    ),
+                    False,
+                )
+    elif grounded_filters:
+        grounded_followup = _apply_grounded_filter_followup(
+            llm_request,
+            user_text,
+            grounded_filters,
+            resolved_columns=resolved_grounding_columns,
+            option_labels={
+                str(identifier): str(label)
+                for identifier, label in (filtered_schema_grounding_catalog.get("option_labels") or {}).items()
+                if isinstance(identifier, str) and isinstance(label, str)
+            },
+        )
+        if grounded_followup:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-followup-rewritten",
+                _extract_last_user_text(llm_request),
+            )
+            return None, True
+
+    return None, False
+
+
 def build_combined_before_model_callback(
     settings: SQLAgentSettings | None = None,
 ):
-    """Chain LLM scope gate → finalize-after-query into a single before_model_callback."""
+    """Chain LLM scope gate → finalize-after-query into a single before_model_callback.
+
+    The dispatcher runs five resolver stages in sequence on a fresh user turn:
+    pending-clarification reply → recent-interpretation correction → last-query
+    refinement → fresh-topic routing → schema grounding. Each stage may
+    short-circuit the LLM call by returning an ``LlmResponse`` or by rewriting
+    the last user turn and deferring to ``finalize``. Mid-turn calls (i.e. the
+    LLM round that follows a tool response) bypass the whole sequence.
+    """
     active_settings = settings or load_settings()
 
     schema_summary = get_schema_summary(
@@ -3896,504 +4430,126 @@ def build_combined_before_model_callback(
     finalize = build_finalize_after_query_before_model_callback()
 
     def combined(callback_context=None, llm_request=None, **kwargs) -> LlmResponse | None:
-        scope_gate_prechecked = False
-        if callback_context is not None and not _request_ends_with_tool_response(llm_request):
-            _clear_private_result_state(callback_context.state)
-            _clear_fresh_topic_clarification_state(callback_context.state)
-            previous_last_user_text = callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
-            if not isinstance(previous_last_user_text, str):
-                previous_last_user_text = None
-            previous_active_query_topic = callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
-            if not isinstance(previous_active_query_topic, str):
-                previous_active_query_topic = None
-            raw_user_text, user_text = _extract_user_turn_texts(llm_request)
-            topic_text = ""
-            fresh_topic_previous_topic = ""
-            if user_text:
-                topic_text = _extract_topic_context_text(user_text)
-                callback_context.state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
-                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_text
-                _print_clarification_debug(active_settings, "before-model-user-prompt", raw_user_text or user_text)
-            pending_clarification = _get_pending_clarification(callback_context.state)
-            clarification_followup = False
-            structured_clarification_response: LlmResponse | None = None
-            if pending_clarification is not None:
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-pending-state",
-                    pending_clarification,
-                )
-                is_structured_grounding_clarification = isinstance(
-                    pending_clarification.get(SQL_GROUNDING_RESOLUTION_ITEMS_KEY),
-                    list,
-                )
-                pending_options = [
-                    option
-                    for option in pending_clarification.get("options") or []
-                    if isinstance(option, str) and option.strip()
-                ]
-                matched_options = _extract_matching_clarification_options(user_text, pending_options)
-                has_option_match = bool(matched_options)
-                if matched_options:
-                    _print_clarification_debug(
-                        active_settings,
-                        "before-model-option-matches",
-                        matched_options,
-                    )
-                if has_option_match:
-                    if is_structured_grounding_clarification:
-                        clarification_followup, structured_clarification_response = _advance_structured_schema_grounding_clarification(
-                            callback_context.state,
-                            llm_request,
-                            pending_clarification,
-                            user_text,
-                            matched_options=matched_options,
-                        )
-                        if clarification_followup:
-                            _print_clarification_debug(
-                                active_settings,
-                                "before-model-followup-rewritten",
-                                _extract_last_user_text(llm_request),
-                            )
-                    else:
-                        clarification_followup = _apply_pending_clarification_followup(
-                            llm_request,
-                            pending_clarification,
-                        )
-                        if clarification_followup:
-                            base_query_frame = pending_clarification.get("base_query_frame")
-                            if isinstance(base_query_frame, dict):
-                                callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                                    base_query_frame
-                                )
-                            topic_context = _select_pending_clarification_topic_text(pending_clarification)
-                            if isinstance(topic_context, str) and topic_context.strip():
-                                callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                            _print_clarification_debug(
-                                active_settings,
-                                "before-model-followup-rewritten",
-                                _extract_last_user_text(llm_request),
-                            )
-                            recent_interpretation_clarification = _build_recent_interpretation_clarification(
-                                pending_clarification
-                            )
-                            if recent_interpretation_clarification is not None:
-                                _set_recent_interpretation_clarification_state(
-                                    callback_context.state,
-                                    recent_interpretation_clarification,
-                                )
-                            _clear_pending_clarification_state(callback_context.state)
-                else:
-                    clarification_resolution = _resolve_pending_clarification_reply(
-                        clarification_resolver,
-                        pending_clarification,
-                        user_text,
-                    )
-                    _print_clarification_debug(
-                        active_settings,
-                        "before-model-clarification-resolution",
-                        clarification_resolution,
-                    )
-                    if clarification_resolution.get("resolution_type") == "topic_change":
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-topic-router-decision",
-                            "TOPIC_CHANGE",
-                        )
-                        fresh_topic_previous_topic = (
-                            _select_pending_clarification_topic_text(pending_clarification) or ""
-                        )
-                        _mark_fresh_topic_clarification_state(callback_context.state)
-                        _clear_pending_clarification_state(callback_context.state)
-                    else:
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-topic-router-decision",
-                            clarification_resolution.get("resolution_type") or "custom_rule",
-                        )
-                        if is_structured_grounding_clarification:
-                            clarification_followup, structured_clarification_response = _advance_structured_schema_grounding_clarification(
-                                callback_context.state,
-                                llm_request,
-                                pending_clarification,
-                                user_text,
-                                matched_options=clarification_resolution.get("selected_options"),
-                                custom_rule=clarification_resolution.get("custom_rule"),
-                            )
-                            if clarification_followup:
-                                _print_clarification_debug(
-                                    active_settings,
-                                    "before-model-followup-rewritten",
-                                    _extract_last_user_text(llm_request),
-                                )
-                        else:
-                            clarification_followup = _apply_pending_clarification_followup_with_resolution(
-                                llm_request,
-                                pending_clarification,
-                                user_text,
-                                matched_options=clarification_resolution.get("selected_options"),
-                                custom_rule=clarification_resolution.get("custom_rule"),
-                            )
-                            if clarification_followup:
-                                base_query_frame = pending_clarification.get("base_query_frame")
-                                if isinstance(base_query_frame, dict):
-                                    callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                                        base_query_frame
-                                    )
-                                topic_context = _select_pending_clarification_topic_text(pending_clarification)
-                                if isinstance(topic_context, str) and topic_context.strip():
-                                    callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                                _print_clarification_debug(
-                                    active_settings,
-                                    "before-model-followup-rewritten",
-                                    _extract_last_user_text(llm_request),
-                                )
-                                if clarification_resolution.get("selected_options"):
-                                    recent_interpretation_clarification = _build_recent_interpretation_clarification(
-                                        pending_clarification
-                                    )
-                                    if recent_interpretation_clarification is not None:
-                                        _set_recent_interpretation_clarification_state(
-                                            callback_context.state,
-                                            recent_interpretation_clarification,
-                                        )
-                                _clear_pending_clarification_state(callback_context.state)
-            if structured_clarification_response is not None:
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-branch",
-                    "continuing structured schema grounding clarification without scope gate",
-                )
-                return structured_clarification_response
-            if clarification_followup:
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-branch",
-                    "continuing clarification flow without scope gate",
-                )
-                return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+        # Mid-turn LLM call (tool result just came back): skip resolver dispatch.
+        # scope_gate self-bypasses on tool-response tails; finalize renders any
+        # stored public result.
+        if callback_context is None or _request_ends_with_tool_response(llm_request):
+            result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
+            if result is not None:
+                return result
+            return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-            recent_interpretation_clarification = _get_recent_interpretation_clarification(
-                callback_context.state
+        state = callback_context.state
+        _clear_private_result_state(state)
+        _clear_fresh_topic_clarification_state(state)
+
+        previous_last_user_text = state.get(SQL_LAST_USER_TEXT_STATE_KEY)
+        if not isinstance(previous_last_user_text, str):
+            previous_last_user_text = None
+        previous_active_query_topic = state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
+        if not isinstance(previous_active_query_topic, str):
+            previous_active_query_topic = None
+
+        raw_user_text, user_text = _extract_user_turn_texts(llm_request)
+        if user_text:
+            topic_text = _extract_topic_context_text(user_text)
+            state[SQL_LAST_USER_TEXT_STATE_KEY] = topic_text
+            state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_text
+            _print_clarification_debug(active_settings, "before-model-user-prompt", raw_user_text or user_text)
+
+        fresh_topic_previous_topic = ""
+
+        # Stage 1: pending clarification reply.
+        early_response, clarification_followup, stage_topic = _resolve_pending_clarification_stage(
+            state,
+            llm_request,
+            user_text,
+            clarification_resolver=clarification_resolver,
+            active_settings=active_settings,
+        )
+        if stage_topic:
+            fresh_topic_previous_topic = stage_topic
+        if early_response is not None:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-branch",
+                "continuing structured schema grounding clarification without scope gate",
             )
-            if recent_interpretation_clarification is not None:
-                recent_options = [
-                    option
-                    for option in recent_interpretation_clarification.get("options") or []
-                    if isinstance(option, str) and option.strip()
-                ]
-                matched_recent_options = _extract_matching_clarification_options(
-                    user_text,
-                    recent_options,
-                )
-                if matched_recent_options:
-                    _print_clarification_debug(
-                        active_settings,
-                        "before-model-option-matches",
-                        matched_recent_options,
-                    )
-                    clarification_followup = _apply_pending_clarification_followup_with_resolution(
-                        llm_request,
-                        recent_interpretation_clarification,
-                        user_text,
-                        matched_options=matched_recent_options,
-                    )
-                    if clarification_followup:
-                        base_query_frame = recent_interpretation_clarification.get("base_query_frame")
-                        if isinstance(base_query_frame, dict):
-                            callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                                base_query_frame
-                            )
-                        topic_context = _select_pending_clarification_topic_text(
-                            recent_interpretation_clarification
-                        )
-                        if isinstance(topic_context, str) and topic_context.strip():
-                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-followup-rewritten",
-                            _extract_last_user_text(llm_request),
-                        )
-                        _set_recent_interpretation_clarification_state(callback_context.state, None)
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-branch",
-                            "continuing clarification flow without scope gate",
-                        )
-                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
-                _set_recent_interpretation_clarification_state(callback_context.state, None)
+            return early_response
+        if clarification_followup:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-branch",
+                "continuing clarification flow without scope gate",
+            )
+            return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-            last_query_frame = _get_last_query_frame(callback_context.state)
-            if last_query_frame is not None:
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-last-query-frame",
-                    last_query_frame,
-                )
-                refinement_resolution = _resolve_recent_refinement_followup(last_query_frame, user_text)
-                if refinement_resolution is None:
-                    refinement_resolution = result_refinement_resolver(last_query_frame, user_text)
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-result-refinement-resolution",
-                    refinement_resolution,
-                )
-                refinement_type = refinement_resolution.get("resolution_type")
-                if refinement_type == "topic_change":
-                    fresh_topic_previous_topic = _get_query_frame_question_text(last_query_frame)
-                    _mark_fresh_topic_clarification_state(callback_context.state)
-                if refinement_type == "needs_clarification":
-                    clarification = _build_result_refinement_clarification(
-                        last_query_frame,
-                        str(refinement_resolution.get("target_column") or "").strip(),
-                        str(refinement_resolution.get("refinement_request") or "").strip(),
-                    )
-                    if clarification is None:
-                        clarification = build_fallback_clarification_response()
-                        previous_question = _get_query_frame_question_text(last_query_frame)
-                        if previous_question:
-                            clarification["topic_context"] = previous_question
-                        query_context = str(last_query_frame.get("topic_context") or "").strip()
-                        if query_context:
-                            clarification["query_context"] = query_context
-                        clarification["base_query_frame"] = copy.deepcopy(last_query_frame)
-                    if clarification is not None:
-                        _set_pending_clarification_state(callback_context.state, clarification)
-                        topic_context = clarification.get("topic_context")
-                        if isinstance(topic_context, str) and topic_context.strip():
-                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = topic_context.strip()
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-result-refinement-clarification",
-                            clarification,
-                        )
-                        formatted_response = format_clarification_response(clarification)
-                        if formatted_response:
-                            return LlmResponse(
-                                content=types.Content(
-                                    role="model",
-                                    parts=[types.Part(text=formatted_response)],
-                                )
-                            )
-                elif refinement_type == "refine_query":
-                    refinement_followup = _apply_last_query_refinement_followup(
-                        llm_request,
-                        last_query_frame,
-                        user_text,
-                        target_column=str(refinement_resolution.get("target_column") or "").strip() or None,
-                        selected_values=[
-                            value
-                            for value in refinement_resolution.get("selected_values") or []
-                            if isinstance(value, str) and value.strip()
-                        ],
-                        refinement_request=str(refinement_resolution.get("refinement_request") or "").strip(),
-                    )
-                    if refinement_followup:
-                        callback_context.state[SQL_REFINEMENT_SOURCE_QUERY_FRAME_STATE_KEY] = copy.deepcopy(
-                            last_query_frame
-                        )
-                        previous_question = _get_query_frame_question_text(last_query_frame)
-                        if previous_question:
-                            callback_context.state[SQL_ACTIVE_QUERY_TOPIC_STATE_KEY] = previous_question
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-followup-rewritten",
-                            _extract_last_user_text(llm_request),
-                        )
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-branch",
-                            "continuing result refinement flow without scope gate",
-                        )
-                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+        # Stage 2: one-turn correction window for a just-applied interpretation.
+        if _resolve_recent_interpretation_stage(
+            state,
+            llm_request,
+            user_text,
+            active_settings=active_settings,
+        ):
+            _print_clarification_debug(
+                active_settings,
+                "before-model-branch",
+                "continuing clarification flow without scope gate",
+            )
+            return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-            if bool(callback_context.state.get(SQL_FRESH_TOPIC_CLARIFICATION_STATE_KEY)):
-                _set_recent_interpretation_clarification_state(callback_context.state, None)
-                fresh_topic_routing = fresh_topic_router(raw_user_text or user_text, fresh_topic_previous_topic)
-                routing_type = str(fresh_topic_routing.get("resolution_type") or "dataset_question").strip().lower()
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-fresh-topic-routing",
-                    {
-                        "current_topic": fresh_topic_previous_topic,
-                        "resolution_type": routing_type,
-                        "user_text": raw_user_text or user_text,
-                    },
-                )
-                if routing_type == "out_of_scope":
-                    _restore_topic_state(
-                        callback_context.state,
-                        previous_last_user_text,
-                        previous_active_query_topic,
-                    )
-                    _clear_refinement_source_query_frame_state(callback_context.state)
-                    _clear_fresh_topic_clarification_state(callback_context.state)
-                    return LlmResponse(
-                        content=types.Content(
-                            role="model",
-                            parts=[types.Part(text=DEFAULT_REFUSAL_MESSAGE)],
-                        )
-                    )
-                if routing_type == "meta_or_conversational":
-                    _restore_topic_state(
-                        callback_context.state,
-                        previous_last_user_text,
-                        previous_active_query_topic,
-                    )
-                    _clear_refinement_source_query_frame_state(callback_context.state)
-                    _clear_fresh_topic_clarification_state(callback_context.state)
-                    return LlmResponse(
-                        content=types.Content(
-                            role="model",
-                            parts=[types.Part(text=SQL_META_OR_CONVERSATIONAL_MESSAGE)],
-                        )
-                    )
-                _clear_refinement_source_query_frame_state(callback_context.state)
-                scope_gate_prechecked = True
+        # Stage 3: refinement of the last successful query.
+        early_response, refinement_followup, stage_topic = _resolve_result_refinement_stage(
+            state,
+            llm_request,
+            user_text,
+            result_refinement_resolver=result_refinement_resolver,
+            active_settings=active_settings,
+        )
+        if stage_topic:
+            fresh_topic_previous_topic = stage_topic
+        if early_response is not None:
+            return early_response
+        if refinement_followup:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-branch",
+                "continuing result refinement flow without scope gate",
+            )
+            return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
-        if callback_context is not None and not _request_ends_with_tool_response(llm_request):
-            if user_text:
-                topic_text = str(
-                    callback_context.state.get(SQL_ACTIVE_QUERY_TOPIC_STATE_KEY)
-                    or callback_context.state.get(SQL_LAST_USER_TEXT_STATE_KEY)
-                    or ""
-                ).strip()
-                request_field_glossary = _extract_request_field_glossary(raw_user_text)
-                schema_grounding_catalog = _build_schema_grounding_catalog(
-                    schema_summary,
-                    request_field_glossary=request_field_glossary,
-                    user_text=user_text,
-                )
-                grounding_resolution = schema_grounding_resolver(
-                    user_text,
-                    str(schema_grounding_catalog.get("context_text") or ""),
-                    [
-                        entry
-                        for entry in schema_grounding_catalog.get("grounding_candidates") or []
-                        if isinstance(entry, dict)
-                    ],
-                    [
-                        identifier
-                        for identifier in schema_grounding_catalog.get("candidate_columns") or []
-                        if isinstance(identifier, str) and identifier.strip()
-                    ],
-                )
-                grounded_filters = _normalize_schema_grounding_filters(
-                    grounding_resolution.get("grounded_filters"),
-                    {
-                        str(identifier): [
-                            value
-                            for value in values or []
-                            if isinstance(value, str) and value.strip()
-                        ]
-                        for identifier, values in (schema_grounding_catalog.get("candidate_values_by_column") or {}).items()
-                        if isinstance(identifier, str) and identifier.strip()
-                    },
-                )
-                filtered_schema_grounding_catalog = _build_schema_grounding_catalog(
-                    schema_summary,
-                    request_field_glossary=request_field_glossary,
-                    grounded_filters=grounded_filters,
-                    user_text=user_text,
-                )
-                resolved_candidate_columns = [
-                    identifier
-                    for identifier in grounding_resolution.get("candidate_columns") or []
-                    if isinstance(identifier, str)
-                    and identifier.strip()
-                    and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
-                ]
-                resolved_grounding_columns = [
-                    identifier
-                    for identifier in grounding_resolution.get("resolved_columns") or []
-                    if isinstance(identifier, str)
-                    and identifier.strip()
-                    and identifier in (filtered_schema_grounding_catalog.get("candidate_columns") or [])
-                ]
-                _print_clarification_debug(
-                    active_settings,
-                    "before-model-schema-grounding-resolution",
-                    {
-                        **grounding_resolution,
-                        "grounded_filters": grounded_filters,
-                        "candidate_columns": resolved_candidate_columns,
-                        "resolved_columns": resolved_grounding_columns,
-                        "resolution_items": grounding_resolution.get("resolution_items") or [],
-                    },
-                )
-                structured_resolution_items = _enrich_grounding_resolution_items(
-                    [
-                        entry
-                        for entry in grounding_resolution.get("resolution_items") or []
-                        if isinstance(entry, dict)
-                    ],
-                    schema_grounding_catalog,
-                )
-                structured_clarification = _build_schema_grounding_clarification_from_resolution_items(
-                    topic_text,
-                    structured_resolution_items,
-                )
-                if structured_clarification is not None:
-                    _set_pending_clarification_state(callback_context.state, structured_clarification)
-                    _print_clarification_debug(
-                        active_settings,
-                        "before-model-schema-grounding-clarification",
-                        structured_clarification,
-                    )
-                    formatted_response = format_clarification_response(structured_clarification)
-                    if formatted_response:
-                        return LlmResponse(
-                            content=types.Content(
-                                role="model",
-                                parts=[types.Part(text=formatted_response)],
-                            )
-                        )
-                if grounding_resolution.get("resolution_type") == "needs_clarification" and len(resolved_candidate_columns) >= 2:
-                    clarification = _build_schema_grounding_clarification(
-                        topic_text,
-                        resolved_candidate_columns,
-                        filtered_schema_grounding_catalog,
-                        grounded_filters=grounded_filters,
-                    )
-                    if clarification is not None:
-                        _set_pending_clarification_state(callback_context.state, clarification)
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-schema-grounding-clarification",
-                            clarification,
-                        )
-                        formatted_response = format_clarification_response(clarification)
-                        if formatted_response:
-                            return LlmResponse(
-                                content=types.Content(
-                                    role="model",
-                                    parts=[types.Part(text=formatted_response)],
-                                )
-                            )
-                elif grounded_filters:
-                    grounded_followup = _apply_grounded_filter_followup(
-                        llm_request,
-                        user_text,
-                        grounded_filters,
-                        resolved_columns=resolved_grounding_columns,
-                        option_labels={
-                            str(identifier): str(label)
-                            for identifier, label in (filtered_schema_grounding_catalog.get("option_labels") or {}).items()
-                            if isinstance(identifier, str) and isinstance(label, str)
-                        },
-                    )
-                    if grounded_followup:
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-followup-rewritten",
-                            _extract_last_user_text(llm_request),
-                        )
-                        _print_clarification_debug(
-                            active_settings,
-                            "before-model-branch",
-                            "continuing schema grounding flow without scope gate",
-                        )
-                        return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
+        # Stage 4: route fresh-topic turns (only runs if an earlier stage set the flag).
+        routing_response, scope_gate_prechecked = _resolve_fresh_topic_routing_stage(
+            state,
+            raw_user_text or user_text,
+            fresh_topic_previous_topic=fresh_topic_previous_topic,
+            previous_last_user_text=previous_last_user_text,
+            previous_active_query_topic=previous_active_query_topic,
+            fresh_topic_router=fresh_topic_router,
+            active_settings=active_settings,
+        )
+        if routing_response is not None:
+            return routing_response
+
+        # Stage 5: schema grounding may produce a clarification or rewrite the turn.
+        early_response, grounded_followup = _resolve_schema_grounding_stage(
+            state,
+            llm_request,
+            user_text,
+            raw_user_text,
+            schema_summary=schema_summary,
+            schema_grounding_resolver=schema_grounding_resolver,
+            active_settings=active_settings,
+        )
+        if early_response is not None:
+            return early_response
+        if grounded_followup:
+            _print_clarification_debug(
+                active_settings,
+                "before-model-branch",
+                "continuing schema grounding flow without scope gate",
+            )
+            return finalize(callback_context=callback_context, llm_request=llm_request, **kwargs)
 
         if not scope_gate_prechecked:
             result = scope_gate(callback_context=callback_context, llm_request=llm_request, **kwargs)
