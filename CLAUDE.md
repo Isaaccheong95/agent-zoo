@@ -80,7 +80,7 @@ Tests — configured via `[tool.pytest.ini_options]` (`testpaths = ["tests"]`). 
 A `pytest` invocation over `tests/` is the conventional alternative, but prefer the verified `unittest` command when reproducing the repo's own workflow.
 
 After any non-trivial behavior change in the SQL agent:
-1. Run the full test suite. The test file `tests/test_sql_agent_db.py` covers DB safety, callbacks, clarification normalization, privacy, object-mode rewriting, and filter coverage — most regressions show up here.
+1. Run the full test suite. The `tests/` directory covers DB safety (`test_db_safety.py`, `test_db_execution.py`), callbacks and clarification normalization (`test_sql_agent_callbacks.py`), privacy and filter coverage (`test_sql_agent_filter_coverage.py`), and object-mode rewriting (`test_sql_agent_object_mode.py`) — most regressions show up here.
 2. If UI/response text changed, run at least one `run-sql-agent --db dataset/titantic/titanic.sqlite --question ...` to sanity-check the rendered output. The CLI prints deterministic rendered text; don't rely on the test suite alone for wording changes.
 
 ## SQL Agent Architecture Notes
