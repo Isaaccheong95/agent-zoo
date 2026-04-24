@@ -13,6 +13,11 @@ import math
 import re
 from typing import Any
 
+from .result_shaping import (
+    _is_numeric,
+    _is_safe_aggregate_column,
+)
+
 
 _CLARIFICATION_METADATA_KEYS = {
     "clarification_kind",
@@ -41,16 +46,6 @@ _GROUPED_SUPPRESSION_NOTE = (
     "Note: Some grouped results were omitted due to privacy guardrails."
 )
 _FILTER_COVERAGE_HEADING = "Cohort filter summary"
-_SAFE_AGGREGATE_COLUMN_PATTERNS = (
-    "avg",
-    "average",
-    "min",
-    "minimum",
-    "max",
-    "maximum",
-)
-
-
 @dataclass(slots=True)
 class SQLResultViewModel:
     """Deterministic contract for rendering final SQL result responses."""
@@ -682,25 +677,6 @@ def format_clarification_response(clarification: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _is_numeric_display_value(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _normalize_result_column_name(value: str) -> str:
-    return re.sub(r"\s+", "_", str(value).strip().lower())
-
-
-def _is_count_result_column(column_name: str) -> bool:
-    return "count" in _normalize_result_column_name(column_name)
-
-
-def _is_safe_aggregate_result_column(column_name: str) -> bool:
-    normalized = _normalize_result_column_name(column_name)
-    if _is_count_result_column(normalized):
-        return False
-    return any(pattern in normalized for pattern in _SAFE_AGGREGATE_COLUMN_PATTERNS)
-
-
 def _get_display_aggregate_columns(tool_result: dict[str, Any], rows: list[Any]) -> set[str]:
     aggregate_columns = {
         str(column).strip()
@@ -720,9 +696,9 @@ def _get_display_aggregate_columns(tool_result: dict[str, Any], rows: list[Any])
 
     detected_columns: set[str] = set()
     for column in columns:
-        if not _is_safe_aggregate_result_column(column):
+        if not _is_safe_aggregate_column(column):
             continue
-        if all(isinstance(row, dict) and _is_numeric_display_value(row.get(column)) for row in rows):
+        if all(isinstance(row, dict) and _is_numeric(row.get(column)) for row in rows):
             detected_columns.add(column)
     return detected_columns
 
@@ -746,7 +722,7 @@ def _build_display_rows(tool_result: dict[str, Any], rows: list[Any]) -> list[An
 
         display_row: dict[str, Any] = {}
         for column, value in row.items():
-            if column in aggregate_columns and _is_numeric_display_value(value):
+            if column in aggregate_columns and _is_numeric(value):
                 display_row[column] = _format_fixed_decimal(value)
                 continue
             display_row[column] = value
