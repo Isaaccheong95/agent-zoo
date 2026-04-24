@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m unittest tests.test_sql_agent_db)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m unittest discover tests)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(.venv/bin/python -c \"from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings, load_settings, build_root_agent, root_agent, ask_question; print\\('imports ok'\\)\")",
+      "Bash(.venv/bin/run-sql-agent --help)",
+      "Bash(.venv/bin/python -c \"from agent_zoo.sql_agent import SQLAgent, SQLAgentSettings, load_settings, build_root_agent, root_agent, ask_question; print\\('public imports ok'\\)\")",
+      "Bash(awk '/^def build_combined_before_model_callback/,/^def [a-z_]/ {print NR\": \"$0}' /home/cheongjsi/agent-zoo/src/agent_zoo/sql_agent/callbacks.py)",
+      "Bash(awk -F: '$1 >= 3948 {print}')",
+      "Bash(cat)",
+      "Read(//tmp/**)",
+      "Bash(awk -F: '{print $2}')",
+      "Bash(awk -F: 'NR==1 {prev=$1} NR>1 {print prev\"-\"\\($1-1\\); prev=$1} END {print prev\"-4488\"}')",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(.venv/bin/python -m unittest tests.test_sql_agent_runtime -v)",
+      "Bash(.venv/bin/python -m unittest tests.test_sql_agent_db tests.test_sql_agent_callbacks tests.test_sql_agent_runtime tests.test_sql_agent_pipeline)"
+    ],
+    "additionalDirectories": [
+      "/home/cheongjsi/agent-zoo/.claude"
+    ]
+  }
+}

@@ -18,6 +18,8 @@ from google.genai import types
 from .config import SQLAgentSettings, load_settings
 from .db import (
     _extract_sql_string_literals,
+    _find_last_top_level_keyword,
+    _find_top_level_keyword,
     _normalize_sql_literal,
     _quote_identifier as _quote_sql_identifier,
     count_subset_rows,
@@ -3056,79 +3058,6 @@ def _sql_has_top_level_group_by(sql: str) -> bool:
     return False
 
 
-def _find_top_level_keyword(sql: str, keyword: str) -> int | None:
-    """Return the start position of the first top-level occurrence of keyword in sql.
-
-    Top-level means not inside parentheses, quoted strings, or comments.
-    Returns None if not found.
-    """
-    upper = sql.upper()
-    keyword_upper = keyword.upper()
-    keyword_len = len(keyword_upper)
-    state = "normal"
-    depth = 0
-    index = 0
-    while index < len(upper):
-        char = upper[index]
-        next_char = upper[index + 1] if index + 1 < len(upper) else ""
-        if state == "line_comment":
-            if char == "\n":
-                state = "normal"
-            index += 1
-            continue
-        if state == "block_comment":
-            if char == "*" and next_char == "/":
-                state = "normal"
-                index += 2
-                continue
-            index += 1
-            continue
-        if state == "single_quote":
-            if char == "'" and next_char == "'":
-                index += 2
-                continue
-            if char == "'":
-                state = "normal"
-            index += 1
-            continue
-        if state == "double_quote":
-            if char == '"':
-                state = "normal"
-            index += 1
-            continue
-        if char == "-" and next_char == "-":
-            state = "line_comment"
-            index += 2
-            continue
-        if char == "/" and next_char == "*":
-            state = "block_comment"
-            index += 2
-            continue
-        if char == "'":
-            state = "single_quote"
-            index += 1
-            continue
-        if char == '"':
-            state = "double_quote"
-            index += 1
-            continue
-        if char == "(":
-            depth += 1
-            index += 1
-            continue
-        if char == ")":
-            depth = max(0, depth - 1)
-            index += 1
-            continue
-        if depth == 0 and upper[index:index + keyword_len] == keyword_upper:
-            before = upper[index - 1] if index > 0 else " "
-            after = upper[index + keyword_len] if index + keyword_len < len(upper) else " "
-            if (not before.isalnum() and before != "_") and (not after.isalnum() and after != "_"):
-                return index
-        index += 1
-    return None
-
-
 def _build_count_sql(sql: str) -> str | None:
     """Convert a scalar aggregate SELECT to SELECT COUNT(*) over the same FROM/WHERE.
 
@@ -3328,19 +3257,6 @@ def _split_top_level_sql_expressions(sql_fragment: str) -> list[str]:
         expressions.append(trailing_expression)
 
     return expressions
-
-
-def _find_last_top_level_keyword(sql: str, keyword: str) -> int | None:
-    last_position = None
-    search_start = 0
-    while search_start < len(sql):
-        next_position = _find_top_level_keyword(sql[search_start:], keyword)
-        if next_position is None:
-            break
-        absolute_position = search_start + next_position
-        last_position = absolute_position
-        search_start = absolute_position + len(keyword)
-    return last_position
 
 
 def _extract_select_item_parts(select_item: str) -> tuple[str, str | None]:
